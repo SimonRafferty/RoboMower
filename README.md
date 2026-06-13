@@ -20,9 +20,11 @@ in the settings (Web UI) I've tried to cover as many permutations of the layout 
 
 You teach it the garden by driving it around the edge with the RC transmitter (or drawing the boundary on the map in the WebUI - both work).  From that one polygon it works out everything else: a navigation boundary the chassis must stay inside, and a working area where the stripes go.
 
-The path planning works just like a 3D Printer slicer - which is where I pinched the idea from.  It mows the perimeter first (like the walls of a print), then an outline around each striped region, then fills in with parallel stripes (the infill).  The outline pass matters more than you'd think: without it, anywhere the lawn edge isn't parallel to the stripes gets left as an uncut wedge.  I'd be disappointed if my 3D prints had holes like that, so the mower doesn't either.
+The path planning works just like a 3D Printer slicer - which is where I stole the idea from.  It mows the perimeter first (like the walls of a print), then an outline around each striped region, then fills in with parallel stripes (the infill).  
 
-Position comes from an RTK GPS (Quectel LC29H) fused with wheel odometry.  I tried using the IMU gyro for heading, but the ground is far too bumpy - the readings were nonsense.  The machine barely slips on grass, so differential wheel odometry between GPS fixes works much better.
+Position comes from a DFRobot RTK GPS (which was the most reasonably priced I could find) fused with wheel odometry.  I tried using the IMU gyro for heading, but the ground is just too bumpy - the readings were nonsense.  If you have a lawn like a bowling green, maybe the IMU would work for you.  Having caterpillar tracks, the machine barely slips on grass, so differential wheel odometry between GPS fixes works much better.
+
+In case you're interested, you can find small tracks on eBay & AliExpress, intended for ATV's.  I used a pair of Bafung geared e-bike front wheel motors with the freewheel clutch welded up so they will drive in reverse to drive the tracks.  They produce bags of torque at low current and are super robust!
 
 If it gets stuck in long wet grass, it raises the cutting deck, has another go, and progressively lowers it again.  If the blade is working too hard, it finishes the strip at maximum height and re-traces lower.  If it hits something (detected by the IMU - no bumpers), it notes the position as an obstacle and routes around it next time.
 
@@ -51,12 +53,6 @@ When the battery gets low it warns you on the transmitter and the phone, then le
 If you use a different VESC for the blade, check which bytes of the CAN STATUS_5 message you're reading.  I had a bug where the firmware read the first two bytes (which are actually the tachometer) as the battery voltage.  It decoded as -0.1V, the firmware decided the battery was flat, and quietly refused to start the blade - while the transmitter cheerfully displayed "Armed & Running".  That one took a while to find.  The voltage is in bytes 4-5.
 #
 
-## A cautionary tale
-
-During development, an early version had a bug where the wheel speed feedback read zero, so the speed controller just kept adding power - and the mower took off backwards at full speed until the fence stopped it.  One broken fence panel and a plant pot.  Fortunately no people.
-
-The firmware now refuses to wind up the power without live feedback from the wheels - but treat this machine with respect.  It weighs a lot, and it has a spinning blade.  Keep the E-stop where you can reach it unless you're not fond of your fingers!
-
 ## Setting it up
 
 1. Arduino IDE 2.x, board "ESP32S3 Dev Module", Partition Scheme "Huge APP (3MB No OTA)", PSRAM "OPI PSRAM".  Libraries: SparkFun BMI270 and FastLED.
@@ -66,9 +62,11 @@ The firmware now refuses to wind up the power without live feedback from the whe
 
 Thanks to Benjamin Vedder for the VESC project - which makes projects like this possible, and to the OpenMower project for convincing me RTK GPS was the right approach.
 
+I did consider just building the OpenMower project - but it's intended for a specific off the shelf mower rather than something mostly home built.  It would have taken extensive re-writing, so I decided to go it alone.  I also preferred to use an ESP32 rather than an RPi just because it boots near instantly.  I wasn't sure the whole thing would fit in an ESP32, but here it is!
+
 Feel free to copy, share, change - whatever you like!
 
 NOTE:
-This is a DIY, experimental project.  It is not a turn-key product, and a mistake in setup can put a heavy machine with a spinning blade somewhere you didn't want it.  If you are not confident with electronics, coding and a bit of mechanical work - please walk away.
+This is a DIY, experimental project.  It is not a turn-key product, and getting something wrong can put a heavy machine with a spinning blade somewhere you don't want it!  If you are not confident with electronics, software and/or mechanics - please walk away unless you're not fond of your fingers & toes!!!
 
 I do not accept responsibility if it mows your flower beds, your neighbour's fence, the cat - or you!
