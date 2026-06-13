@@ -1,0 +1,2068 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>RoboMower</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/@geoman-io/leaflet-geoman-free@2.16.0/dist/leaflet-geoman.css">
+<style>
+/* ══════════════════════════════════════════════════════
+   Reset & base
+══════════════════════════════════════════════════════ */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg:       #1a1a2e;
+  --surface:  #16213e;
+  --card:     #0f3460;
+  --accent:   #e94560;
+  --text:     #eee;
+  --muted:    #888;
+  --green:    #00cc44;
+  --amber:    #ff8c00;
+  --red:      #ff2233;
+  --blue:     #4488ff;
+  --hdr-h:    48px;
+}
+body {
+  font-family: system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100dvh;
+  display: grid;
+  grid-template-rows: var(--hdr-h) 1fr;
+  grid-template-columns: 1fr;
+  grid-template-areas: "hdr" "main";
+  overflow: hidden;
+}
+button { cursor: pointer; font: inherit; }
+input[type=range] { width: 100%; }
+
+/* ══════════════════════════════════════════════════════
+   Header
+══════════════════════════════════════════════════════ */
+#app-header {
+  grid-area: hdr;
+  background: var(--surface);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  border-bottom: 1px solid #333;
+}
+#header-title { font-weight: 700; font-size: 1.1rem; }
+#ble-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+#ble-dot.connected    { background: var(--green); }
+#ble-dot.disconnected { background: var(--muted); }
+#ble-btn {
+  background: var(--card);
+  border: 1px solid #555;
+  color: var(--text);
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+}
+#ble-btn:hover { background: #1a4070; }
+
+/* ══════════════════════════════════════════════════════
+   Header tab buttons
+══════════════════════════════════════════════════════ */
+#header-tabs {
+  display: flex;
+  gap: 4px;
+  flex: 1;
+  justify-content: center;
+}
+#header-tabs .tab-btn {
+  background: none;
+  border: 1px solid #444;
+  color: var(--muted);
+  padding: 4px 14px;
+  border-radius: 4px;
+  font-size: 0.82rem;
+  transition: color .15s, border-color .15s, background .15s;
+}
+#header-tabs .tab-btn:hover  { color: var(--text); border-color: #888; }
+#header-tabs .tab-btn.active { color: var(--text); border-color: var(--accent); background: rgba(233,69,96,.15); }
+
+/* ══════════════════════════════════════════════════════
+   Main content area
+══════════════════════════════════════════════════════ */
+#app-main { grid-area: main; position: relative; overflow: hidden; }
+
+/* Only active tab is shown */
+.tab        { display: none; height: 100%; overflow-y: auto; }
+.tab.active { display: flex; flex-direction: column; }
+
+/* ══════════════════════════════════════════════════════
+   Cards
+══════════════════════════════════════════════════════ */
+.card {
+  background: var(--card);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 6px;
+}
+.card-title { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 6px; }
+.card-value { font-size: 1.4rem; font-weight: 700; }
+.card-sub   { font-size: 0.85rem; color: var(--muted); margin-top: 2px; }
+
+/* Dashboard grid */
+#dash-grid {
+  padding: 6px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 6px;
+  overflow-y: auto;
+}
+
+/* State badge */
+.state-badge {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-weight: 700;
+  font-size: 0.9rem;
+}
+/* RC switch indicators row */
+.sw-row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.sw-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 10px; border-radius: 12px; font-size: .75rem; font-weight: 600;
+  border: 1px solid #555; background: rgba(255,255,255,.05); color: var(--muted);
+}
+.sw-chip.on  { border-color: var(--green); color: var(--green); background: rgba(0,204,68,.12); }
+.sw-chip.warn { border-color: var(--amber); color: var(--amber); background: rgba(255,140,0,.12); }
+
+/* Progress bar */
+.prog-bar-wrap { background: #333; border-radius: 4px; height: 8px; overflow: hidden; margin-top: 4px; }
+.prog-bar      { background: var(--accent); height: 100%; border-radius: 4px; transition: width .4s; }
+.prog-bar.green { background: var(--green); }
+.prog-bar.amber { background: var(--amber); }
+.prog-bar.red   { background: var(--red); }
+
+/* Module status chips */
+.mod-grid { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 4px; }
+.mod-chip {
+  display: flex; align-items: center; gap: 4px;
+  padding: 3px 8px; border-radius: 12px; font-size: 0.78rem; font-weight: 600;
+}
+.mod-chip.ok     { background: #1a4a1a; color: var(--green);  border: 1px solid var(--green); }
+.mod-chip.yellow { background: #3a3a00; color: #e8e800;      border: 1px solid #e8e800; }
+.mod-chip.warn   { background: #4a3800; color: #ffb300;      border: 1px solid #ffb300; }
+.mod-chip.fail   { background: #4a1a1a; color: var(--red);   border: 1px solid var(--red); }
+.mod-chip.grey   { background: #222;    color: #555;         border: 1px solid #444; }
+.mod-chip::before { content: '●'; font-size: 0.6rem; }
+
+/* System log box */
+.log-box {
+  margin-top: 6px; max-height: 160px; overflow-y: auto;
+  background: #111; border-radius: 4px; padding: 6px;
+  font-size: 0.75rem; font-family: monospace; color: #aaa;
+  border: 1px solid #333;
+}
+.log-box .log-entry { padding: 1px 0; border-bottom: 1px solid #1e1e1e; }
+.log-box .log-entry:last-child { border-bottom: none; }
+.log-box.empty { color: var(--muted); font-style: italic; }
+
+/* ══════════════════════════════════════════════════════
+   Map & Perimeters combined tab
+══════════════════════════════════════════════════════ */
+#tab-map { padding: 0; overflow: hidden; }
+
+/* Map tab */
+#map-container { flex: 1; min-height: 0; position: relative; }
+#map { width: 100%; height: 100%; }
+#map-toolbar {
+  background: var(--surface);
+  padding: 6px 10px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  border-bottom: 1px solid #333;
+  flex-shrink: 0;
+}
+#map-toolbar button {
+  background: var(--card);
+  border: 1px solid #444;
+  color: var(--text);
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 0.8rem;
+}
+#map-toolbar button:disabled { opacity: 0.4; cursor: not-allowed; }
+#map-toolbar button.active-edit { background: var(--accent); border-color: var(--accent); }
+
+
+/* ══════════════════════════════════════════════════════
+   Controls
+══════════════════════════════════════════════════════ */
+#controls-wrap { display:flex; flex-direction:column; height:100%; padding:6px; gap:6px; overflow-y:auto; }
+.ctrl-label { font-size:0.7rem; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin-bottom:4px; }
+
+/* RC gating overlay */
+#rc-gating-banner {
+  position:absolute; inset:0; z-index:50;
+  display:none; align-items:center; justify-content:center;
+  background:rgba(0,0,0,.78); color:var(--amber);
+  font-size:1.1rem; font-weight:700; text-align:center;
+  flex-direction:column; gap:8px;
+}
+#rc-gating-banner .rc-icon { font-size:2rem; }
+
+/* State indicator badge */
+#state-badge {
+  flex:1 1 0; min-width:50px;
+  background:#333; border:1px solid #555; color:var(--text);
+  padding:8px 2px; border-radius:6px;
+  font-size:0.78rem; font-weight:600; text-align:center;
+  user-select:none;
+}
+
+/* Button bar */
+.ctrl-btn-bar { display:flex; gap:4px; flex-wrap:wrap; }
+.mode-btn, .ctrl-btn {
+  flex:1 1 0; min-width:50px;
+  background:var(--card); border:1px solid #555; color:var(--text);
+  padding:8px 2px; border-radius:6px;
+  font-size:0.78rem; font-weight:600; cursor:pointer;
+  touch-action:manipulation; user-select:none;
+  transition:background .15s, border-color .15s;
+}
+.mode-btn:disabled, .ctrl-btn:disabled { opacity:0.4; cursor:not-allowed; }
+.mode-btn.active-mode { background:var(--accent); border-color:var(--accent); }
+.ctrl-btn.blade-on    { background:var(--green);  border-color:var(--green);  color:#000; }
+.ctrl-btn.paused      { background:var(--amber);  border-color:var(--amber);  color:#000; }
+.ctrl-btn.learn-active { background:#8833cc;      border-color:#8833cc; }
+.ctrl-btn.storept-active { background:#6644aa;    border-color:#6644aa; }
+
+/* Drive zone: 2-column 50/50 grid like RC transmitter sticks */
+#drive-zone {
+  display:grid; grid-template-columns:1fr 1fr; gap:8px;
+  flex:1 1 auto; min-height:160px;
+}
+.stick-cell {
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  background:var(--card); border-radius:10px; border:1px solid #333; padding:8px;
+}
+
+/* Slider labels & values */
+.slider-label { font-size:0.6rem; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; }
+.slider-val   { font-size:0.85rem; font-weight:700; font-family:monospace; min-width:38px; text-align:center; }
+
+/* Vertical velocity slider — centred in its cell */
+#vel-slider {
+  writing-mode:vertical-lr; direction:rtl;
+  -webkit-appearance:none; appearance:none;
+  width:48px; flex:1; min-height:100px;
+  background:transparent; cursor:pointer; touch-action:none;
+}
+#vel-slider::-webkit-slider-runnable-track { width:10px; background:#2a2a2a; border-radius:5px; border:1px solid #444; }
+#vel-slider::-webkit-slider-thumb { -webkit-appearance:none; width:44px; height:28px; background:var(--accent); border-radius:6px; border:none; margin-left:-17px; }
+#vel-slider::-moz-range-track { width:10px; background:#2a2a2a; border-radius:5px; border:1px solid #444; }
+#vel-slider::-moz-range-thumb  { width:44px; height:28px; background:var(--accent); border-radius:6px; border:none; }
+#vel-slider:disabled::-webkit-slider-thumb { background:#555; }
+#vel-slider:disabled::-moz-range-thumb     { background:#555; }
+
+/* Horizontal steering slider — centred in its cell */
+#str-slider {
+  -webkit-appearance:none; appearance:none;
+  width:80%; height:48px;
+  background:transparent; cursor:pointer; touch-action:none;
+}
+#str-slider::-webkit-slider-runnable-track { height:10px; background:#2a2a2a; border-radius:5px; border:1px solid #444; }
+#str-slider::-webkit-slider-thumb { -webkit-appearance:none; width:48px; height:48px; background:var(--accent); border-radius:6px; border:none; margin-top:-19px; }
+#str-slider::-moz-range-track { height:10px; background:#2a2a2a; border-radius:5px; border:1px solid #444; }
+#str-slider::-moz-range-thumb  { width:48px; height:48px; background:var(--accent); border-radius:6px; border:none; }
+#str-slider:disabled::-webkit-slider-thumb { background:#555; }
+#str-slider:disabled::-moz-range-thumb     { background:#555; }
+
+/* Cut height row */
+#cut-height-section { padding:0 6px; }
+#cut-height-row { display:flex; align-items:center; gap:10px; }
+#cut-height-val { min-width:50px; text-align:right; font-weight:700; }
+
+/* ── Mower config form ────────────────── */
+details.ctrl-section { margin-top:8px; }
+details.ctrl-section summary { cursor:pointer; font-size:0.85rem; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; padding:6px 0; user-select:none; }
+details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
+.cfg-note { font-size:0.75rem; color:var(--muted); margin:6px 0 10px; }
+.cfg-group-label { font-size:0.7rem; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin:10px 0 4px; border-bottom:1px solid #333; padding-bottom:3px; }
+.cfg-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); gap:6px; margin-bottom:4px; }
+.cfg-grid label { display:flex; flex-direction:column; font-size:0.75rem; color:var(--muted); gap:2px; }
+.cfg-input { background:var(--card); border:1px solid #444; color:var(--text); padding:4px 6px; border-radius:4px; font-size:0.85rem; width:100%; box-sizing:border-box; }
+.cfg-input:focus { outline:1px solid var(--accent); border-color:var(--accent); }
+.cfg-derived { font-size:0.78rem; color:var(--muted); line-height:1.8; margin-bottom:8px; }
+.cfg-actions { display:flex; gap:8px; margin-top:10px; }
+.cfg-actions button { flex:1; padding:8px; border-radius:6px; border:1px solid #555; background:var(--card); color:var(--text); font-size:0.85rem; font-weight:600; cursor:pointer; }
+.cfg-actions button:disabled { opacity:0.4; cursor:not-allowed; }
+#cfg-save-btn:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+
+/* Landscape phone: maximise drive zone height */
+@media (max-height:500px) {
+  #controls-wrap { padding:3px; gap:3px; }
+  .mode-btn, .ctrl-btn { padding:5px 2px; font-size:0.72rem; }
+}
+.ack-toast {
+  position: fixed;
+  bottom: 70px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #333;
+  color: var(--text);
+  padding: 8px 20px;
+  border-radius: 20px;
+  font-size: 0.85rem;
+  z-index: 9999;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .3s;
+}
+.ack-toast.show { opacity: 1; }
+.ack-toast.ok   { background: #1a5030; }
+.ack-toast.fail { background: #501a1a; }
+
+/* ══════════════════════════════════════════════════════
+   Diagnostics tab
+══════════════════════════════════════════════════════ */
+#diag-grid { padding:6px; display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:6px; overflow-y:auto; }
+#diag-age  { font-size:.7rem; color:var(--muted); padding:4px 8px; }
+.diag-card { background:var(--card); border-radius:8px; padding:10px; }
+.diag-card .card-title { font-size:.75rem; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin-bottom:6px; }
+.diag-table { width:100%; border-collapse:collapse; font-size:.8rem; font-family:monospace; }
+.diag-table td { padding:2px 6px; border-bottom:1px solid #1e1e1e; }
+.diag-table td:first-child { color:var(--muted); white-space:nowrap; }
+.diag-table td:last-child  { text-align:right; font-weight:600; }
+.diag-stale { color:#e94560; }
+.diag-ok    { color:#4caf50; }
+.diag-warn  { color:#ff9800; }
+
+/* ══════════════════════════════════════════════════════
+   Misc
+══════════════════════════════════════════════════════ */
+#no-ble-banner {
+  position: fixed; inset: 0; background: rgba(0,0,0,.85);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  z-index: 9000; padding: 20px; text-align: center; color: var(--text);
+}
+#no-ble-banner h2 { color: var(--red); margin-bottom: 10px; }
+#no-ble-banner p { max-width: 360px; color: #bbb; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+<!-- ── Header ─────────────────────────────────────────── -->
+<header id="app-header">
+  <span id="header-title">RoboMower</span>
+  <nav id="header-tabs">
+    <button class="tab-btn active" data-tab="dashboard">Dashboard</button>
+    <button class="tab-btn" data-tab="map">Map</button>
+    <button class="tab-btn" data-tab="controls">Controls</button>
+    <button class="tab-btn" data-tab="diag">Diagnostics</button>
+  </nav>
+  <span id="ble-dot" class="disconnected"></span>
+  <span id="ble-label" style="font-size:.85rem;color:var(--muted)">Disconnected</span>
+  <button id="ble-btn" title="Connect to or disconnect from the RoboMower via Bluetooth">Connect</button>
+</header>
+
+<!-- ── Main content ───────────────────────────────────── -->
+<main id="app-main">
+
+  <!-- Dashboard -->
+  <section id="tab-dashboard" class="tab active">
+    <div id="dash-grid"></div>
+    <details class="ctrl-section" id="cfg-section">
+      <summary>Settings</summary>
+      <div id="cfg-form">
+        <p class="cfg-note">Values are saved to the mower's NVS and take effect immediately. The mower must be connected.</p>
+        <div class="cfg-group-label">Manual Drive</div>
+        <div class="cfg-grid">
+          <label>Max duty (0–1)<input type="number" class="cfg-input" id="cfg-manual_max_duty" step="0.05" min="0.1" max="1.0" title="Maximum duty cycle at full stick deflection (0–1). Lower = slower max speed, more usable range in the lower stick. Default 0.6"></label>
+          <label>Max yaw rate<input type="number" class="cfg-input" id="cfg-manual_max_yaw_rate" step="0.1" title="Maximum yaw rate at full steering stick deflection (rad/s). Controls how fast the mower turns in manual/learn modes"></label>
+          <label>Heading Kp<input type="number" class="cfg-input" id="cfg-heading_kp" step="0.05" title="Proportional gain for gyro heading stabilisation ((m/s)/rad). Higher = stronger heading hold."></label>
+          <label>Heading Kd<input type="number" class="cfg-input" id="cfg-heading_kd" step="0.01" title="Derivative gain for yaw rate damping ((m/s)/(rad/s)). Damps oscillation. Higher = more damping."></label>
+        </div>
+        <div class="cfg-group-label">Robot Footprint (m from steering centre)</div>
+        <div class="cfg-grid">
+          <label>Front<input type="number" class="cfg-input" id="cfg-robot_front_m"   step="0.01" title="Distance from the steering centre to the front edge of the chassis (metres)"></label>
+          <label>Rear<input  type="number" class="cfg-input" id="cfg-robot_rear_m"    step="0.01" title="Distance from the steering centre to the rear edge of the chassis (metres)"></label>
+          <label>Left<input  type="number" class="cfg-input" id="cfg-robot_left_m"    step="0.01" title="Distance from the steering centre to the left edge of the chassis (metres)"></label>
+          <label>Right<input type="number" class="cfg-input" id="cfg-robot_right_m"   step="0.01" title="Distance from the steering centre to the right edge of the chassis (metres)"></label>
+        </div>
+        <div class="cfg-group-label">Chassis</div>
+        <div class="cfg-grid">
+          <label>Width m<input  type="number" class="cfg-input" id="cfg-chassis_width_m"  step="0.01" title="Distance between left and right wheel centres (track width, metres)"></label>
+          <label>Length m<input type="number" class="cfg-input" id="cfg-chassis_length_m" step="0.01" title="Distance between front and rear wheel centres (metres)"></label>
+        </div>
+        <div class="cfg-group-label">Drive</div>
+        <div class="cfg-grid">
+          <label>Wheel radius m<input  type="number" class="cfg-input" id="cfg-wheel_radius_m"  step="0.001" title="Radius of the driven wheels (metres). Used for odometry calculations"></label>
+          <label>Motor pole pairs<input type="number" class="cfg-input" id="cfg-motor_pole_pairs" step="1" min="1" title="Number of magnetic pole PAIRS in the drive motor rotor. Used to convert eRPM to mechanical RPM"></label>
+          <label>Gear ratio<input      type="number" class="cfg-input" id="cfg-gear_ratio"       step="0.1" title="Gearbox reduction ratio from motor shaft to wheel shaft. Higher = more torque, lower speed"></label>
+          <label>Manual max speed m/s<input type="number" class="cfg-input" id="cfg-manual_max_speed_ms" step="0.05" min="0.05" title="Maximum wheel speed at full throttle stick in manual mode (m/s). Automatically respects gear ratio and pole pairs."></label>
+          <label>Min turn radius m<input   type="number" class="cfg-input" id="cfg-min_turn_radius_m"   step="0.01" min="0" title="Minimum path-following turn radius (metres). Set to 0 for tracked/skid-steer vehicles that can pivot on the spot. Wheeled differential: typically half the track width."></label>
+        </div>
+        <div class="cfg-group-label">GPS Antenna Offset (m from steering centre)</div>
+        <div class="cfg-grid">
+          <label>Forward<input type="number" class="cfg-input" id="cfg-antenna_fwd_m"   step="0.01" title="RTK antenna offset along the heading axis (metres). Positive = antenna is ahead of steering centre"></label>
+          <label>Right<input   type="number" class="cfg-input" id="cfg-antenna_right_m" step="0.01" title="RTK antenna offset perpendicular to heading (metres). Positive = antenna is to the right of steering centre"></label>
+        </div>
+        <div class="cfg-group-label">Blade &amp; Cutting</div>
+        <div class="cfg-grid">
+          <label>Steer to cut m<input    type="number" class="cfg-input" id="cfg-steer_to_cut_m"      step="0.01" title="Distance from steering centre to the centre of the cutting disc (metres). Positive = disc is ahead"></label>
+          <label>Blade radius m<input    type="number" class="cfg-input" id="cfg-cut_disc_radius_m"   step="0.001" title="Radius of the cutting disc (metres)"></label>
+          <label>Cut width m<input       type="number" class="cfg-input" id="cfg-cut_width_m"         step="0.01" title="Effective cut width per mowing pass (metres). Usually slightly less than blade diameter"></label>
+          <label>Strip overlap m<input   type="number" class="cfg-input" id="cfg-strip_overlap_m"     step="0.005" title="Overlap between adjacent mowing strips (metres). Prevents uncut lines between passes"></label>
+          <label>Blade pole pairs<input  type="number" class="cfg-input" id="cfg-blade_motor_pole_pairs" step="1" min="1" title="Number of magnetic pole PAIRS in the blade motor rotor. Used to convert eRPM to mechanical RPM"></label>
+          <label>Blade RPM<input         type="number" class="cfg-input" id="cfg-blade_target_rpm"    step="100" min="0" title="Target mechanical RPM for the blade motor during mowing"></label>
+        </div>
+        <div class="cfg-group-label">Cut Height Limits (mm)</div>
+        <div class="cfg-grid">
+          <label>Min mm<input type="number" class="cfg-input" id="cfg-cut_height_min_mm" step="1" min="0" title="Minimum allowed cutting deck height (mm). The cut-height slider won't go below this"></label>
+          <label>Max mm<input type="number" class="cfg-input" id="cfg-cut_height_max_mm" step="1" min="0" title="Maximum allowed cutting deck height (mm). The cut-height slider won't go above this"></label>
+        </div>
+        <div class="cfg-group-label">Path Following</div>
+        <div class="cfg-grid">
+          <label>Lookahead base m<input type="number" class="cfg-input" id="cfg-pp_lookahead_base_m" step="0.01" title="Pure pursuit base lookahead distance at zero speed (metres). Larger = smoother but less responsive tracking"></label>
+          <label>Lookahead K (s)<input  type="number" class="cfg-input" id="cfg-pp_lookahead_k"      step="0.05" title="Lookahead speed gain. Total lookahead = base + K &times; speed. Higher K = more stable at speed but slower to react"></label>
+          <label>Mow speed m/s<input    type="number" class="cfg-input" id="cfg-max_mowing_speed_ms" step="0.01" title="Forward speed during normal mowing (m/s)"></label>
+          <label>Headland speed m/s<input type="number" class="cfg-input" id="cfg-headland_speed_ms" step="0.01" title="Forward speed during perimeter/headland passes (m/s)"></label>
+          <label>Transit speed m/s<input type="number" class="cfg-input" id="cfg-transit_speed_ms"   step="0.01" title="Forward speed during non-mowing transitions between strips (m/s)"></label>
+          <label>Creep speed m/s<input  type="number" class="cfg-input" id="cfg-min_creep_speed_ms"  step="0.01" title="Minimum commanded speed (m/s). The mower never goes slower than this — prevents stalling mid-path"></label>
+          <label>Arrive dist m<input    type="number" class="cfg-input" id="cfg-waypoint_arrive_dist_m" step="0.01" title="Distance to a waypoint at which it is considered reached (metres)"></label>
+          <label>Max wheel m/s<input    type="number" class="cfg-input" id="cfg-max_wheel_speed_ms"  step="0.05" title="Maximum surface speed of either wheel (m/s)"></label>
+          <label>Max current A<input    type="number" class="cfg-input" id="cfg-max_current_a"       step="0.5" title="Drive motor continuous current limit (amps)"></label>
+          <label>Current ramp A/s<input type="number" class="cfg-input" id="cfg-current_ramp_a_per_s" step="0.5" title="Maximum rate of current change (amps per second)"></label>
+        </div>
+        <div class="cfg-group-label">Uncertainty Navigation</div>
+        <div class="cfg-grid">
+          <label>Margin m<input type="number" class="cfg-input" id="cfg-uncertainty_margin_m" step="0.05" title="Safety margin (metres). When distance-to-edge minus position uncertainty falls below this, the mower slows down"></label>
+          <label>Tilt normal &deg;<input type="number" class="cfg-input" id="cfg-tilt_limit_normal_deg" step="1" title="Maximum tilt from vertical (degrees) during normal operation before the mower pauses"></label>
+          <label>Tilt careful &deg;<input type="number" class="cfg-input" id="cfg-tilt_limit_careful_deg" step="1" title="Maximum tilt from vertical (degrees) when near the perimeter with high uncertainty"></label>
+          <label>Collision mult<input type="number" class="cfg-input" id="cfg-collision_mult_careful" step="0.5" title="Collision threshold multiplier when close to perimeter with high uncertainty"></label>
+        </div>
+        <div class="cfg-group-label">Wheel Speed PI (auto mode)</div>
+        <div class="cfg-grid">
+          <label>Speed Kp A/(m/s)<input type="number" class="cfg-input" id="cfg-wheel_pi_kp" step="1.0" title="Proportional gain for ESP32 wheel speed PI loop (A per m/s of error). Higher = more aggressive response. Reduce if wheels oscillate."></label>
+          <label>Speed Ki A/(m/s²)<input type="number" class="cfg-input" id="cfg-wheel_pi_ki" step="0.5" title="Integral gain for ESP32 wheel speed PI loop (A per accumulated m/s error). Eliminates steady-state speed error under load."></label>
+        </div>
+        <div class="cfg-group-label">Derived (read-only)</div>
+        <div class="cfg-derived" id="cfg-derived"></div>
+        <div class="cfg-actions">
+          <button id="cfg-save-btn" disabled title="Send all config values to the mower. Saved to NVS flash and takes effect immediately">Save to Mower</button>
+          <button id="cfg-reset-btn" title="Discard changes and reload all fields from the mower's current saved config">Reset to Current</button>
+        </div>
+      </div>
+    </details>
+  </section>
+
+  <!-- Map -->
+  <section id="tab-map" class="tab">
+    <div id="map-toolbar">
+      <button id="btn-get-esp32" disabled title="Download the perimeter and map data from the mower">Load from Mower</button>
+      <button id="btn-upload-map-perim" disabled title="Upload the current map perimeter to the mower (requires Bluetooth connection)">Send to Mower</button>
+      <button id="btn-load-perim" title="Open a perimeter JSON file saved on this device and load it onto the map">Load File</button>
+      <button id="btn-save-perim" disabled title="Save the current map perimeter as a JSON file on this device">Save File</button>
+      <span style="flex:1"></span>
+      <button id="btn-centre-gps" title="Pan the map to the last known mower position">Centre on GPS</button>
+      <button id="btn-layer-toggle" title="Switch between street map and satellite imagery">Satellite</button>
+      <input type="file" id="file-import" accept=".json" style="display:none">
+      <span id="map-status" style="font-size:.78rem;color:var(--muted);margin-left:auto"></span>
+    </div>
+    <div id="map-diag" style="font-size:.7rem;color:#ff8;background:#222;padding:2px 6px;overflow-x:auto;white-space:nowrap"></div>
+    <div id="map-container">
+      <div id="map"></div>
+    </div>
+  </section>
+
+  <!-- Controls -->
+  <section id="tab-controls" class="tab" style="position:relative">
+    <div id="rc-gating-banner">
+      <span class="rc-icon">&#x1F4E1;</span>
+      RC Transmitter Active<br><span style="font-size:.8rem;font-weight:400;color:var(--muted)">Turn off the transmitter to use phone controls</span>
+    </div>
+    <div id="controls-wrap">
+      <!-- All action buttons in one top row -->
+      <div class="ctrl-btn-bar">
+        <span id="state-badge">INIT</span>
+        <button class="mode-btn" id="btn-mode-manual" disabled>Manual</button>
+        <button class="mode-btn" id="btn-mode-auto"   disabled>Auto</button>
+        <button class="mode-btn" id="btn-mode-return" disabled>Return</button>
+        <button class="ctrl-btn"  id="btn-learn"       disabled>Learn</button>
+        <button class="ctrl-btn"  id="btn-store-pt"    disabled>Store Pt</button>
+        <button class="ctrl-btn"  id="btn-blade"       disabled>Start Blade</button>
+        <button class="ctrl-btn"  id="btn-pause"       disabled>Pause</button>
+      </div>
+
+      <!-- Drive zone: 2-column grid like RC transmitter sticks -->
+      <div id="drive-zone">
+        <div class="stick-cell">
+          <div class="slider-label">FWD</div>
+          <input type="range" id="vel-slider" min="-100" max="100" value="0" step="1" disabled>
+          <div class="slider-val" id="vel-val">0%</div>
+          <div class="slider-label">REV</div>
+        </div>
+        <div class="stick-cell">
+          <div class="slider-label">L</div>
+          <input type="range" id="str-slider" min="-100" max="100" value="0" step="1" disabled>
+          <div class="slider-val" id="str-val">0%</div>
+          <div class="slider-label">R</div>
+        </div>
+      </div>
+
+      <!-- Cut height -->
+      <div id="cut-height-section">
+        <div class="ctrl-label">Cut Height</div>
+        <div id="cut-height-row">
+          <input type="range" id="cut-height-slider" min="35" max="90" value="90" step="5" disabled title="Adjust blade cut height (35–90 mm)">
+          <span id="cut-height-val">90mm</span>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- Diagnostics -->
+  <section id="tab-diag" class="tab">
+    <div id="diag-age">No data — switch to this tab while connected to start polling</div>
+    <div class="ctrl-btn-bar" style="margin:6px 0">
+      <button class="ctrl-btn" id="btn-plan-test" disabled
+              title="Dry-run the coverage planner on the stored perimeter without starting AUTO. Result appears as a toast and in the system log">Plan Test</button>
+      <button class="ctrl-btn" id="btn-refresh-log" disabled
+              title="Fetch the latest status and system log from the mower (log shows on the Dashboard tab)">Refresh Log</button>
+    </div>
+    <div id="diag-grid"></div>
+  </section>
+
+</main>
+
+<!-- ACK toast -->
+<div class="ack-toast" id="ack-toast"></div>
+
+<!-- No-BLE banner (shown if browser lacks Web Bluetooth) -->
+<div id="no-ble-banner" style="display:none">
+  <h2>Browser Not Supported</h2>
+  <p>Web Bluetooth is required. Please use <strong>Chrome on Android</strong> or
+  <strong>Chrome / Edge on Windows / macOS / Linux</strong>.<br><br>
+  Safari and iOS are not supported.</p>
+</div>
+
+<!-- External libraries -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/@geoman-io/leaflet-geoman-free@2.16.0/dist/leaflet-geoman.min.js"></script>
+
+<script>
+'use strict';
+// ══════════════════════════════════════════════════════
+//  SECTION: CONFIG
+// ══════════════════════════════════════════════════════
+const SERVICE_UUID  = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+const TELEM_UUID    = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+const MAP_UUID      = 'beb5483e-36e1-4688-b7f5-ea07361b26a9';
+const CMD_UUID      = 'beb5483e-36e1-4688-b7f5-ea07361b26aa';
+const STATUS_UUID   = 'beb5483e-36e1-4688-b7f5-ea07361b26ab';
+
+const FRAG_CHUNK = 490;   // bytes per fragment for large outgoing commands
+
+const STATE_COLOURS = {
+  'AUTO':           '#ff8c00',
+  'PAUSED':         '#00cc44',
+  'MOTORS_OFFLINE': '#cc4400',
+  'IDLE':           '#4488ff',
+  'LEARN_PERIM':    '#00cccc',
+  'MANUAL':         '#8844ff',
+  'RETRACE':        '#ffcc00',
+  'BOG':            '#ff6600',
+  'OBS_AVOID':      '#ff4400',
+  'INIT':           '#888888',
+  'RETURN':         '#00aaff',
+};
+
+// ══════════════════════════════════════════════════════
+//  SECTION: BLE MANAGER
+// ══════════════════════════════════════════════════════
+class BLEManager {
+  constructor() {
+    this.device    = null;
+    this.server    = null;
+    this.service   = null;
+    this.chars     = {};
+    this.connected = false;
+    this._frags    = {};    // reassembly buffers keyed by UUID
+    // Callbacks
+    this.onTelemetry = null;
+    this.onMap       = null;
+    this.onStatus    = null;
+    this.onAck       = null;
+    this.onDiag      = null;
+    this.onConnect   = null;
+    this.onDisconnect = null;
+  }
+
+  async connect() {
+    if (!navigator.bluetooth) throw new Error('No Web Bluetooth');
+    this.device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: 'RoboMower' }],
+      optionalServices: [SERVICE_UUID]
+    });
+    this.device.addEventListener('gattserverdisconnected', () => this._onDisconnect());
+    this.server  = await this.device.gatt.connect();
+    this.service = await this.server.getPrimaryService(SERVICE_UUID);
+
+    this.chars.telem  = await this.service.getCharacteristic(TELEM_UUID);
+    this.chars.map    = await this.service.getCharacteristic(MAP_UUID);
+    this.chars.cmd    = await this.service.getCharacteristic(CMD_UUID);
+    this.chars.status = await this.service.getCharacteristic(STATUS_UUID);
+
+    await this.chars.telem.startNotifications();
+    this.chars.telem.addEventListener('characteristicvaluechanged',
+      e => this._handleNotify(TELEM_UUID, e.target.value));
+
+    await this.chars.map.startNotifications();
+    this.chars.map.addEventListener('characteristicvaluechanged',
+      e => this._handleNotify(MAP_UUID, e.target.value));
+
+    await this.chars.status.startNotifications();
+    this.chars.status.addEventListener('characteristicvaluechanged',
+      e => this._handleNotify(STATUS_UUID, e.target.value));
+
+    this.connected = true;
+    if (this.onConnect) this.onConnect();
+
+    // Sync initial state
+    await this.sendCommand({ cmd: 'REQUEST_STATUS' });
+    await this.sendCommand({ cmd: 'REQUEST_MAP' });
+  }
+
+  _onDisconnect() {
+    this.connected = false;
+    this.chars = {};
+    if (this.onDisconnect) this.onDisconnect();
+  }
+
+  _handleNotify(uuid, dataView) {
+    // Binary fragment: first byte 0x01 (SOH), then [f uint8][n uint8][raw data...]
+    // Plain JSON always starts with '{' (0x7B) — no ambiguity.
+    if (dataView.byteLength >= 4 && dataView.getUint8(0) === 0x01) {
+      const f     = dataView.getUint8(1);
+      const n     = dataView.getUint8(2);
+      const chunk = new TextDecoder().decode(
+        new Uint8Array(dataView.buffer, dataView.byteOffset + 3, dataView.byteLength - 3));
+      this._reassemble(uuid, { f, n, d: chunk });
+      return;
+    }
+    const text = new TextDecoder().decode(dataView);
+    let json;
+    try { json = JSON.parse(text); } catch(e) {
+      console.warn('[BLE] JSON parse failed on', uuid, ':', e.message, '| text=', text.slice(0,80));
+      return;
+    }
+    this._dispatch(uuid, json);
+  }
+
+  _reassemble(uuid, frag) {
+    if (!this._frags[uuid]) this._frags[uuid] = { parts: [], n: 0 };
+    const buf = this._frags[uuid];
+    buf.parts[frag.f] = frag.d;
+    buf.n = frag.n;
+    const received = buf.parts.filter(p => p !== undefined).length;
+    if (received === buf.n) {
+      const full = buf.parts.slice(0, buf.n).join('');
+      this._frags[uuid] = { parts: [], n: 0 };
+      let obj;
+      try { obj = JSON.parse(full); } catch { return; }
+      this._dispatch(uuid, obj);
+    }
+  }
+
+  _dispatch(uuid, json) {
+    if (uuid === TELEM_UUID  && this.onTelemetry) this.onTelemetry(json);
+    if (uuid === MAP_UUID    && this.onMap)        this.onMap(json);
+    if (uuid === STATUS_UUID) {
+      if (json.type === 'ack'    && this.onAck)    this.onAck(json);
+      if (json.type === 'status' && this.onStatus) this.onStatus(json);
+      if (json.type === 'diag'   && this.onDiag)   this.onDiag(json);
+    }
+  }
+
+  async sendCommand(obj) {
+    if (!this.connected || !this.chars.cmd) throw new Error('Not connected');
+    const bytes = new TextEncoder().encode(JSON.stringify(obj));
+    if (bytes.length <= FRAG_CHUNK) {
+      await this.chars.cmd.writeValueWithResponse(bytes);
+      return;
+    }
+    // Binary fragment format: [0x01][f uint8][n uint8][raw bytes...]
+    // Matches firmware handle_cmd_fragment() — no JSON escaping needed.
+    const n = Math.ceil(bytes.length / FRAG_CHUNK);
+    for (let f = 0; f < n; f++) {
+      const start = f * FRAG_CHUNK;
+      const chunk = bytes.slice(start, start + FRAG_CHUNK);
+      const frag  = new Uint8Array(3 + chunk.length);
+      frag[0] = 0x01;  // SOH marker
+      frag[1] = f;
+      frag[2] = n;
+      frag.set(chunk, 3);
+      await this.chars.cmd.writeValueWithResponse(frag);
+      await new Promise(r => setTimeout(r, 30));
+    }
+  }
+
+  disconnect() {
+    if (this.device?.gatt?.connected) this.device.gatt.disconnect();
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  SECTION: TELEMETRY STORE
+// ══════════════════════════════════════════════════════
+class TelemetryStore {
+  constructor() {
+    this.data = {
+      state: 'INIT', x: 0, y: 0, hdg: 0, lat: 0, lon: 0,
+      fix: 0, sat: 0, hdop: 1, difAge: 0, vel: 0,
+      hprog: 0, sprog: 0, cutH: 100, obs: 0, unc: 0,
+      bladeRPM: 0, bladeA: 0, bladeLoad: 0, cutStatus: 'NORMAL',
+      battV: 0, battState: 'OK', collBase: 0, armed: false,
+      tilt: 0, modeSw: 0, pauseSw: false, learnSw: false,
+      blePause: false, bleArm: false, bladeCmd: false, bladeLock: false, ch6Us: 0, t: 0
+    };
+    this._listeners = [];
+  }
+  update(json) { this.data = { ...this.data, ...json }; this._listeners.forEach(fn => fn(this.data)); }
+  onChange(fn) { this._listeners.push(fn); }
+  get fixLabel() {
+    return { 0:'No Fix', 1:'GPS', 2:'DGPS', 4:'RTK Fixed', 5:'RTK Float' }[this.data.fix] ?? 'Unknown';
+  }
+  get gpsAccLabel() {
+    // Accuracy = σ_base × HDOP × √2 (2D RMS from per-axis noise)
+    const base = { 0:0, 1:100, 2:50, 4:1, 5:15 };
+    const b = base[this.data.fix];
+    if (b === undefined || b === 0) return '—';
+    const hdop = Math.max(this.data.hdop ?? 1, 1);
+    const acc_cm = b * hdop * Math.SQRT2;
+    return '~' + (acc_cm < 10 ? acc_cm.toFixed(1) : Math.round(acc_cm)) + 'cm';
+  }
+  get latLonLabel() {
+    const lat = this.data.lat, lon = this.data.lon;
+    if (!lat && !lon) return 'Lat/Lon: —';
+    return `${lat.toFixed(7)}°, ${lon.toFixed(7)}°`;
+  }
+  get difAgeLabel() {
+    const age = this.data.difAge;
+    if (age === undefined || age === null) return '—';
+    if (age <= 0) return '0s ✓';
+    if (age < 2)  return `${age.toFixed(1)}s`;
+    return `${age.toFixed(1)}s ⚠`;  // >2s is concerning — LoRa may be dropping packets
+  }
+  get progTotal() { return (this.data.hprog * 0.3 + this.data.sprog * 0.7); }
+}
+
+// ══════════════════════════════════════════════════════
+//  SECTION: PERIMETER FILE I/O
+// ══════════════════════════════════════════════════════
+
+/** Save a perimeter object to a JSON file.
+ *  Uses the File System Access API (showSaveFilePicker) when available,
+ *  giving a proper Save-As dialog. Falls back to a silent <a download> on
+ *  browsers that don't support it (Firefox, older Edge). */
+async function savePerimeterToFile(perim) {
+  const json = JSON.stringify(perim, null, 2);
+  if (window.showSaveFilePicker) {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: 'perimeter.json',
+      types: [{ description: 'Perimeter JSON', accept: { 'application/json': ['.json'] } }]
+    });
+    const writable = await handle.createWritable();
+    await writable.write(json);
+    await writable.close();
+  } else {
+    // Fallback: trigger browser download to default downloads folder
+    const blob = new Blob([json], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = 'perimeter.json'; a.click();
+    URL.revokeObjectURL(url);
+  }
+}
+
+/** Parse a perimeter JSON string from a loaded file. Throws on invalid format. */
+function parsePerimeterFile(str) {
+  const obj = JSON.parse(str);
+  if (!obj.origin?.lat || !obj.polygon?.length) throw new Error('Invalid perimeter JSON — missing origin or polygon');
+  return obj;
+}
+
+// ══════════════════════════════════════════════════════
+//  SECTION: COMMANDS
+// ══════════════════════════════════════════════════════
+const Commands = {
+  setMode:       (mode) => ({ cmd: 'SET_MODE',       value: mode }),
+  setCutHeight:  (mm)   => ({ cmd: 'SET_CUT_HEIGHT',  value: mm }),
+  pauseToggle:   ()     => ({ cmd: 'PAUSE_TOGGLE' }),
+  setDrive:      (thr, str) => ({ cmd: 'SET_DRIVE', thr, str }),
+  setArm:        (on)   => ({ cmd: 'SET_ARM', value: on ? 1 : 0 }),
+  setLearn:      ()     => ({ cmd: 'SET_LEARN' }),
+  storePoint:    ()     => ({ cmd: 'STORE_POINT' }),
+  requestMap:    ()     => ({ cmd: 'REQUEST_MAP' }),
+  requestStatus: ()     => ({ cmd: 'REQUEST_STATUS' }),
+  requestDiag:   ()     => ({ cmd: 'REQUEST_DIAG' }),
+  clearObstacles:()     => ({ cmd: 'CLEAR_OBSTACLES' }),
+  clearPerimeter:()     => ({ cmd: 'CLEAR_PERIMETER' }),
+  sendPerimeter: (origin, polygon) => ({ cmd: 'SEND_PERIMETER', origin, polygon })
+};
+
+// ══════════════════════════════════════════════════════
+//  SECTION: DRIVE CONTROLLER
+//  Manages velocity/steering sliders with damped return-to-centre.
+//  Sends SET_DRIVE at 10 Hz while active.
+// ══════════════════════════════════════════════════════
+class DriveController {
+  constructor(ble) {
+    this._ble = ble;
+    this._velSlider = document.getElementById('vel-slider');
+    this._strSlider = document.getElementById('str-slider');
+    this._velVal    = document.getElementById('vel-val');
+    this._strVal    = document.getElementById('str-val');
+    this._rcActive  = true;
+    this._velTarget = 0;
+    this._strTarget = 0;
+    this._velDamping = false;
+    this._strDamping = false;
+    this._lastSendMs = 0;
+    this._rafId = null;
+    this._prevTs = 0;
+    this._velDecayRate = 100 / 4.0;   // 4s from max to zero
+    this._strDecayRate = 100 / 1.0;   // 1s from max to zero
+    this._touching = { vel: false, str: false };
+    this._bindEvents();
+  }
+
+  _bindEvents() {
+    const velStart = () => { this._touching.vel = true; this._velDamping = false; };
+    const velMove  = () => {
+      this._velTarget = Number(this._velSlider.value);
+      this._velDamping = false;
+      this._updateDisplay();
+      this._startLoop();
+    };
+    const velEnd   = () => {
+      this._touching.vel = false;
+      this._velDamping = true;
+      this._startLoop();
+    };
+    this._velSlider.addEventListener('touchstart', velStart, {passive:true});
+    this._velSlider.addEventListener('mousedown',  velStart);
+    this._velSlider.addEventListener('input',      velMove);
+    this._velSlider.addEventListener('touchend',   velEnd);
+    this._velSlider.addEventListener('mouseup',    velEnd);
+
+    const strStart = () => { this._touching.str = true; this._strDamping = false; };
+    const strMove  = () => {
+      this._strTarget = Number(this._strSlider.value);
+      this._strDamping = false;
+      this._updateDisplay();
+      this._startLoop();
+    };
+    const strEnd   = () => {
+      this._touching.str = false;
+      this._strDamping = true;
+      this._startLoop();
+    };
+    this._strSlider.addEventListener('touchstart', strStart, {passive:true});
+    this._strSlider.addEventListener('mousedown',  strStart);
+    this._strSlider.addEventListener('input',      strMove);
+    this._strSlider.addEventListener('touchend',   strEnd);
+    this._strSlider.addEventListener('mouseup',    strEnd);
+  }
+
+  _startLoop() {
+    if (this._rafId) return;
+    this._prevTs = performance.now();
+    this._rafId = requestAnimationFrame(ts => this._loop(ts));
+  }
+
+  _loop(ts) {
+    const dt = Math.min((ts - this._prevTs) / 1000, 0.1);
+    this._prevTs = ts;
+
+    if (this._velDamping && this._velTarget !== 0) {
+      const decay = this._velDecayRate * dt;
+      if (Math.abs(this._velTarget) <= decay) {
+        this._velTarget = 0; this._velDamping = false;
+      } else {
+        this._velTarget -= Math.sign(this._velTarget) * decay;
+      }
+      this._velSlider.value = Math.round(this._velTarget);
+    }
+
+    if (this._strDamping && this._strTarget !== 0) {
+      const decay = this._strDecayRate * dt;
+      if (Math.abs(this._strTarget) <= decay) {
+        this._strTarget = 0; this._strDamping = false;
+      } else {
+        this._strTarget -= Math.sign(this._strTarget) * decay;
+      }
+      this._strSlider.value = Math.round(this._strTarget);
+    }
+
+    this._updateDisplay();
+
+    if (ts - this._lastSendMs >= 100) {
+      this._lastSendMs = ts;
+      this._sendDrive();
+    }
+
+    if (this._velDamping || this._strDamping ||
+        this._velTarget !== 0 || this._strTarget !== 0 ||
+        this._touching.vel || this._touching.str) {
+      this._rafId = requestAnimationFrame(ts2 => this._loop(ts2));
+    } else {
+      this._rafId = null;
+      this._sendDrive();  // final zero
+    }
+  }
+
+  _updateDisplay() {
+    this._velVal.textContent = Math.round(this._velTarget) + '%';
+    this._strVal.textContent = Math.round(this._strTarget) + '%';
+  }
+
+  _sendDrive() {
+    if (!this._ble.connected || this._rcActive) return;
+    const thr = Math.round(this._velTarget) / 100;
+    const str = Math.round(this._strTarget) / 100;
+    this._ble.sendCommand(Commands.setDrive(
+      Math.round(thr * 1000) / 1000,
+      Math.round(str * 1000) / 1000
+    )).catch(() => {});
+  }
+
+  setRcActive(active) {
+    this._rcActive = active;
+    const banner = document.getElementById('rc-gating-banner');
+    if (banner) banner.style.display = active ? 'flex' : 'none';
+    this._updateSliderState();
+  }
+
+  updateConnected(connected) {
+    this._updateSliderState();
+  }
+
+  _updateSliderState() {
+    const disabled = !this._ble.connected || this._rcActive;
+    this._velSlider.disabled = disabled;
+    this._strSlider.disabled = disabled;
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  SECTION: MAP MANAGER (Leaflet)
+// ══════════════════════════════════════════════════════
+class MapManager {
+  constructor(containerId) {
+    this._id         = containerId;
+    this._map        = null;
+    this._tileLayer  = null;
+    this._satellite  = false;
+    this._perimOrigin = null;   // ENU origin — derived from perimeter (file or ESP32)
+    this._lastPos     = null;   // buffered ENU position for deferred placement
+    this._originMark  = null;   // orange dot at the perimeter origin (first vertex)
+    this._perimLayer  = null;
+    this._navLayer    = null;
+    this._workLayer   = null;
+    this._recGroup    = null;   // in-progress recording points (LEARN mode)
+    this._mowedGroup  = null;
+    this._obsGroup    = null;
+    this._posMarker   = null;
+    this._mowPathLayer   = null;   // dashed line: planned mowing path
+    this._transitLayer   = null;   // dashed line: transit to mow start
+    this._mapData     = null;
+  }
+
+  _tileLayers() {
+    return {
+      map: {
+        url: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
+        opts: {
+          attribution: '&copy; <a href="https://openstreetmap.org">OpenStreetMap</a> contributors, &copy; <a href="https://carto.com">CARTO</a>',
+          subdomains: 'abcd', maxNativeZoom: 19, maxZoom: 24
+        }
+      },
+      satellite: {
+        url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        opts: {
+          attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community',
+          maxNativeZoom: 19, maxZoom: 24
+        }
+      }
+    };
+  }
+
+  setLayer(type) {
+    if (!this._map) return;
+    this._satellite = (type === 'satellite');
+    if (this._tileLayer) this._map.removeLayer(this._tileLayer);
+    const def = this._tileLayers()[type] ?? this._tileLayers().map;
+    this._tileLayer = L.tileLayer(def.url, def.opts).addTo(this._map);
+    this._tileLayer.bringToBack();
+    const btn = document.getElementById('btn-layer-toggle');
+    if (btn) btn.textContent = this._satellite ? 'Street Map' : 'Satellite';
+  }
+
+  init() {
+    this._map = L.map(this._id, { zoomControl: true, maxZoom: 24 });
+    this.setLayer('map');
+
+    // Draw polygon, edit, drag and removal — all other Geoman tools hidden
+    this._map.pm.addControls({
+      position:        'topright',
+      drawPolygon:     true,
+      drawMarker:      false,
+      drawCircle:      false,
+      drawPolyline:    false,
+      drawRectangle:   false,
+      drawCircleMarker:false,
+      editMode:        true,
+      dragMode:        true,
+      cutPolygon:      false,
+      removalMode:     true,
+      rotateMode:      false,
+    });
+    this._map.pm.setGlobalOptions({ snappable: true, snapDistance: 10 });
+
+    // New polygon drawn — replace any existing perimeter layer
+    this._map.on('pm:create', e => {
+      if (!(e.layer instanceof L.Polygon)) return;
+      // Calling disableDraw here (not later) prevents Geoman removing the finished layer
+      this._map.pm.disableDraw();
+      if (this._perimLayer) this._map.removeLayer(this._perimLayer);
+      this._perimLayer = e.layer;
+      this._perimLayer.setStyle({ color: '#4488ff', weight: 2.5, fillOpacity: 0.08, fillColor: '#4488ff' });
+      this._updateToolbarState();
+    });
+
+    // Polygon removed via Geoman's remove tool
+    this._map.on('pm:remove', e => {
+      if (e.layer === this._perimLayer) {
+        this._perimLayer  = null;
+        this._perimOrigin = null;
+        this._updateOriginMark();
+        this._updateToolbarState();
+      }
+    });
+
+    this._map.setView([51.5, -0.1], 18);
+
+    // If map data arrived before the tab was first opened, render it now.
+    if (this._mapData) this._applyMapData(this._mapData);
+    // Place origin dot if origin was already set before map was initialised.
+    this._updateOriginMark();
+  }
+
+  _enuToLatLon(x, y) {
+    if (!this._perimOrigin) return [0, 0];
+    const lat = this._perimOrigin.lat + y / 111319.5;
+    const lon = this._perimOrigin.lon + x / (111319.5 * Math.cos(this._perimOrigin.lat * Math.PI / 180));
+    return [lat, lon];
+  }
+
+  _updateOriginMark() {
+    if (this._originMark) {
+      this._map?.removeLayer(this._originMark);
+      this._originMark = null;
+    }
+    if (!this._map || !this._perimLayer) return;
+    // Place the origin dot at the first vertex of the displayed perimeter polygon.
+    // This is always correct regardless of what _perimOrigin is, because the polygon
+    // itself is already rendered at the right location.
+    const lls = this._perimLayer.getLatLngs();
+    const ring = Array.isArray(lls[0]) ? lls[0] : lls;
+    if (!ring.length) return;
+    const first = ring[0];
+    this._originMark = L.circleMarker(
+      [first.lat, first.lng],
+      { radius: 6, color: '#fff', weight: 2, fillColor: '#ff8c00', fillOpacity: 1, zIndexOffset: 500 }
+    ).bindTooltip('Perimeter origin').addTo(this._map);
+  }
+
+  _latLonToEnu(lat, lon, origin) {
+    const o = origin || this._perimOrigin;
+    if (!o) return [0, 0];
+    const y = (lat - o.lat) * 111319.5;
+    const x = (lon - o.lon) * 111319.5 * Math.cos(o.lat * Math.PI / 180);
+    return [x, y];
+  }
+
+  _polyToLatLons(pts, origin) {
+    const o = origin || this._perimOrigin;
+    if (!o) return [];
+    return pts.map(([x, y]) => {
+      const lat = o.lat + y / 111319.5;
+      const lon = o.lon + x / (111319.5 * Math.cos(o.lat * Math.PI / 180));
+      return [lat, lon];
+    });
+  }
+
+  loadMapData(data) {
+    this._mapData = data;
+    console.log('[Map] loadMapData: origin=', data.origin,
+                'perimeter pts=', data.perimeter?.length ?? 'missing');
+
+    // The ESP32 map JSON includes the GPS ENU origin — the lat/lon where the firmware
+    // established its coordinate frame. All polygon vertices and the mower position
+    // are ENU offsets from this point. Only adopt when non-zero (zero = GPS not yet fixed).
+    const hadOrigin = !!this._perimOrigin;
+    if (data.origin?.lat || data.origin?.lon) {
+      this._perimOrigin = data.origin;
+    }
+
+    // Map tab may not have been opened yet — init() deferred until then.
+    // Store the data and return; init() will call _applyMapData() on first open.
+    if (!this._map) { console.log('[Map] map not ready, data buffered'); return; }
+
+    this._applyMapData(data);
+    this._updateOriginMark();
+
+    // If origin just became known and there is a buffered position, place it now.
+    if (!hadOrigin && this._perimOrigin && this._lastPos) {
+      this.updatePosition(this._lastPos.x, this._lastPos.y, this._lastPos.hdg);
+    }
+  }
+
+  _applyMapData(data) {
+    this._renderPolygons(data);
+    this._renderPlannedPaths(data);
+    this._renderMowedCells(data);
+    this._renderObstacles(data);
+    if (data.pos) this.updatePosition(data.pos.x, data.pos.y, data.pos.hdg);
+
+    // Fit view to perimeter (including padded partial perimeters)
+    if (this._perimLayer) {
+      this._map.fitBounds(this._perimLayer.getBounds(), { padding: [20, 20] });
+    }
+    document.getElementById('map-status').textContent =
+      `Updated ${new Date().toLocaleTimeString()}`;
+    this._updateToolbarState();
+  }
+
+  _renderPolygons(data) {
+    if (this._perimLayer) { this._map.removeLayer(this._perimLayer); this._perimLayer = null; }
+    if (this._navLayer)   { this._map.removeLayer(this._navLayer);   this._navLayer   = null; }
+    if (this._workLayer)  { this._map.removeLayer(this._workLayer);  this._workLayer  = null; }
+
+    // Pad partial perimeter (1-2 points) to a 1m triangle so it's an editable polygon.
+    // The synthetic points are purely in the WebUI — firmware NVS is only updated
+    // if the user edits the polygon and/or sends it back to the ESP32.
+    let perimPts = data.perimeter ? [...data.perimeter] : [];
+    if (perimPts.length === 1) {
+      const [x, y] = perimPts[0];
+      perimPts.push([x + 1, y], [x + 0.5, y + 0.866]);
+    } else if (perimPts.length === 2) {
+      const [x0, y0] = perimPts[0];
+      const [x1, y1] = perimPts[1];
+      const mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
+      const dx = x1 - x0, dy = y1 - y0;
+      const len = Math.sqrt(dx * dx + dy * dy) || 1;
+      const side = Math.max(len, 1);
+      perimPts.push([mx - dy / len * side * 0.5, my + dx / len * side * 0.5]);
+    }
+
+    if (perimPts.length >= 3) {
+      this._perimLayer = L.polygon(this._polyToLatLons(perimPts), {
+        color: '#4488ff', weight: 2.5, fillOpacity: 0.08, fillColor: '#4488ff'
+      }).addTo(this._map);
+    }
+
+    // In-progress recording points (shown during active LEARN session)
+    if (this._recGroup) { this._map.removeLayer(this._recGroup); this._recGroup = null; }
+    if (data.recording?.length > 0) {
+      this._recGroup = L.layerGroup();
+      const lls = this._polyToLatLons(data.recording);
+      lls.forEach((ll, i) => {
+        L.circleMarker(ll, {
+          radius: 6, color: '#8833cc', fillColor: '#bb66ff', fillOpacity: 0.8, weight: 2
+        }).bindTooltip(`Pt ${i + 1}`).addTo(this._recGroup);
+      });
+      if (lls.length > 1) {
+        L.polyline(lls, { color: '#8833cc', weight: 2, dashArray: '6,4', opacity: 0.7 })
+          .addTo(this._recGroup);
+      }
+      this._recGroup.addTo(this._map);
+      if (!data.perimeter?.length) {
+        this._map.fitBounds(L.latLngBounds(lls).pad(0.3));
+      }
+    }
+    // nav_boundary and working_area are derived insets — not shown on map.
+  }
+
+  _renderPlannedPaths(data) {
+    if (this._mowPathLayer) { this._map.removeLayer(this._mowPathLayer); this._mowPathLayer = null; }
+    if (this._transitLayer) { this._map.removeLayer(this._transitLayer); this._transitLayer = null; }
+
+    // Mowing path — segmented: each element is a segment of [x,y] points.
+    // Rendered as a multi-polyline so segments don't connect across transits.
+    if (data.mow_path?.length > 0) {
+      const multiLls = data.mow_path
+        .filter(seg => seg.length > 1)
+        .map(seg => this._polyToLatLons(seg));
+      if (multiLls.length > 0) {
+        this._mowPathLayer = L.polyline(multiLls, {
+          color: '#00cc44', weight: 1.5, dashArray: '6,4', opacity: 0.7
+        }).addTo(this._map);
+      }
+    }
+
+    // Transit path — dashed orange line from mower to mow start
+    if (data.transit_path?.length > 1) {
+      const lls = this._polyToLatLons(data.transit_path);
+      this._transitLayer = L.polyline(lls, {
+        color: '#ff8c00', weight: 2, dashArray: '8,6', opacity: 0.8
+      }).addTo(this._map);
+    }
+  }
+
+  _renderMowedCells(data) {
+    if (this._mowedGroup) { this._map.removeLayer(this._mowedGroup); this._mowedGroup = null; }
+    const g = data.grid;
+    if (!g || !data.mowed_cells?.length) return;
+    this._mowedGroup = L.layerGroup();
+    const cs = g.cell_m;
+    for (const [col, row] of data.mowed_cells) {
+      const wx = g.ox + col * cs;
+      const wy = g.oy + row * cs;
+      const sw = this._enuToLatLon(wx,      wy);
+      const ne = this._enuToLatLon(wx + cs, wy + cs);
+      L.rectangle([sw, ne], { color: '#00cc44', weight: 0, fillOpacity: 0.35 })
+        .addTo(this._mowedGroup);
+    }
+    this._mowedGroup.addTo(this._map);
+  }
+
+  _renderObstacles(data) {
+    if (this._obsGroup) { this._map.removeLayer(this._obsGroup); this._obsGroup = null; }
+    if (!data.obstacles?.length) return;
+    this._obsGroup = L.layerGroup();
+    for (const obs of data.obstacles) {
+      const ll = this._enuToLatLon(obs.x, obs.y);
+      L.circle(ll, { radius: 0.3, color: '#ff2233', weight: 2, fillOpacity: 0.5 })
+        .addTo(this._obsGroup);
+    }
+    this._obsGroup.addTo(this._map);
+  }
+
+  updatePosition(x, y, hdg) {
+    this._lastPos = { x, y, hdg };
+    if (!this._map) return;
+    if (!this._perimOrigin) return;
+    const ll = this._enuToLatLon(x, y);
+    const deg = hdg * 180 / Math.PI;
+    const icon = L.divIcon({
+      className: '',
+      html: `<svg width="22" height="22" viewBox="0 0 22 22" style="transform:rotate(${deg}deg);transform-origin:center;display:block"><polygon points="11,1 20,21 11,16 2,21" fill="#e94560" stroke="#fff" stroke-width="1.5"/></svg>`,
+      iconSize: [22, 22], iconAnchor: [11, 11]
+    });
+    if (!this._posMarker) {
+      this._posMarker = L.marker(ll, { icon, zIndexOffset: 1000 }).addTo(this._map);
+    } else {
+      this._posMarker.setLatLng(ll);
+      this._posMarker.setIcon(icon);
+    }
+  }
+
+  /** Diagnostic: compute distance from EKF-derived position to first perimeter vertex.
+   *  Logs to console and updates the map-diag element so we can see whether the
+   *  error is in the EKF coordinates or the map integration. */
+  _logPositionDiagnostic(ekfX, ekfY, gpsLat, gpsLon) {
+    if (!this._map) return;
+    // EKF position converted to lat/lon via _perimOrigin
+    const ekfLL = this._perimOrigin ? this._enuToLatLon(ekfX, ekfY) : [0, 0];
+    // First perimeter vertex (from rendered polygon)
+    let perimLL = null;
+    if (this._perimLayer) {
+      const lls = this._perimLayer.getLatLngs();
+      const ring = Array.isArray(lls[0]) ? lls[0] : lls;
+      if (ring.length) perimLL = [ring[0].lat, ring[0].lng];
+    }
+    // Flat-earth distance: EKF-derived position to first perimeter vertex
+    let distEkfPerim = '—';
+    if (perimLL && this._perimOrigin) {
+      const de = (ekfLL[1] - perimLL[1]) * Math.cos(perimLL[0] * Math.PI / 180) * 111319.5;
+      const dn = (ekfLL[0] - perimLL[0]) * 111319.5;
+      distEkfPerim = Math.sqrt(de*de + dn*dn).toFixed(1) + ' m';
+    }
+    // Flat-earth distance: GPS lat/lon to first perimeter vertex
+    let distGpsPerim = '—';
+    if (perimLL && gpsLat && gpsLon) {
+      const de = (gpsLon - perimLL[1]) * Math.cos(perimLL[0] * Math.PI / 180) * 111319.5;
+      const dn = (gpsLat - perimLL[0]) * 111319.5;
+      distGpsPerim = Math.sqrt(de*de + dn*dn).toFixed(1) + ' m';
+    }
+    // Update diagnostic display
+    const el = document.getElementById('map-diag');
+    if (el) {
+      el.textContent =
+        `EKF(${ekfX.toFixed(2)},${ekfY.toFixed(2)})→LL(${ekfLL[0].toFixed(6)},${ekfLL[1].toFixed(6)}) | ` +
+        `origin(${this._perimOrigin?.lat?.toFixed(6) ?? '?'},${this._perimOrigin?.lon?.toFixed(6) ?? '?'}) | ` +
+        `perimV0(${perimLL?.[0]?.toFixed(6) ?? '?'},${perimLL?.[1]?.toFixed(6) ?? '?'}) | ` +
+        `EKF↔perim: ${distEkfPerim} | GPS↔perim: ${distGpsPerim} | ` +
+        `GPS(${gpsLat?.toFixed(6) ?? '?'},${gpsLon?.toFixed(6) ?? '?'})`;
+    }
+    // Throttled console log (every 5s)
+    const now = Date.now();
+    if (!this._lastDiagMs || now - this._lastDiagMs > 5000) {
+      this._lastDiagMs = now;
+      console.log(`[DIAG] EKF ENU: (${ekfX.toFixed(3)}, ${ekfY.toFixed(3)}) → LL: (${ekfLL[0].toFixed(7)}, ${ekfLL[1].toFixed(7)})`);
+      console.log(`[DIAG] Origin: (${this._perimOrigin?.lat?.toFixed(7) ?? 'null'}, ${this._perimOrigin?.lon?.toFixed(7) ?? 'null'})`);
+      console.log(`[DIAG] GPS LL: (${gpsLat?.toFixed(7) ?? 'null'}, ${gpsLon?.toFixed(7) ?? 'null'})`);
+      console.log(`[DIAG] Perim[0]: (${perimLL?.[0]?.toFixed(7) ?? 'null'}, ${perimLL?.[1]?.toFixed(7) ?? 'null'})`);
+      console.log(`[DIAG] EKF↔perim: ${distEkfPerim}, GPS↔perim: ${distGpsPerim}`);
+    }
+  }
+
+  centreOnGps() {
+    if (!this._map) return;
+    if (this._posMarker) {
+      this._map.panTo(this._posMarker.getLatLng());
+    } else {
+      showToast('No GPS position yet', false);
+    }
+  }
+
+  getEditedPolygon() {
+    if (!this._perimLayer) return null;
+    // getLatLngs returns nested array for polygons — unwrap one level
+    const lls = this._perimLayer.getLatLngs();
+    const ring = Array.isArray(lls[0]) ? lls[0] : lls;
+    // Origin is always the first perimeter vertex. All ENU coordinates are
+    // offsets from this point. Vertex[0] will always be (0, 0) in ENU.
+    const o = { lat: ring[0].lat, lon: ring[0].lng };
+    this._perimOrigin = o;
+    return ring.map(ll => this._latLonToEnu(ll.lat, ll.lng, o));
+  }
+
+  // Load a perimeter from a JSON file directly onto the map.
+  // The file's origin becomes the reference frame for all ENU conversions,
+  // including the mower arrow (until the ESP32 pushes a map with its own origin).
+  loadFilePerimeter(data) {
+    if (!data.origin || !data.polygon?.length) return;
+    this._perimOrigin = data.origin;
+    if (this._perimLayer) this._map.removeLayer(this._perimLayer);
+    this._perimLayer = L.polygon(this._polyToLatLons(data.polygon), {
+      color: '#4488ff', weight: 2.5, fillOpacity: 0.08, fillColor: '#4488ff'
+    }).addTo(this._map);
+    this._map.fitBounds(this._perimLayer.getBounds(), { padding: [20, 20] });
+    this._updateOriginMark();
+    this._updateToolbarState();
+  }
+
+  _updateToolbarState() {
+    const hasPerim  = !!this._perimLayer;
+    const connected = !!window._ble?.connected;
+    const saveBtn   = document.getElementById('btn-save-perim');
+    const upBtn     = document.getElementById('btn-upload-map-perim');
+    if (saveBtn) saveBtn.disabled = !hasPerim;
+    if (upBtn)   upBtn.disabled   = !hasPerim || !connected;
+  }
+
+  get origin() { return this._perimOrigin; }
+  get hasPerimeter() { return !!this._perimLayer; }
+}
+
+// ══════════════════════════════════════════════════════
+//  SECTION: UI — DASHBOARD
+// ══════════════════════════════════════════════════════
+function buildDashboard(telem) {
+  const d = telem.data;
+  const col = STATE_COLOURS[d.state] ?? '#888';
+
+  const bladeBarCls = d.bladeLoad > 0.9 ? 'red' : d.bladeLoad > 0.75 ? 'amber' : 'green';
+  const bladeBarW   = Math.round(d.bladeLoad * 100);
+  const battPct     = Math.max(0, Math.min(100, ((d.battV - 40) / 10) * 100));
+  const battBarCls  = d.battV < 42 ? 'red' : d.battV < 44 ? 'amber' : 'green';
+
+  const progPct = Math.round(telem.progTotal * 100);
+
+  // Module health chips from telemetry (d.mod)
+  const m = d.mod ?? {};
+  function chip(label, ok, tip) {
+    const cls = ok === null ? 'grey' : ok ? 'ok' : 'fail';
+    return `<span class="mod-chip ${cls}" title="${tip}">${label}</span>`;
+  }
+  function chipTristate(label, cls, tip) {
+    return `<span class="mod-chip ${cls}" title="${tip}">${label}</span>`;
+  }
+  const bleConnected = !!window._ble?.connected;
+  // GPS: 4 states — no comms (red), no fix (amber), fix/no RTK (yellow), RTK (green)
+  const gpsFix = d.fix ?? 0;
+  const gpsLabel = gpsFix === 4 ? 'GPS: RTK Fixed'
+                 : gpsFix === 5 ? 'GPS: RTK Float'
+                 : gpsFix === 1 ? 'GPS: Autonomous'
+                 : gpsFix === 2 ? 'GPS: DGPS'
+                 : 'GPS: No Fix';
+  const gpsClass = !bleConnected          ? 'grey'
+                 : m.gps === 0            ? 'fail'
+                 : gpsFix === 0           ? 'warn'
+                 : (gpsFix === 4 || gpsFix === 5) ? 'ok'
+                 : 'yellow';
+  // VESCs: 3 states — CAN bus down (red), bus OK but VESC silent (amber), VESC responding (green)
+  function vescChip(label, vescOk, tip) {
+    const cls = !bleConnected ? 'grey' : m.can === 0 ? 'fail' : vescOk ? 'ok' : 'warn';
+    return `<span class="mod-chip ${cls}" title="${tip}">${label}</span>`;
+  }
+  const modHtml = `
+    ${chip('IMU',     bleConnected ? m.imu !== 0 : null, 'BMI270 inertial measurement unit — provides heading, collision detection, and tilt safety')}
+    ${chipTristate(gpsLabel, gpsClass, 'u-blox RTK GPS receiver. RTK Fixed = cm-level accuracy. No Fix or Autonomous = not accurate enough for mowing')}
+    ${chip('RC',      bleConnected ? m.rc  !== 0 : null, 'ELRS RC receiver (CRSF protocol). Provides manual control, arm switch (CH6), and pause (CH7)')}
+    ${chip('CAN Bus', bleConnected ? m.can !== 0 : null, 'TWAI/CAN bus connecting the ESP32 to the three VESC motor controllers')}
+    ${vescChip('VESC-L', m.vL !== 0, 'Left drive wheel VESC motor controller. Amber = CAN bus OK but no response from this VESC')}
+    ${vescChip('VESC-R', m.vR !== 0, 'Right drive wheel VESC motor controller. Amber = CAN bus OK but no response from this VESC')}
+    ${vescChip('VESC-B', m.vB !== 0, 'Blade motor VESC controller. Amber = CAN bus OK but no response from this VESC')}`;
+
+  // System log from last status response (d.log)
+  const logEntries = Array.isArray(d.log) ? d.log : [];
+  window._lastLogEntries = logEntries;   // kept for the Copy button
+  const logHtml = logEntries.length === 0
+    ? '<div class="log-box empty">No messages</div>'
+    : `<div class="log-box">${
+        logEntries.map(e => `<div class="log-entry">${escHtml(e)}</div>`).join('')
+      }</div>`;
+
+  return `
+    <div class="card" style="grid-column:1/-1" title="Current operating state of the mower and overall mowing progress as a percentage of the planned area">
+      <div class="card-title">State</div>
+      <span class="state-badge" style="background:${col}20;color:${col};border:1px solid ${col}">${d.state}</span>
+      <div class="sw-row">
+        <span class="sw-chip ${d.armed ? 'on' : ''}" title="CH6 arm switch / s_last_armed">ARM: ${d.armed ? 'ON' : 'OFF'}</span>
+        <span class="sw-chip ${d.ch6Us > 1530 ? 'on' : d.ch6Us > 1168 ? 'warn' : ''}" title="CH6 raw µs — >1530=armed, 1168-1530=borderline, <1168=disarmed">CH6: ${d.ch6Us}µs</span>
+        <span class="sw-chip ${['','on','warn'][d.modeSw] || ''}" title="CH4 mode switch">${['MODE: Manual','MODE: Auto','MODE: Return'][d.modeSw] || 'MODE: ?'}</span>
+        <span class="sw-chip ${d.pauseSw ? 'warn' : ''}" title="CH7 pause switch">PAUSE: ${d.pauseSw ? 'ON' : 'OFF'}</span>
+        <span class="sw-chip ${d.learnSw ? 'on' : ''}" title="CH5 learn switch">LEARN: ${d.learnSw ? 'ON' : 'OFF'}</span>
+        <span class="sw-chip ${d.tilt > 30 ? 'warn' : d.tilt > 15 ? 'on' : ''}" title="IMU tilt angle (normal limit 30°, careful limit 15°)">TILT: ${d.tilt.toFixed(0)}°</span>
+        <span class="sw-chip ${d.bladeCmd ? 'on' : ''}" title="Blade commanded to spin (set by arm switch in MANUAL/AUTO)">BLADE: ${d.bladeCmd ? 'ON' : 'OFF'}</span>
+      </div>
+      <div class="card-title" style="margin-top:8px">Overall Progress</div>
+      <div style="font-size:.85rem;color:var(--muted);margin-bottom:2px">${progPct}%</div>
+      <div class="prog-bar-wrap"><div class="prog-bar" style="width:${progPct}%"></div></div>
+    </div>
+
+    <div class="card" style="grid-column:1/-1">
+      <div class="card-title">Modules</div>
+      <div class="mod-grid">${modHtml}</div>
+    </div>
+
+    <div class="card" title="RTK GPS status. Fix type, satellite count, horizontal accuracy, EKF uncertainty, and RTCM correction age">
+      <div class="card-title">GPS</div>
+      <div class="card-value" style="font-size:1rem">${telem.fixLabel}</div>
+      <div class="card-sub">Sats: ${d.sat} · GPS acc: ±${telem.gpsAccLabel}</div>
+      <div class="card-sub">${telem.latLonLabel}</div>
+      <div class="card-sub">EKF ±${(d.unc*100).toFixed(0)}cm · Corr age: ${telem.difAgeLabel}</div>
+    </div>
+
+    <div class="card" title="Current ground speed from the EKF (m/s) and compass heading in degrees (0 = North, clockwise)">
+      <div class="card-title">Speed</div>
+      <div class="card-value">${d.vel.toFixed(2)}<span style="font-size:.8rem;font-weight:400"> m/s</span></div>
+      <div class="card-sub">Hdg: ${(d.hdg * 180/Math.PI).toFixed(1)}°</div>
+    </div>
+
+    <div class="card" title="Blade motor RPM, current draw, and load percentage. Bar turns amber above 75% load and red above 90%">
+      <div class="card-title">Blade</div>
+      <div class="card-value" style="font-size:1rem">${Math.round(d.bladeRPM)} RPM</div>
+      <div class="prog-bar-wrap"><div class="prog-bar ${bladeBarCls}" style="width:${bladeBarW}%"></div></div>
+      <div class="card-sub">${d.cutStatus} · ${(d.bladeLoad*100).toFixed(0)}% load · ${d.bladeA.toFixed(1)}A</div>
+    </div>
+
+    <div class="card" title="Battery pack voltage (40V = empty, 50V = full for 12S LiPo). Bar turns amber below 44V and red below 42V">
+      <div class="card-title">Battery</div>
+      <div class="card-value">${d.battV.toFixed(1)}<span style="font-size:.8rem;font-weight:400">V</span></div>
+      <div class="prog-bar-wrap"><div class="prog-bar ${battBarCls}" style="width:${battPct.toFixed(0)}%"></div></div>
+      <div class="card-sub">${d.battState}</div>
+    </div>
+
+    <div class="card" title="Current cutting deck height in mm and arm/disarm status (controlled by the RC transmitter CH6 switch)">
+      <div class="card-title">Cut Height</div>
+      <div class="card-value">${Math.round(d.cutH)}<span style="font-size:.8rem;font-weight:400">mm</span></div>
+      <div class="card-sub">${d.armed ? '🟢 Armed' : '⚫ Disarmed'}</div>
+    </div>
+
+    <div class="card" title="Current session stats: obstacle collision count, IMU collision detection baseline acceleration, and firmware uptime">
+      <div class="card-title">Session</div>
+      <div class="card-sub">Obstacles: ${d.obs}</div>
+      <div class="card-sub">Collision baseline: ${d.collBase.toFixed(3)}g</div>
+      <div class="card-sub">Uptime: ${Math.floor(d.t/60000)}m ${Math.floor((d.t%60000)/1000)}s</div>
+    </div>
+
+    <div class="card" style="grid-column:1/-1" title="Recent system log messages from the firmware (newest at the bottom)">
+      <div class="card-title">System Log
+        <button class="ctrl-btn" style="float:right;padding:2px 10px;font-size:0.72rem"
+                onclick="window._copySysLog && window._copySysLog(this)"
+                title="Copy all log lines to the clipboard for pasting into a bug report">Copy</button>
+      </div>
+      ${logHtml}
+    </div>
+  `;
+}
+
+// Copy the last-received system log to the clipboard (used by the button above;
+// defined on window because the dashboard HTML is re-rendered on every update).
+window._copySysLog = async function(btn) {
+  const lines = (window._lastLogEntries || []).join('\n');
+  if (!lines) { showToast('Log is empty', false); return; }
+  try {
+    await navigator.clipboard.writeText(lines);
+    showToast('Log copied to clipboard', true);
+  } catch (e) {
+    showToast('Copy failed: ' + e.message, false);
+  }
+};
+
+// ══════════════════════════════════════════════════════
+//  SECTION: DIAGNOSTICS RENDERER
+// ══════════════════════════════════════════════════════
+
+function buildDiagnostics(d) {
+  function row(label, value, cls) {
+    const c = cls ? ` class="${cls}"` : '';
+    return `<tr><td>${label}</td><td${c}>${value}</td></tr>`;
+  }
+  function tbl(rows) { return `<table class="diag-table">${rows}</table>`; }
+  function staleMs(dt) { return dt > 500 ? 'diag-stale' : ''; }
+
+  const chNames = ['Steer','Throttle','Cut Height','Mode','Learn','Arm','Pause','Learn Pt'];
+  const rcCh = (d.rc?.ch ?? []).map((v, i) =>
+    row('CH' + (i+1) + ' ' + (chNames[i]??''), v)).join('');
+
+  const hdgDeg = ((d.imu?.hdg ?? 0) * 180 / Math.PI).toFixed(1);
+  const gzDegS = ((d.imu?.gz  ?? 0) * 180 / Math.PI).toFixed(2);
+  const fixNames = {0:'None',1:'GPS',2:'DGPS',4:'RTK Fixed',5:'RTK Float'};
+
+  return `
+    <div class="diag-card" title="BMI270 inertial measurement unit — heading, gyro rate, and bias calibration">
+      <div class="card-title">IMU (BMI270)</div>
+      ${tbl(
+        row('Status', d.imu?.ok ? 'OK' : 'FAULT', d.imu?.ok ? 'diag-ok' : 'diag-stale') +
+        row('Pitch', (d.imu?.pitch?.toFixed(1) ?? '?') + '\u00b0') +
+        row('Roll', (d.imu?.roll?.toFixed(1) ?? '?') + '\u00b0') +
+        row('Yaw (heading)', hdgDeg + '\u00b0') +
+        row('Gyro Z rate', gzDegS + '\u00b0/s') +
+        row('Gyro bias', (d.imu?.bias?.toFixed(5) ?? '?') + ' rad/s') +
+        row('Surge (fwd)', (d.imu?.surge?.toFixed(3) ?? '?') + ' g') +
+        row('Sway (right)', (d.imu?.sway?.toFixed(3) ?? '?') + ' g') +
+        row('Heave (up)', (d.imu?.heave?.toFixed(3) ?? '?') + ' g')
+      )}
+      <div style="color:var(--muted);font-size:0.75em;padding:4px 8px;line-height:1.4">
+        Pitch: nose up = +ve &nbsp; Roll: right down = +ve &nbsp; Yaw: clockwise = +ve<br>
+        Surge: forward = +ve &nbsp; Sway: right = +ve &nbsp; Heave: up = +ve (tilt board to verify signs)
+      </div>
+    </div>
+
+    <div class="diag-card" title="RTK GPS receiver — fix quality, position, and RTCM correction status">
+      <div class="card-title">GPS (LC29H)</div>
+      ${tbl(
+        row('Fix', fixNames[d.gps?.fix] ?? '?', d.gps?.fix >= 4 ? 'diag-ok' : d.gps?.fix >= 1 ? 'diag-warn' : 'diag-stale') +
+        row('Sats', d.gps?.sat ?? '?') +
+        row('HDOP', d.gps?.hdop?.toFixed(2) ?? '?') +
+        row('Lat / Lon', (d.gps?.lat?.toFixed(7) ?? '?') + ' / ' + (d.gps?.lon?.toFixed(7) ?? '?')) +
+        row('ENU E / N', (d.gps?.e?.toFixed(3) ?? '?') + ' / ' + (d.gps?.n?.toFixed(3) ?? '?') + ' m') +
+        row('Corr age', (d.gps?.age?.toFixed(1) ?? '?') + ' s', (d.gps?.age ?? 0) > 2 ? 'diag-warn' : '') +
+        row('Timeout', d.gps?.tmo ? 'YES' : 'no', d.gps?.tmo ? 'diag-stale' : 'diag-ok') +
+        row('Valid', d.gps?.v ? 'yes' : 'no', d.gps?.v ? 'diag-ok' : 'diag-stale')
+      )}
+    </div>
+
+    <div class="diag-card" title="ELRS RC receiver (CRSF protocol) — raw channel values (172\u20131811 CRSF range)">
+      <div class="card-title">RC Receiver (CRSF)</div>
+      ${tbl(
+        rcCh +
+        row('Failsafe', d.rc?.fs ? 'ACTIVE' : 'OK', d.rc?.fs ? 'diag-stale' : 'diag-ok') +
+        row('Frame age', (d.rc?.age ?? '?') + ' ms', (d.rc?.age ?? 9999) > 100 ? 'diag-warn' : '')
+      )}
+    </div>
+
+    <div class="diag-card" title="Left drive wheel VESC — feedback from motor and commanded current from firmware">
+      <div class="card-title">VESC Left (ID 1)</div>
+      ${tbl(
+        row('eRPM', Math.round(d.vL?.rpm ?? 0)) +
+        row('Current (feedback)', (d.vL?.A?.toFixed(2) ?? '?') + ' A') +
+        row('Current (commanded)', (d.vL?.cmdA?.toFixed(2) ?? '?') + ' A') +
+        row('Duty', (((d.vL?.d ?? 0)) * 100).toFixed(1) + '%') +
+        row('Distance', (d.vL?.dist?.toFixed(2) ?? '?') + ' m') +
+        row('Velocity', (d.vL?.vel?.toFixed(3) ?? '?') + ' m/s') +
+        row('Stale', (d.vL?.dt ?? '?') + ' ms', staleMs(d.vL?.dt))
+      )}
+    </div>
+
+    <div class="diag-card" title="Right drive wheel VESC — feedback from motor and commanded current from firmware">
+      <div class="card-title">VESC Right (ID 2)</div>
+      ${tbl(
+        row('eRPM', Math.round(d.vR?.rpm ?? 0)) +
+        row('Current (feedback)', (d.vR?.A?.toFixed(2) ?? '?') + ' A') +
+        row('Current (commanded)', (d.vR?.cmdA?.toFixed(2) ?? '?') + ' A') +
+        row('Duty', (((d.vR?.d ?? 0)) * 100).toFixed(1) + '%') +
+        row('Distance', (d.vR?.dist?.toFixed(2) ?? '?') + ' m') +
+        row('Velocity', (d.vR?.vel?.toFixed(3) ?? '?') + ' m/s') +
+        row('Stale', (d.vR?.dt ?? '?') + ' ms', staleMs(d.vR?.dt))
+      )}
+    </div>
+
+    <div class="diag-card" title="Blade motor VESC — RPM feedback, current draw, and duty cycle">
+      <div class="card-title">VESC Blade (ID 3)</div>
+      ${tbl(
+        row('RPM', Math.round(d.vB?.rpm ?? 0)) +
+        row('eRPM', Math.round(d.vB?.erpm ?? 0)) +
+        row('Current (feedback)', (d.vB?.A?.toFixed(2) ?? '?') + ' A') +
+        row('Duty', (((d.vB?.d ?? 0)) * 100).toFixed(1) + '%') +
+        row('Stale', (d.vB?.dt ?? '?') + ' ms', staleMs(d.vB?.dt))
+      )}
+    </div>
+
+    <div class="diag-card" title="Extended Kalman Filter — fused position, heading, speed, and uncertainty estimate">
+      <div class="card-title">EKF Localiser</div>
+      ${tbl(
+        row('X / Y', (d.ekf?.x?.toFixed(3) ?? '?') + ' / ' + (d.ekf?.y?.toFixed(3) ?? '?') + ' m') +
+        row('Heading', (((d.ekf?.h ?? 0) * 180 / Math.PI).toFixed(1)) + '\u00b0') +
+        row('Speed', (d.ekf?.v?.toFixed(3) ?? '?') + ' m/s') +
+        row('Uncertainty', '\u00b1' + (((d.ekf?.u ?? 0) * 100).toFixed(1)) + ' cm')
+      )}
+    </div>
+
+    <div class="diag-card" title="Path following cross-track error, blade load, battery voltage, and CAN bus status">
+      <div class="card-title">Path Following / Cutting</div>
+      ${tbl(
+        row('Cross-track err', (d.xte?.toFixed(3) ?? '?') + ' m') +
+        row('Margin', (d.margin?.toFixed(2) ?? '?') + ' m',
+            (d.margin ?? 1) <= 0 ? 'diag-stale' : (d.margin ?? 1) < 0.5 ? 'diag-warn' : 'diag-ok') +
+        row('Tilt', (d.tilt?.toFixed(1) ?? '?') + '\u00b0',
+            (d.tilt ?? 0) > 20 ? 'diag-warn' : '') +
+        row('Heading AGC', (d.hdgGain?.toFixed(2) ?? '?') + '\u00d7',
+            (d.hdgGain ?? 1) < 0.5 ? 'diag-warn' : '') +
+        row('Blade avg current', (d.cutA?.toFixed(2) ?? '?') + ' A') +
+        row('Blade load', (((d.cutLF ?? 0) * 100).toFixed(1)) + '%',
+            (d.cutLF ?? 0) > 0.75 ? 'diag-warn' : '') +
+        row('Battery', (d.battV?.toFixed(1) ?? '?') + ' V') +
+        row('CAN bus', d.can ? 'OK' : 'FAULT', d.can ? 'diag-ok' : 'diag-stale')
+      )}
+    </div>
+  `;
+}
+
+// ══════════════════════════════════════════════════════
+//  SECTION: UTILITIES
+// ══════════════════════════════════════════════════════
+function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+let _toastTimer = null;
+function showToast(msg, ok) {
+  const el = document.getElementById('ack-toast');
+  el.textContent = msg;
+  el.className = 'ack-toast show ' + (ok ? 'ok' : 'fail');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => el.classList.remove('show'), 3000);
+}
+
+// ══════════════════════════════════════════════════════
+//  SECTION: MAIN — router, tab bar, init
+// ══════════════════════════════════════════════════════
+
+function showTab(name) {
+  document.querySelectorAll('.tab').forEach(t => {
+    t.classList.toggle('active', t.id === 'tab-' + name);
+  });
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === name);
+  });
+  if (name === 'map') {
+    const mgr = window._mapMgr;
+    if (mgr && !mgr._map) {
+      mgr.init();
+    } else {
+      setTimeout(() => mgr?._map?.invalidateSize(), 50);
+    }
+  }
+  // Diagnostics polling: start when tab shown, stop when hidden
+  if (name === 'diag') {
+    if (!window._diagInterval && window._ble?.connected) {
+      window._ble.sendCommand(Commands.requestDiag()).catch(() => {});
+      window._diagInterval = setInterval(() => {
+        if (window._ble?.connected)
+          window._ble.sendCommand(Commands.requestDiag()).catch(() => {});
+      }, 500);
+    }
+  } else {
+    if (window._diagInterval) {
+      clearInterval(window._diagInterval);
+      window._diagInterval = null;
+    }
+  }
+}
+
+async function main() {
+  // Check Web Bluetooth support
+  if (!navigator.bluetooth) {
+    document.getElementById('no-ble-banner').style.display = 'flex';
+    return;
+  }
+
+  const ble    = new BLEManager();
+  const telem  = new TelemetryStore();
+  const mapMgr = new MapManager('map');
+  window._mapMgr = mapMgr;
+  window._ble    = ble;
+
+  // ── Tab bar navigation ──────────────────────────────
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => showTab(btn.dataset.tab));
+  });
+// ── BLE connect button ──────────────────────────────
+  const bleBtn   = document.getElementById('ble-btn');
+  const bleDot   = document.getElementById('ble-dot');
+  const bleLabel = document.getElementById('ble-label');
+
+  function updateBleUi(connected) {
+    bleDot.className     = connected ? 'connected' : 'disconnected';
+    bleLabel.textContent = connected ? 'Connected'  : 'Disconnected';
+    bleBtn.textContent   = connected ? 'Disconnect' : 'Connect';
+    // Controls that require BLE
+    document.querySelectorAll('.mode-btn, .ctrl-btn, #cut-height-slider, #btn-get-esp32, #btn-upload-map-perim')
+      .forEach(el => el.disabled = !connected);
+    if (typeof driveCrl !== 'undefined') driveCrl.updateConnected(connected);
+  }
+
+  bleBtn.addEventListener('click', async () => {
+    if (ble.connected) { ble.disconnect(); return; }
+    bleBtn.textContent = '...';
+    bleBtn.disabled    = true;
+    try {
+      await ble.connect();
+    } catch (e) {
+      showToast('Connect failed: ' + e.message, false);
+    } finally {
+      bleBtn.disabled = false;
+      updateBleUi(ble.connected);
+    }
+  });
+
+  ble.onConnect    = () => {
+    updateBleUi(true);
+    mapMgr._updateToolbarState();
+    document.getElementById('cfg-save-btn').disabled = false;
+    // If diag tab is active on reconnect, start polling
+    if (document.getElementById('tab-diag')?.classList.contains('active')) {
+      if (!window._diagInterval) {
+        window._diagInterval = setInterval(() => {
+          if (window._ble?.connected)
+            window._ble.sendCommand(Commands.requestDiag()).catch(() => {});
+        }, 500);
+      }
+    }
+  };
+  ble.onDisconnect = () => {
+    updateBleUi(false);
+    mapMgr._updateToolbarState();
+    document.getElementById('dash-grid').innerHTML = buildDashboard(telem);
+    document.getElementById('cfg-save-btn').disabled = true;
+    if (window._diagInterval) {
+      clearInterval(window._diagInterval);
+      window._diagInterval = null;
+    }
+    showToast('BLE disconnected', false);
+  };
+
+  // ── Diagnostics tab: planner dry-run + log refresh ───
+  document.getElementById('btn-plan-test')?.addEventListener('click', async () => {
+    try { await ble.sendCommand({ cmd: 'PLAN_TEST' }); }
+    catch (e) { showToast(e.message, false); }
+  });
+  document.getElementById('btn-refresh-log')?.addEventListener('click', async () => {
+    try { await ble.sendCommand(Commands.requestStatus()); }
+    catch (e) { showToast(e.message, false); }
+  });
+
+  // ── DriveController ──────────────────────────────────
+  const driveCrl = new DriveController(ble);
+
+  // ── Telemetry → dashboard + controls ───────────────
+  telem.onChange(d => {
+    // Battery warning: toast + audible beep when the state degrades.
+    // No automatic return — the operator decides (Return button / CH4).
+    if (d.battState && d.battState !== window._prevBattState) {
+      const wasOk = !window._prevBattState || window._prevBattState === 'OK';
+      if (wasOk && (d.battState === 'WARNING' || d.battState === 'LOW')) {
+        showToast(`Battery ${d.battState} (${(d.battV ?? 0).toFixed(1)}V) — consider Return`, false);
+        try {
+          const ctx = window._beepCtx || (window._beepCtx = new (window.AudioContext || window.webkitAudioContext)());
+          for (let i = 0; i < 2; i++) {
+            const o = ctx.createOscillator(), g = ctx.createGain();
+            o.connect(g); g.connect(ctx.destination);
+            o.frequency.value = 880;
+            g.gain.setValueAtTime(0.25, ctx.currentTime + i * 0.5);
+            o.start(ctx.currentTime + i * 0.5);
+            o.stop(ctx.currentTime + i * 0.5 + 0.3);
+          }
+        } catch (e) { /* audio not permitted — toast still shows */ }
+      }
+      window._prevBattState = d.battState;
+    }
+    document.getElementById('dash-grid').innerHTML = buildDashboard(telem);
+    mapMgr.updatePosition(d.x, d.y, d.hdg);
+    mapMgr._logPositionDiagnostic(d.x, d.y, d.lat, d.lon);
+    document.getElementById('cut-height-val').textContent = Math.round(d.cutH) + 'mm';
+
+    // RC gating: d.mod.rc === 1 means RC transmitter is active
+    const rcActive = d.mod?.rc === 1;
+    driveCrl.setRcActive(rcActive);
+
+    // Blade button
+    const bladeBtn = document.getElementById('btn-blade');
+    if (bladeBtn) {
+      bladeBtn.textContent = d.armed ? 'Stop Blade' : 'Start Blade';
+      bladeBtn.classList.toggle('blade-on', !!d.armed);
+    }
+
+    // Pause button
+    const pauseBtn = document.getElementById('btn-pause');
+    if (pauseBtn) {
+      const isPaused = d.state === 'PAUSED' || d.blePause;
+      pauseBtn.textContent = isPaused ? 'Resume' : 'Pause';
+      pauseBtn.classList.toggle('paused', isPaused);
+    }
+
+    // Learn button — only enabled when in MANUAL (or already learning)
+    const learnBtn = document.getElementById('btn-learn');
+    if (learnBtn) {
+      const isLearning = d.state === 'LEARN_PERIM';
+      learnBtn.textContent = isLearning ? 'Stop Learn' : 'Learn';
+      learnBtn.classList.toggle('learn-active', isLearning);
+      learnBtn.disabled = !ble.connected || rcActive ||
+        (!isLearning && d.state !== 'MANUAL' && d.state !== 'IDLE');
+    }
+
+    // Store Pt — only enabled when learning
+    const storePt = document.getElementById('btn-store-pt');
+    if (storePt) storePt.disabled = d.state !== 'LEARN_PERIM' || !ble.connected || rcActive;
+
+    // State badge — shows current state (readable label)
+    const badge = document.getElementById('state-badge');
+    if (badge) {
+      const stateLabels = {
+        INIT:'INIT', IDLE:'IDLE', MANUAL:'MANUAL', LEARN_PERIM:'LEARN',
+        AUTO:'AUTO', RETRACE:'RETRACE', BOG:'BOG', OBS_AVOID:'OBSTACLE',
+        RETURN:'RETURN', PAUSED:'PAUSED', MOTORS_OFFLINE:'MOT OFF'
+      };
+      badge.textContent = stateLabels[d.state] || d.state || '?';
+    }
+
+    // Active mode highlighting on ALL buttons
+    document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active-mode'));
+    const stMap = {
+      MANUAL:'btn-mode-manual', AUTO:'btn-mode-auto', RETURN:'btn-mode-return',
+      LEARN_PERIM:'btn-learn'
+    };
+    const activeId = stMap[d.state];
+    if (activeId) document.getElementById(activeId)?.classList.add('active-mode');
+  });
+
+  ble.onTelemetry = json => telem.update(json);
+  ble.onMap       = json => mapMgr.loadMapData(json);
+  ble.onStatus    = json => { telem.update(json); if (json.cfg) _cfgPopulateFromStatus(json); };
+  ble.onAck       = json => showToast(`${json.cmd}: ${json.msg}`, json.ok);
+  ble.onDiag      = json => {
+    document.getElementById('diag-grid').innerHTML = buildDiagnostics(json);
+    document.getElementById('diag-age').textContent =
+      'Updated ' + new Date().toLocaleTimeString() + ' \u2014 uptime ' + Math.floor((json.t??0)/1000) + 's';
+  };
+
+  // ── Map toolbar ─────────────────────────────────────
+
+  document.getElementById('btn-centre-gps').addEventListener('click', () => {
+    mapMgr.centreOnGps();
+  });
+
+  document.getElementById('btn-layer-toggle').addEventListener('click', () => {
+    mapMgr.setLayer(mapMgr._satellite ? 'map' : 'satellite');
+  });
+
+  document.getElementById('btn-save-perim').addEventListener('click', async () => {
+    const pts = mapMgr.getEditedPolygon();
+    if (!pts || pts.length < 4) return;
+    try {
+      await savePerimeterToFile({ origin: mapMgr.origin, polygon: pts });
+      showToast('Perimeter saved', true);
+    } catch (e) {
+      if (e.name !== 'AbortError') showToast('Save failed: ' + e.message, false);
+    }
+  });
+
+  document.getElementById('btn-upload-map-perim').addEventListener('click', async () => {
+    const pts = mapMgr.getEditedPolygon();
+    if (!pts || pts.length < 4) return;
+    if (!ble.connected) { showToast('Not connected', false); return; }
+    try {
+      await ble.sendCommand(Commands.sendPerimeter(mapMgr.origin, pts));
+      showToast('Sent to mower — awaiting ACK', true);
+    } catch (e) {
+      showToast('Upload failed: ' + e.message, false);
+    }
+  });
+
+  // ── Library panel ───────────────────────────────────
+
+  document.getElementById('btn-load-perim').addEventListener('click', () => {
+    document.getElementById('file-import').click();
+  });
+
+  document.getElementById('file-import').addEventListener('change', async e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const data = parsePerimeterFile(await file.text());
+      showTab('map');
+      // Defer so the map container is visible before Leaflet renders
+      setTimeout(() => mapMgr.loadFilePerimeter(data), 100);
+      showToast(`Loaded "${file.name}"`, true);
+    } catch (err) {
+      showToast('Load failed: ' + err.message, false);
+    }
+    e.target.value = '';
+  });
+
+  document.getElementById('btn-get-esp32').addEventListener('click', async () => {
+    if (!ble.connected) { showToast('Not connected', false); return; }
+    showToast('Requesting map from mower…', true);
+    await ble.sendCommand(Commands.requestMap());
+  });
+
+  // ── Controls panel ──────────────────────────────────
+  async function sendCtrlCmd(obj) {
+    if (!ble.connected) { showToast('Not connected', false); return; }
+    try { await ble.sendCommand(obj); } catch (e) { showToast(e.message, false); }
+  }
+
+  document.getElementById('btn-mode-manual').addEventListener('click',
+    () => sendCtrlCmd(Commands.setMode('MANUAL')));
+  document.getElementById('btn-mode-auto').addEventListener('click',
+    () => sendCtrlCmd(Commands.setMode('AUTO')));
+  document.getElementById('btn-mode-return').addEventListener('click',
+    () => sendCtrlCmd(Commands.setMode('AUTO_RETURN')));
+  document.getElementById('btn-pause').addEventListener('click',
+    () => sendCtrlCmd(Commands.pauseToggle()));
+  document.getElementById('btn-blade').addEventListener('click',
+    () => sendCtrlCmd(Commands.setArm(!telem.data.armed)));
+  document.getElementById('btn-learn').addEventListener('click',
+    () => sendCtrlCmd(Commands.setLearn()));
+  document.getElementById('btn-store-pt').addEventListener('click',
+    () => sendCtrlCmd(Commands.storePoint()));
+
+  // Cut height slider — debounced send
+  let _heightTimer = null;
+  const slider = document.getElementById('cut-height-slider');
+  slider.addEventListener('input', () => {
+    document.getElementById('cut-height-val').textContent = slider.value + 'mm';
+    clearTimeout(_heightTimer);
+    _heightTimer = setTimeout(() => {
+      if (ble.connected) sendCtrlCmd(Commands.setCutHeight(Number(slider.value)));
+    }, 500);
+  });
+
+  // Sync slider from telemetry
+  telem.onChange(d => {
+    if (!slider.matches(':active')) {
+      slider.value = Math.round(d.cutH);
+    }
+  });
+
+  // ── Mower config form ───────────────────────────────────
+  // Config fields: key = cfg-<field_name>
+  const CFG_FIELDS = [
+    'robot_front_m','robot_rear_m','robot_left_m','robot_right_m',
+    'chassis_width_m','chassis_length_m',
+    'wheel_radius_m','motor_pole_pairs','gear_ratio',
+    'antenna_fwd_m','antenna_right_m',
+    'steer_to_cut_m','cut_disc_radius_m','cut_width_m','strip_overlap_m',
+    'cut_height_min_mm','cut_height_max_mm',
+    'blade_motor_pole_pairs','blade_target_rpm',
+    'pp_lookahead_base_m','pp_lookahead_k',
+    'max_mowing_speed_ms','headland_speed_ms','transit_speed_ms','min_creep_speed_ms',
+    'waypoint_arrive_dist_m','max_wheel_speed_ms',
+    'max_current_a','current_ramp_a_per_s',
+    'uncertainty_margin_m','tilt_limit_normal_deg','tilt_limit_careful_deg','collision_mult_careful',
+    'heading_kp','heading_kd','manual_max_yaw_rate',
+    'wheel_pi_kp','wheel_pi_ki',
+    'manual_max_duty','manual_max_speed_ms',
+    'min_turn_radius_m'
+  ];
+
+  function cfgUpdateDerived(cfg) {
+    const trackW    = cfg.chassis_width_m || 0;
+    const navInset  = Math.max(cfg.robot_left_m||0, cfg.robot_right_m||0, trackW/2) + 0.05;
+    const bladeFwd  = Math.max(0, (cfg.steer_to_cut_m||0) + (cfg.cut_disc_radius_m||0));
+    const headland  = Math.max(
+      (cfg.cut_width_m||0) * 1.5,
+      (cfg.robot_rear_m||0) + (cfg.strip_overlap_m||0),
+      bladeFwd + (cfg.strip_overlap_m||0)
+    );
+    const stripStep = (cfg.cut_width_m||0) - (cfg.strip_overlap_m||0);
+    const turnR     = cfg.min_turn_radius_m || 0;
+    document.getElementById('cfg-derived').innerHTML =
+      `Nav inset: <b>${navInset.toFixed(3)} m</b> &nbsp;|&nbsp; ` +
+      `Headland: <b>${headland.toFixed(3)} m</b> &nbsp;|&nbsp; ` +
+      `Strip step: <b>${stripStep.toFixed(3)} m</b> &nbsp;|&nbsp; ` +
+      `Min turn radius: <b>${turnR.toFixed(3)} m</b>`;
+  }
+
+  function cfgReadForm() {
+    const obj = {};
+    CFG_FIELDS.forEach(f => {
+      const el = document.getElementById('cfg-' + f);
+      if (el) obj[f] = Number(el.value);
+    });
+    return obj;
+  }
+
+  function cfgPopulate(cfg) {
+    CFG_FIELDS.forEach(f => {
+      const el = document.getElementById('cfg-' + f);
+      if (el && cfg[f] !== undefined) el.value = cfg[f];
+    });
+    cfgUpdateDerived(cfg);
+  }
+
+  // Update derived values live as inputs change
+  document.getElementById('cfg-form').addEventListener('input', () => {
+    cfgUpdateDerived(cfgReadForm());
+  });
+
+  // _cfgPopulateFromStatus is called from ble.onStatus (defined above)
+  function _cfgPopulateFromStatus(json) {
+    cfgPopulate(json.cfg);
+    const sl = document.getElementById('cut-height-slider');
+    sl.min = json.cfg.cut_height_min_mm ?? 35;
+    sl.max = json.cfg.cut_height_max_mm ?? 90;
+  }
+
+  document.getElementById('cfg-save-btn').addEventListener('click', async () => {
+    if (!ble.connected) { showToast('Not connected', false); return; }
+    const cfg = cfgReadForm();
+    const btn = document.getElementById('cfg-save-btn');
+    btn.disabled = true;
+    try {
+      await ble.sendCommand({ cmd: 'SET_CONFIG', ...cfg });
+    } finally {
+      btn.disabled = !ble.connected;
+    }
+  });
+
+  document.getElementById('cfg-reset-btn').addEventListener('click', () => {
+    // Re-request status to restore fields from mower
+    if (ble.connected) ble.sendCommand(Commands.requestStatus());
+    else showToast('Not connected — showing last received values', false);
+  });
+
+  // Build initial dashboard (placeholder)
+  document.getElementById('dash-grid').innerHTML = buildDashboard(telem);
+}
+
+main().catch(console.error);
+</script>
+</body>
+</html>

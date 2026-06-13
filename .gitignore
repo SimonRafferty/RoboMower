@@ -1,0 +1,19 @@
+# Full dated source snapshots — redundant with git history, and large
+/Backups/
+
+# Claude Code local session config / permissions
+/.claude/
+
+# Host-test build artifacts (the .cpp/.h sources are kept; binaries are not)
+/host_test/*.exe
+/host_test/*.o
+/host_test/*.obj
+/host_test/*.pdb
+
+# One-off debug screenshot of a path-planning bug that's since been fixed
+/Path Plan error.jpg
+
+# OS / editor cruft
+Thumbs.db
+.DS_Store
+*.swp
