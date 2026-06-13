@@ -12,6 +12,8 @@ in the settings (Web UI) I've tried to cover as many permutations of the layout 
 
 [![Watch the RoboMower mowing the lawn](https://img.youtube.com/vi/C5biq-wlkIc/hqdefault.jpg)](https://www.youtube.com/watch?v=C5biq-wlkIc)
 
+![The RoboMower - built like a small tank, because it basically is one](Robo-Mower.jpg)
+
 ▶ I'm going to make a cover for the electronics which will make it look tidier! 
 
 ## How it works
@@ -36,6 +38,10 @@ If it gets stuck in long wet grass, it raises the cutting deck, has another go, 
 ## Controls & monitoring
 
 Day to day you don't need a laptop for anything.  The TX16S runs a Lua widget (in the repository) showing state, battery, blade load, GPS quality and a compass - and it beeps at you when the mower wants attention.  CH4 selects Manual/Auto/Return, CH5 records the perimeter, CH6 arms the blade, CH7 pauses.
+
+![The TX16S running the Lua telemetry widget](TX16S.jpg)
+
+*Everything at a glance on the transmitter - state, compass, GPS quality and blade load.  The big red button is exactly what it looks like.*
 
 There's also a WebUI - a single HTML file that connects over Bluetooth from a phone (Chrome on Android).  That gives you a live map, perimeter editing, config settings and a diagnostics page with the raw VESC data.  If something misbehaves, the System Log on the dashboard tells you what the mower decided and why - copy & paste it if you want help.
 
