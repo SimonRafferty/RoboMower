@@ -4,9 +4,15 @@ ESP32-S3 firmware for a home-built robot mower.  RTK GPS for positioning, VESC m
 Why build one when you can buy a robot mower off the shelf?  The commercial ones either want a wire burying around the garden, or cost about the same as a small car - and none of them will cut a meadow.  This one is built like a small tank, cuts at whatever height you like and knows where it is to a couple of centimetres.
 It's also an interesting project!
 
+My intention with publishing this is so you can design your own mechanical hardware - any brushless drive and blade motors will work, controlled with VESCs. I'm using cheap knock-off 75100 types from AliExpress which seem to work great.
+
+I'm going to publish the cad files for my mechanics but they might not be all that useful as the mower was mostly built out of bits I had laying around. you could do a much better job buying the 'right' parts.
+
+in the settings (Web UI) I've tried to cover as many permutations of the layout of wheels, tracks etc as possible.
+
 [![Watch the RoboMower mowing the lawn](https://img.youtube.com/vi/C5biq-wlkIc/hqdefault.jpg)](https://www.youtube.com/watch?v=C5biq-wlkIc)
 
-▶ Click the picture to watch it out in the garden (YouTube).
+▶ I'm going to make a cover for the electronics which will make it look tidier! 
 
 ## How it works
 
