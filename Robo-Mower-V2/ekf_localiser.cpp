@@ -361,6 +361,12 @@ void ekf_update_gps(float gps_east, float gps_north, int fix_type,
     sigma = clampf(sigma, 0.005f, 5.0f);
     float r_val = sigma * sigma;
 
+    // BNO heading read OUTSIDE the EKF mutex (the driver uses its own spinlock).
+    // Used below for the heading-offset trim; on a gate-enforced STRAIGHT segment
+    // (turn < HEADING_STRAIGHT_MAX_TURN_RAD ≈ 11°) this end-of-segment sample is a
+    // bounded approximation of the chord-average BNO heading.
+    float bno_hdg = imu_get_heading_fused();
+
     xSemaphoreTake(g_ekf_mutex, portMAX_DELAY);
 
     // ── Innovation gate ───────────────────────────────────────────────────────
@@ -430,8 +436,7 @@ void ekf_update_gps(float gps_east, float gps_north, int fix_type,
                     // reversing (s_v < 0).
                     if (s_v < -0.03f) z_hdg = wrapAngle(z_hdg + (float)M_PI);
 
-                    float bno = imu_get_heading_fused();
-                    s_hdg_offset = heading_offset_ema(s_hdg_offset, z_hdg, bno,
+                    s_hdg_offset = heading_offset_ema(s_hdg_offset, z_hdg, bno_hdg,
                                                       HEADING_OFFSET_TRIM_GAIN);
                     s_heading_established = true;
 
@@ -526,6 +531,9 @@ float ekf_get_heading_offset() {
 }
 
 void ekf_save_heading_offset_if_due() {
+    // Called only from the single 10 Hz EKF hook (Core 1), so the throttle
+    // timestamp s_hdg_offset_save_ms needs no mutex; s_hdg_offset itself is
+    // copied under the mutex below.
     if (g_ekf_mutex == nullptr) return;
     xSemaphoreTake(g_ekf_mutex, portMAX_DELAY);
     float off   = s_hdg_offset;
