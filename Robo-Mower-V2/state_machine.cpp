@@ -1538,17 +1538,16 @@ void state_machine_update() {
                                         : (now_ekf - s_ekf_last_ms) * 0.001f;
         s_ekf_last_ms = now_ekf;
         // SCALED velocities: the GPS-referenced distance calibration feeds the EKF
-        // (position + odometry heading) and the self-calibrator together.
+        // (position) and the self-calibrator together.
         float v_left  = vesc_erpm_to_velocity_scaled(vesc_get_status(VESC_ID_LEFT).erpm);
         float v_right = vesc_erpm_to_velocity_scaled(vesc_get_status(VESC_ID_RIGHT).erpm);
-        // Gyro Z (bias-corrected, CW+) — used by the EKF for heading ONLY during
-        // on-the-spot pivots, where wheel-odometry heading over-rotates (scrub)
-        // and GPS cannot correct it. Odometry+GPS remain the source otherwise.
-        float gyro_cw = imu_get_gz_rads();
-        ekf_predict(v_left, v_right, gyro_cw, dt);
-        // Self-calibrate scale (straights) + track width (turns) from GPS, in
-        // every state where the wheels turn (manual and auto).
+        // Heading comes from the BNO055 absolute fusion + GPS-trimmed offset
+        // inside ekf_predict() — no gyro/odometry heading term here.
+        ekf_predict(v_left, v_right, dt);
+        // Self-calibrate distance scale (straights) from GPS in every driving state.
         odo_calib_update(v_left, v_right, dt);
+        // Persist the GPS-trimmed heading offset (throttled, NVS).
+        ekf_save_heading_offset_if_due();
     }
 
     // ── Collect RC snapshot ───────────────────────────────────────────────────
