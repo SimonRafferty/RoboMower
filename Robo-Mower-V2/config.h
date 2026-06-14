@@ -299,48 +299,35 @@
 #define PIVOT_EXIT_DEG            12.0f  // [deg] — stop pivoting once |heading error| drops below this
 #define PIVOT_WHEEL_MS            0.18f  // [m/s] — per-track tangential speed during a pivot
 
-// Gyro-assisted heading during pivots (EKF heading-rate source selection).
-// Wheel odometry is the heading source for forward driving and gentle arcs and
-// is continuously corrected by GPS while the machine translates. But a zero-
-// radius pivot SCRUBS the tracks, so the effective track is far larger than the
-// GPS-arc-calibrated value and the odometry heading OVER-rotates (measured ~1.5×
-// on this machine); worse, GPS cannot correct it because there is no translation.
-// In that one regime — near-zero translation AND a real yaw rate — the EKF takes
-// its heading rate from the BMI270 gyro Z instead. The gyro is unreliable while
-// driving over bumpy ground at speed (why it is NOT used for general heading),
-// but a slow on-the-spot spin produces little vibration and the 1–2 s pivot is
-// too short to accumulate meaningful drift. Detect with odometry; measure with gyro.
-#define GYRO_HEADING_MAX_V_MS      0.12f  // [m/s] — use gyro for heading below this translation speed
-#define GYRO_HEADING_MIN_OMEGA     0.30f  // [rad/s] — ...and above this odometry yaw rate (~17°/s)
-
 // Node follower (drive branch): P-controller turns yaw rate from heading error.
 #define NODE_HEADING_KP           1.5f   // [1/s] — yaw rate = KP × heading error (rad)
 #define NODE_YAW_RATE_MAX         1.2f   // [rad/s] — cap on drive-branch yaw rate
 
-// AUTO-start heading bootstrap: establish a GPS heading before following nodes.
-#define AUTO_BOOTSTRAP_PERIM_MIN_M  2.0f   // [m] — PAUSE if perimeter nearer than this at AUTO start (heading unknown)
-#define AUTO_BOOTSTRAP_SPEED_MS     0.20f  // [m/s] — straight creep speed while establishing heading
-#define AUTO_BOOTSTRAP_MAX_MS       8000   // [ms] — give up establishing heading → PAUSE
+// RTK requirement for perimeter learning.
+#define RTK_MIN_FIX_FOR_LEARNING      4    // [fix_type] — 4=RTK fixed required
 
-// RTK requirements
-#define RTK_MIN_FIX_FOR_LEARNING      4    // [fix_type] — 4=RTK fixed required during perimeter learning
-#define HEADING_FROM_GPS_MIN_DIST_M  0.30f // [m] — minimum (floor) travel between GPS fixes to use for heading
-
-// ── GPS heading lock (2026-06-13) ─────────────────────────────────────────────
-// GPS travel direction is the only absolute heading truth, so when the mower has
-// driven a STRAIGHT, measurable distance the EKF heading is LOCKED onto it (strong
-// gain) rather than weakly blended. Between locks — and while turning on the spot
-// or before enough distance accumulates — heading is carried by the IMU/odometry.
-//   LOCK_GAIN     : fraction of the GPS-vs-EKF heading error applied per qualifying
-//                   fix (1.0 = full snap). High = decisive correction.
-//   STRAIGHT_MAX_TURN_RAD : if |heading change| since the reference exceeds this,
-//                   the segment wasn't straight → discard the chord, restart.
-//   DIST_SIGMA_K  : required travel = max(MIN_DIST, K × GPS sigma) so the chord is
-//                   long enough that GPS position noise gives an accurate heading
-//                   (e.g. 1 cm fixed → 0.3 m; 15 cm float → ~3 m).
-#define HEADING_GPS_LOCK_GAIN         0.80f
+// ── Heading = BNO absolute fusion + GPS-trimmed offset ────────────────────────
+// The BNO055 supplies a tilt-compensated absolute heading at 100 Hz. The only
+// correction is a slowly-trimmed offset (mounting + magnetic declination),
+// estimated from the GPS travel chord on STRAIGHT, MEASURABLE RTK segments and
+// persisted to NVS. No wheel-odometry heading, no gyro-pivot hack, no GPS lock.
+//   STRAIGHT_MAX_TURN_RAD : Σ|Δheading| since the reference above this → the
+//                           segment wasn't straight; discard the chord, restart.
+//   FROM_GPS_MIN_DIST_M   : distance floor for a usable chord.
+//   DIST_SIGMA_K          : required chord also ≥ K × GPS sigma (1 cm fixed →
+//                           0.3 m; 15 cm float → ~3 m).
+//   OFFSET_TRIM_GAIN      : EMA gain folding each chord estimate into the offset.
 #define HEADING_STRAIGHT_MAX_TURN_RAD 0.20f   // ~11 deg
+#define HEADING_FROM_GPS_MIN_DIST_M   0.30f   // [m]
 #define HEADING_GPS_DIST_SIGMA_K      20.0f
+#define HEADING_OFFSET_TRIM_GAIN      0.10f   // EMA gain per qualifying chord
+
+// Offset NVS persistence throttle (avoid flash wear; offset drifts very slowly).
+#define HEADING_OFFSET_SAVE_MIN_INTERVAL_MS  30000   // [ms]
+#define HEADING_OFFSET_SAVE_MIN_CHANGE_RAD   0.0087f // ~0.5 deg
+
+// EKF heading variance when the BNO is healthy (absolute fused heading is good).
+#define EKF_HDG_VAR_BNO               0.0012f // rad² (~2 deg 1-σ)
 
 // ── AUTO fault responses — TEMPORARILY DISABLED (2026-06-13) ──────────────────
 // The cutting-overload, wheel-stall ("crash"), wheel-slip and obstacle-suspected
