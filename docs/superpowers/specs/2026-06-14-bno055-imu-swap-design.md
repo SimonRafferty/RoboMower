@@ -53,6 +53,12 @@ collision baseline) happens when it is connected.
   tree cover).
 - **Re-enabling AUTO fault responses** (`AUTO_FAULT_RESPONSES_ENABLED` stays 0).
   Collision is rewritten but remains disabled.
+- **IMUPLUS / accelerometer-only heading fallback — deliberately rejected.**
+  Accelerometer/gyro-only heading proved unreliable; that is the reason for the
+  magnetometer. If the magnetometer is untrustworthy, the design **requires a
+  recalibration or a hardware fix**, never an automatic downgrade to a worse
+  source. Likewise, **no wheel-odometry heading fallback** (it was the original
+  ~90°-off AUTO heading problem).
 
 ## 3. Build / verification phasing
 
@@ -63,8 +69,8 @@ hardware once the BNO055 is wired.
 |---|---|---|
 | 0 | Scaffolding: device-neutral `imu.h` API, `imu_bno055.cpp` skeleton, `config.h` switches. Compiles with the BMI270 gone. | Offline (compile) |
 | 1 | Driver bring-up: I²C @100 kHz, comms, axis-remap confirm, tilt/accel/gyro/heading getters, NVS calibration profile. | When wired |
-| 2 | Mag-distortion characterization: log BNO heading vs GPS travel-heading under varying drive/blade load → decide **NDOF vs IMUPLUS**. | When wired + driving |
-| 3 | Heading rewrite: `heading = BNO + GPS-trimmed offset` into EKF; retire gyro-pivot, GPS-lock, bootstrap creep; re-gate AUTO start. | When wired + RTK |
+| 2 | Mag-distortion **validation**: log BNO heading vs GPS travel-heading under varying drive/blade load → confirm trustworthy; if not, **fix the install** (re-mount / move from interference). No software fallback. | When wired + driving |
+| 3 | Heading rewrite: `heading = BNO + GPS-trimmed offset` into EKF; delete gyro-pivot, GPS-lock, bootstrap creep, **and the odometry-heading path**; re-gate AUTO start. | When wired + RTK |
 | 4 | Collision re-tune: BNO linear-accel source, reset baseline, baseline-capture logging. **Stays disabled.** | When wired |
 
 **Phases 0 and 3 (plus the driver implementation they depend on) and the
@@ -115,11 +121,10 @@ hardware-verification activities for code written now.
   CW-from-North+) via the BNO `AXIS_MAP_CONFIG`/`AXIS_MAP_SIGN` registers, set
   once at init. Default remap values are written with a documented bring-up
   check procedure; exact signs are confirmed when wired.
-- **Fusion mode** chosen by `config.h` `IMU_FUSION_MODE`:
-  - `NDOF` (default) — full 9-axis, mag-referenced absolute heading.
-  - `IMUPLUS` — gyro + accel only (no mag); used if the mag-distortion test
-    shows load-dependent heading swing. Absolute reference then comes solely
-    from the GPS-trimmed offset.
+- **Fusion mode: NDOF only** (full 9-axis, mag-referenced absolute heading).
+  IMUPLUS is deliberately **not** used — see Non-Goals. The mag-distortion test
+  (Phase 2) validates NDOF rather than selecting between modes; a bad result is a
+  hardware problem to fix, not a mode to fall back to.
 - Sampling task on **Core 0 at 100 Hz** (BNO fusion output rate), replacing the
   200 Hz BMI270 task. Thread safety unchanged (portMUX spinlock around the
   published volatiles).
@@ -162,6 +167,12 @@ Reuses the existing straight-RTK detector almost verbatim:
 - Associated now-dead `config.h` constants.
 - `ekf_predict`'s `gyro_rate_cw` parameter (the only consumer was the pivot
   exception) and the gyro argument at its `state_machine.cpp` call-site.
+- **The wheel-odometry heading path** (`omega_odo = (vL−vR)/track` driving
+  `s_theta`). The BNO supplies heading at 100 Hz independent of GPS, so there is
+  no scenario where odometry heading is needed. `odo_calib`'s distance `scale`
+  is retained for position dead-reckoning between GPS fixes; its kinematic
+  `track_m` calibration is no longer heading-critical (kept only as a harmless
+  diagnostic / for future use).
 
 ### 5.5 MANUAL operation
 **No structural change.** `drive_manual` + `heading_controller` (PD + AGC) keep
@@ -170,13 +181,19 @@ re-wired *for free*:
 - `pose.heading` ← EKF `s_theta` ← now BNO + offset.
 - `yaw_rate_error` uses `imu_get_gz_rads()` ← now the BNO gyro-Z (API preserved).
 
-### 5.6 Fallback (BNO faulted)
-If `imu_is_fault()`, `ekf_predict` reverts to **odometry heading integration**
-(`omega_odo = (vL−vR)/odo_cal_track_m()`) — the path used today — so a BNO
-dropout degrades gracefully instead of freezing heading. This is the only reason
-odometry-heading and `odo_calib`'s `track_m` are retained. `odo_calib` continues
-to consume the published straight-RTK heading events for its distance/track
-self-cal (now sourced from BNO-quality headings).
+### 5.6 Failure handling (no heading degradation — stop and require a fix)
+There is **no fallback to a lesser heading source**. If trustworthy heading is
+lost, autonomous operation stops.
+- **BNO chip fault** (`imu_is_fault()`): in **AUTO**, treat as a safety fault →
+  **PAUSE** (VESCs powered, CAN stop sent), surfaced to the operator. In
+  **MANUAL**, disable the heading-hold assist and fall to plain open-loop
+  tank-mix — the operator remains in direct control. Heading is never
+  reconstructed from odometry or accelerometer.
+- **Heading confidence lost during AUTO** (`imu_heading_is_confident()` goes
+  false — e.g. a magnetometer-distortion event): **PAUSE** and prompt
+  recalibration. This is the §7 gate, monitored continuously, not only at start.
+- `odo_calib` continues to consume the published straight-RTK heading events for
+  its distance `scale` self-cal (now sourced from BNO-quality headings).
 
 ## 6. Calibration and NVS
 
@@ -191,35 +208,34 @@ self-calibrates.
 
 ## 7. Heading-confidence gate and AUTO start
 
-`imu_heading_is_confident()`:
-- **NDOF:** BNO **system + magnetometer** calibration are good (e.g. both ≥ 2).
-- **IMUPLUS:** no magnetometer; confidence requires a GPS-trimmed `hdgoff` to
-  exist (persisted from a prior run, or trimmed this session).
+`imu_heading_is_confident()` (NDOF): true when the BNO **system +
+magnetometer** calibration are good (e.g. both ≥ 2).
 
 **AUTO start** (`STATE_AUTO_MOWING` entry):
 - The **≥2 m perimeter-clearance** requirement and the **straight-creep** are
   both **removed**.
 - AUTO starts immediately when `imu_heading_is_confident()`.
 - Otherwise PAUSE with an operator message: *drive slow loops in MANUAL to
-  calibrate the magnetometer* (NDOF), or *drive a short straight RTK run to set
-  the heading offset* (IMUPLUS).
+  calibrate the magnetometer*.
 
-## 8. Magnetometer calibration UX (NDOF only)
+**During AUTO:** the same condition is monitored continuously; if it goes false
+(§5.6), AUTO pauses and prompts recalibration rather than degrading.
+
+## 8. Magnetometer calibration UX
 
 The BNO magnetometer calibrates only after seeing varied headings. A ground
 robot can't perform a hand-held 3D figure-8; the on-ground equivalent is
 **driving a few slow loops/circles** (sweeping heading through 360°). Because the
 calibration profile is persisted to NVS, this is a **one-time** setup that
-re-converges almost immediately on later boots, and is **not needed at all in
-IMUPLUS mode**.
+re-converges almost immediately on later boots.
 
 - **Telemetry:** add BNO calibration status (at minimum system + magnetometer,
   0–3 each) to the `MOWER_STATUS` (0x80) CRSF frame. Extend the payload by one
   byte (or pack into spare flag bits); the Lua already tolerates variable-length
   payloads — update it for the new field.
-- **TX16S Lua widget:** when in NDOF and `imu_heading_is_confident()` is false,
-  display e.g. `MAG CAL n/3 — drive slow loops (MANUAL)`; clear once confident.
-  Same condition that gates AUTO start.
+- **TX16S Lua widget:** when `imu_heading_is_confident()` is false, display e.g.
+  `MAG CAL n/3 — drive slow loops (MANUAL)`; clear once confident. Same condition
+  that gates AUTO start.
 
 ## 9. Collision framework rewrite (left disabled)
 
@@ -261,7 +277,9 @@ Remove every BMI270 reference as if it never existed:
 1. I²C comms @100 kHz; `imu_is_present()` true.
 2. Axis-sign confirmation (tilt the robot; check surge/sway/heave + yaw signs).
 3. Tilt/pitch/roll sanity vs the safety tilt limit.
-4. **Mag-distortion test → choose NDOF vs IMUPLUS** (§4.5, Phase 2).
+4. **Mag-distortion validation** (§4.5, Phase 2): confirm NDOF heading holds
+   under drive/blade load. A bad result → fix the install; do **not** ship a
+   software fallback.
 5. BNO heading vs GPS travel-heading on straight RTK runs (offset converges).
 6. AUTO heading correct at start, through pivots, and under tree cover.
 7. Collision baseline capture during normal driving/mowing.
@@ -269,11 +287,15 @@ Remove every BMI270 reference as if it never existed:
 ## 12. Risks and rollback
 
 - **Axis signs wrong** → caught at bring-up (step 2); fix the remap constants.
-- **Magnetometer distortion from motors/blade** → IMUPLUS fallback is designed
-  in (`IMU_FUSION_MODE`); mounting is ~150 mm from the motors and distance, not
-  the 304 stainless, is what helps.
-- **First-ever-boot offset unknown in IMUPLUS** → mitigated by NVS persistence +
-  the confidence gate (won't auto-start without a valid offset).
+- **Magnetometer distortion from motors/blade** → validated in Phase 2 and
+  expected to be a non-issue (a phone magnetometer in the same mounting spot
+  reads good heading). Mounting is ~150 mm from the motors, and distance — not
+  the 304 stainless — is what helps. **If distortion is found, the fix is
+  hardware** (re-mount / shield routing / move interference), per the no-fallback
+  decision; there is no software degradation path.
+- **First-ever-boot heading unknown** → the confidence gate refuses AUTO start
+  until the magnetometer is calibrated (operator drives slow loops); the cal
+  profile and `hdgoff` then persist to NVS for subsequent boots.
 - **Rollback:** the BMI270 is recoverable from git history, but because the purge
   is intentional, rollback means `git revert`, not a config flag. Acceptable —
   the BNO055 is in hand and this is the committed direction.
