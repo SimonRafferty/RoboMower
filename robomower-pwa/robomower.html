@@ -212,6 +212,18 @@ input[type=range] { width: 100%; }
 }
 #rc-gating-banner .rc-icon { font-size:2rem; }
 
+/* Magnetometer-calibration warning bar (fixed, top) */
+#mag-cal-banner {
+  position:fixed; top:0; left:0; right:0; z-index:60;
+  display:none; align-items:center; justify-content:center; gap:12px;
+  background:var(--amber); color:#000; padding:8px 12px;
+  font-size:0.9rem; font-weight:700; text-align:center;
+}
+#mag-cal-banner button {
+  background:#000; color:var(--amber); border:none; border-radius:6px;
+  padding:6px 12px; font-weight:700; cursor:pointer;
+}
+
 /* State indicator badge */
 #state-badge {
   flex:1 1 0; min-width:50px;
@@ -538,6 +550,12 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
 <!-- ACK toast -->
 <div class="ack-toast" id="ack-toast"></div>
 
+<!-- Magnetometer calibration warning -->
+<div id="mag-cal-banner">
+  <span>&#x1F9ED; Compass not calibrated (<span id="mag-cal-level">sys 0/3 mag 0/3</span>) — drive slow loops in Manual</span>
+  <button id="btn-recal-imu" type="button">Recalibrate compass</button>
+</div>
+
 <!-- No-BLE banner (shown if browser lacks Web Bluetooth) -->
 <div id="no-ble-banner" style="display:none">
   <h2>Browser Not Supported</h2>
@@ -808,6 +826,7 @@ const Commands = {
   requestDiag:   ()     => ({ cmd: 'REQUEST_DIAG' }),
   clearObstacles:()     => ({ cmd: 'CLEAR_OBSTACLES' }),
   clearPerimeter:()     => ({ cmd: 'CLEAR_PERIMETER' }),
+  recalibrateImu:()     => ({ cmd: 'RECAL_IMU' }),
   sendPerimeter: (origin, polygon) => ({ cmd: 'SEND_PERIMETER', origin, polygon })
 };
 
@@ -1776,6 +1795,13 @@ async function main() {
     try { await ble.sendCommand(Commands.requestStatus()); }
     catch (e) { showToast(e.message, false); }
   });
+  document.getElementById('btn-recal-imu')?.addEventListener('click', async () => {
+    if (!ble.connected) { showToast('Not connected', false); return; }
+    try {
+      await ble.sendCommand(Commands.recalibrateImu());
+      showToast('Compass recalibration started — drive slow loops in Manual', true);
+    } catch (e) { showToast(e.message, false); }
+  });
 
   // ── DriveController ──────────────────────────────────
   const driveCrl = new DriveController(ble);
@@ -1801,6 +1827,16 @@ async function main() {
         } catch (e) { /* audio not permitted — toast still shows */ }
       }
       window._prevBattState = d.battState;
+    }
+    // Magnetometer calibration banner: prompt recal when heading not trustworthy.
+    const magBanner = document.getElementById('mag-cal-banner');
+    if (magBanner) {
+      const showMag = ble.connected && d.headingConfident === false;
+      magBanner.style.display = showMag ? 'flex' : 'none';
+      if (showMag) {
+        const lvl = document.getElementById('mag-cal-level');
+        if (lvl) lvl.textContent = `sys ${d.imuCalSys ?? 0}/3  mag ${d.imuCalMag ?? 0}/3`;
+      }
     }
     document.getElementById('dash-grid').innerHTML = buildDashboard(telem);
     mapMgr.updatePosition(d.x, d.y, d.hdg);
