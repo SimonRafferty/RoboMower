@@ -135,8 +135,8 @@
 #include <algorithm>
 #include <cmath>
 
-// SparkFun BMI270 library (install via Library Manager)
-#include <SparkFun_BMI270_Arduino_Library.h>
+// Adafruit BNO055 library (install via Library Manager)
+#include <Adafruit_BNO055.h>
 
 // ── Local module includes (in dependency order) ──────────────
 #include "config.h"
