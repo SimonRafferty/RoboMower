@@ -355,7 +355,7 @@
 #define COLLISION_RISE_TIME_MS          50     // spike rise time < this = collision (ms)
                                                // terrain bumps rise more slowly
 #define COLLISION_CONFIRM_MS            20     // spike must persist this long before triggering
-#define COLLISION_RMS_WINDOW_SAMPLES    50     // short-window RMS: 50 samples = 250ms at 200Hz
+#define COLLISION_RMS_WINDOW_SAMPLES    25     // short-window RMS: 25 samples = 250ms at 100Hz (BNO task)
 
 // Adaptive baseline parameters
 #define BASELINE_ALPHA                  0.001f // EMA adaptation rate (~1000 samples = ~5s full update)
