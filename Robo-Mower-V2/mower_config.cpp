@@ -12,7 +12,7 @@
 // NVS storage: same "mower" namespace as nvs_storage.cpp to avoid wasting slots.
 // Key must be ≤ 15 characters.
 static const char *k_nvs_ns  = "mower";
-static const char *k_nvs_key = "mow_cfg_v10"; // bumped: added min_turn_radius_m
+static const char *k_nvs_key = "mow_cfg_v11"; // bumped: footprint W×L box + track_width_m (removed robot_*/chassis_length)
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -20,12 +20,9 @@ static SemaphoreHandle_t s_cfg_mutex = nullptr;
 
 // Compile-time defaults from config.h — used when NVS has no saved config.
 static const MowerConfig k_defaults = {
-    /* robot_front_m          */ ROBOT_FRONT_M,
-    /* robot_rear_m           */ ROBOT_REAR_M,
-    /* robot_left_m           */ ROBOT_LEFT_M,
-    /* robot_right_m          */ ROBOT_RIGHT_M,
-    /* chassis_width_m        */ CHASSIS_WIDTH_M,
-    /* chassis_length_m       */ CHASSIS_LENGTH_M,
+    /* footprint_width_m      */ FOOTPRINT_WIDTH_M,
+    /* footprint_length_m     */ FOOTPRINT_LENGTH_M,
+    /* track_width_m          */ TRACK_WIDTH_M,
     /* wheel_radius_m         */ WHEEL_RADIUS_M,
     /* motor_pole_pairs       */ (uint8_t)MOTOR_POLE_PAIRS,
     /* gear_ratio             */ GEAR_RATIO,
@@ -143,13 +140,19 @@ MowerConfig mower_config_get() {
 // Each helper takes a snapshot under mutex via mower_config_get().
 
 float mower_config_track_width_m() {
-    return mower_config_get().chassis_width_m;
+    return mower_config_get().track_width_m;
 }
 
 float mower_config_nav_inset_m() {
     MowerConfig mc = mower_config_get();
-    float half_track = mc.chassis_width_m / 2.0f;
-    return fmaxf(fmaxf(mc.robot_left_m, mc.robot_right_m), half_track) + 0.05f;
+    // Half the footprint diagonal: the radius the footprint corners sweep when the
+    // robot pivots on the spot about the steering centre. Keeping the steering
+    // centre this far inside the perimeter guarantees no corner crosses it during a
+    // corner pivot. (Using half the WIDTH let a corner swing past — the bug this
+    // fixes.) Assumes the steering centre sits ~centrally in the footprint box.
+    float half_diag = 0.5f * sqrtf(mc.footprint_width_m  * mc.footprint_width_m +
+                                   mc.footprint_length_m * mc.footprint_length_m);
+    return half_diag + 0.05f;   // + GPS margin
 }
 
 float mower_config_blade_fwd_reach_m() {
@@ -160,8 +163,10 @@ float mower_config_blade_fwd_reach_m() {
 float mower_config_headland_m() {
     MowerConfig mc = mower_config_get();
     float blade_fwd = fmaxf(0.0f, mc.steer_to_cut_m + mc.cut_disc_radius_m);
+    // Vestigial under the spiral planner (working area is still derived/displayed).
+    // Rear-extent term uses half the footprint length now that robot_rear_m is gone.
     return fmaxf(fmaxf(mc.cut_width_m * 1.5f,
-                       mc.robot_rear_m + mc.strip_overlap_m),
+                       mc.footprint_length_m * 0.5f + mc.strip_overlap_m),
                  blade_fwd + mc.strip_overlap_m);
 }
 

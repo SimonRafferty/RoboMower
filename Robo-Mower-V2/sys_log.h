@@ -11,7 +11,7 @@
 //  Not thread-safe — call only from Core 1 (setup / state machine).
 // ══════════════════════════════════════════════════════════════════════════════
 
-#define SYS_LOG_MAX_ENTRIES  30
+#define SYS_LOG_MAX_ENTRIES  50
 #define SYS_LOG_MAX_LEN      80
 
 /** Push a message into the ring buffer (oldest entry is overwritten when full).

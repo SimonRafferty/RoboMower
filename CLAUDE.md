@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ESP32-S3 firmware for an autonomous RTK GPS lawnmower robot. Uses VESC motor controllers over CAN bus, a BMI270 IMU, CRSF radio (RadioMaster TX16S + ER8 receiver), and a boustrophedon coverage planner with headland passes.
+ESP32-S3 firmware for an autonomous RTK GPS lawnmower robot. Uses VESC motor controllers over CAN bus, a BMI270 IMU (**being replaced by a BNO055** — see *Planned: BNO055 IMU swap*), CRSF radio (RadioMaster TX16S + ER8 receiver), and a **concentric inward spiral** coverage planner (replaced boustrophedon strips 2026-06-13) built on the Clipper2 polygon-offset library.
+
+> **Read first:** *Known Issues & TODO* (below) for what currently works, what's disabled, and what's outstanding. Much changed on 2026-06-13/14 — be wary of stale assumptions.
 
 **Board:** ESP32S3 Dev Module — specifically the **N16R8 variant** (16 MB flash, 8 MB OPI PSRAM). Generic ESP32-S3 boards are **not compatible** (blank flash requires Flash Download Tool or JTAG to recover — do not flash wrong firmware).
 
@@ -24,19 +26,24 @@ Open `Robo-Mower-V2/Robo-Mower-V2.ino`. Required board settings:
 | USB Mode | Hardware CDC and JTAG |
 
 Required libraries (install via Library Manager):
-- `SparkFun BMI270 Arduino Library` by SparkFun Electronics
+- `SparkFun BMI270 Arduino Library` by SparkFun Electronics (IMU — until the BNO055 swap; then a BNO055 lib, e.g. Adafruit_BNO055)
 - `FastLED` by Daniel Garcia
+
+**Clipper2 is vendored in-tree** at `Robo-Mower-V2/src/clipper2/` (Boost license) — Arduino compiles the sketch's `src/` subtree automatically, no library install needed.
 
 ### arduino-cli (safe to use — previously caused BSOD but was updated 2026-04-09)
 
-```bash
-arduino-cli compile --fqbn esp32:esp32:esp32s3 \
-  --board-options "PartitionScheme=huge_app,PSRAM=opi" Robo-Mower-V2/
+The binary is **not on PATH**; it lives at `C:\Users\simon\Downloads\arduino-cli_1.5.0_Windows_64bit\arduino-cli.exe`.
 
-arduino-cli upload -p COM44 --fqbn esp32:esp32:esp32s3 Robo-Mower-V2/
+```powershell
+$cli = "C:\Users\simon\Downloads\arduino-cli_1.5.0_Windows_64bit\arduino-cli.exe"
+& $cli compile --fqbn esp32:esp32:esp32s3 `
+  --board-options "PartitionScheme=huge_app,PSRAM=opi" Robo-Mower-V2
+
+& $cli upload -p COM47 --fqbn esp32:esp32:esp32s3 Robo-Mower-V2
 ```
 
-**Always upload to COM44 after a successful compile.**
+**Upload port is COM47** (the mower; not always present — only when powered + plugged in. Check `[System.IO.Ports.SerialPort]::GetPortNames()` first). Don't blindly flash COM3/15/20 — those are other devices. Current build size ≈ 46 % flash / 48 % RAM (Clipper2 added ~270 KB).
 
 ### Build-time switches (`config.h:22–34`)
 
@@ -57,11 +64,60 @@ cd host_test
 `host_test/geometry.cpp` / `geometry_test.cpp` are COPIES of the Robo-Mower-V2 sources with `config.h` swapped for `host_config.h` — re-copy them after editing the originals:
 `(Get-Content Robo-Mower-V2\geometry.cpp -Raw) -replace '#include "config.h"', '#include "host_config.h"' | Set-Content host_test\geometry.cpp -Encoding utf8` (same for `geometry_test.cpp`, which also drops `#include <Arduino.h>`).
 
+**Spiral/Clipper host tests** (compile the in-tree Clipper2 + the real wrapper, no copies needed):
+```powershell
+$cl = "../Robo-Mower-V2/src/clipper2"
+& $zig c++ -std=c++17 -O1 "-I../Robo-Mower-V2" "-I$cl" -o wrap.exe `
+  clipper_wrapper_test.cpp ../Robo-Mower-V2/clipper_offset.cpp geometry.cpp `
+  "$cl/clipper.engine.cpp" "$cl/clipper.offset.cpp" "$cl/clipper.rectclip.cpp"
+.\wrap.exe
+```
+- `clipper_spiral_test.cpp` — direct `InflatePaths` spiral on the deep-notch garden (no spikes/inversion).
+- `clipper_wrapper_test.cpp` — real `offsetPolygonClipper` wrapper + from-perimeter spiral loop → reaches centre, all in-bounds.
+- `clipper_multiregion_test.cpp` — dumbbell/pinch shape → both lobes covered (the "missed arm" fix).
+- `spiral_test.cpp` / `spiral_dump.cpp` — older hand-rolled-inset spiral probes (kept for reference).
+
 ## Repository Notes
 
 - **Remote:** `https://github.com/SimonRafferty/RoboMower`. The `Robo_Mower_2/` tree is its **own standalone git repo**, pushed there. Note it is physically **nested inside** the home-directory `MAKER-Code` monorepo (`C:/Users/simon/.git`) — when working on the mower, the nested `.git` in `Robo_Mower_2/` is the one that matters. Don't auto-push; push only when the user asks.
 - The working directory is `Robo_Mower_2/`; the Arduino sketch is in `Robo-Mower-V2/`.
 - Documentation: `telemetry.md` (CRSF frame payload layouts), `manual.md` (user-facing operating guide), `README.md` (full ops manual with wiring and tuning).
+
+## Known Issues & TODO (current state — 2026-06-14)
+
+**Coverage planning (spiral): working.** Clipper2 spiral covers concave gardens, side-arms (pinched lobes), uniform spacing from the perimeter inward, bridges between rings, plunge to centre. Residual: a tiny uncut patch at the very centre of each area (single centroid plunge) — could upgrade to a short cross if a large central area shows it.
+
+**Heading: the main open problem (reason for the BNO055 swap).**
+- AUTO heading was wrong (often ~90° off) and didn't self-correct at creep speed; manual was fine. Addressed 2026-06-13 by the **GPS heading LOCK** (lock to GPS travel direction on straight+measurable segments, IMU between) — see EKF section. This should help a lot but is **unverified on hardware**.
+- **gyro-during-pivot can hunt** (turns one way then reverses) — the BMI270 gyro path is the weak link. The **BNO055 swap is intended to replace this whole area** with a continuous fused absolute heading + GPS-trimmed offset.
+- Possible residual risk: if a pivot leaves the heading badly wrong, the node-follower can curve to chase the node and never travel straight enough to re-lock (circling). The AUTO bootstrap (straight creep at entry) establishes heading cleanly to start.
+
+**Disabled / vestigial right now:**
+- **AUTO fault responses are OFF** (`AUTO_FAULT_RESPONSES_ENABLED 0`): overload→RETRACE, stall→BOG_RECOVERY, obstacle→OBSTACLE_AVOID, follower-stall/slip all gated off. Blade is **RC-only** in AUTO. Only **tilt** and **collision** remain as exceptions (plus always-on perimeter-breach / VESC-silence). Re-enable when detectors are trustworthy.
+- **Collision detection does NOT work** — needs a full re-tune (planned to be redone with the BNO055 accelerometer, so no loss).
+- **Blade load %** is display-only now (fixed `BLADE_CURRENT_LIMIT_A` reference); the auto-cal still writes NVS `blade_cal` but its value is unused.
+- **Nav boundary / working area** polygons are still derived/stored/displayed but **unused for navigation** (perimeter is the centre-limit; spiral & breach use the perimeter directly).
+- **Battery auto-return** removed (operator decision; revisit when the mower can self-charge).
+
+**Latent traps to watch:**
+- `perimeter_close_track()` uses a point-COUNT window (dense-perimeter assumption) — could in theory drop a corner on a sparse perimeter. Suspect it if a recorded perimeter loses a corner.
+- After the `mow_cfg` v10→v11 bump, **saved MowerConfig reset to defaults** — operator must re-enter footprint W×L, track width, and any tuning (perimeter & odocal survived in their own keys).
+- `BLADE_CURRENT_LIMIT_A` (config.h) must match the VESC Tool "Motor Current Max".
+
+**Pivot/turn tuning** (`PIVOT_*`, `GYRO_HEADING_*`, `NODE_*` in config.h) is still rough — revisit after the BNO055 gives a trustworthy heading.
+
+## Planned: BNO055 IMU swap (replaces the BMI270)
+
+**Decision (2026-06-14):** replace the BMI270 (6-axis) with a **BNO055** (9-axis with on-chip sensor fusion) for a continuous, tilt-compensated **absolute heading** at standstill / during pivots / under patchy tree cover — the gap GPS-travel-heading can't fill. (Dual-antenna RTK heading was considered and rejected: too costly and little benefit under heavy tree cover where RTK is patchy.) **It replaces the BMI270 outright — no PCB space for both.**
+
+Approach when the part arrives:
+- **Same I²C bus**, drop the bus to **100 kHz** (BNO055 clock-stretching quirk). Confirm comms + set the BNO **axis-remap register** to the robot frame (surge fwd +, sway right +, heave up +, heading CW-from-North +) before anything else.
+- **Keep the `imu_*()` API** — rewrite the IMU driver internals (new `imu_bno055.cpp`, or repurpose `imu_bmi270.*`) so `collision_detect` / `safety` (tilt) / `node_follower` / `state_machine` consumers don't change. Add one new getter for the fused heading.
+- **Role mapping:** tilt → BNO fused Euler pitch/roll (better than raw-accel atan2); gyro Z → BNO gyro; accel → BNO accel (m/s², so **re-tune collision** — which is broken anyway; consider BNO *linear* accel for jolts); heading → BNO fused.
+- **Heading architecture simplifies:** `heading = BNO_heading + offset`, where `offset` is slowly trimmed from GPS travel-direction during straight RTK runs (reuse the `s_hdg_turn_accum` straight detector + distance gate). This **deletes the gyro-pivot hack and most of the GPS-lock gymnastics**; the EKF stops integrating heading (still does position). Robust to patchy GPS (offset holds during outages). Heading known **instantly at AUTO start** — no bootstrap creep needed.
+- **Mag distortion test first:** before trusting NDOF, log BNO heading vs GPS travel-heading while varying drive + blade load. If it swings, fall back to **IMUPLUS** (gyro+accel, no mag) — still better than the current raw-gyro path. Mounting is ~150 mm from the motors behind 304 stainless (which does NOT magnetically shield — distance is what helps).
+- **NVS:** store the BNO 22-byte calibration profile (repurpose the `gyro_bias` key) so it doesn't re-learn the mag each boot. The 2.5 s boot gyro-cal (`imu_collect_bias`) goes away (BNO self-calibrates).
+- **Integration order:** I²C + axis map → mag-distortion test → wire heading + GPS offset into the EKF → re-tune collision.
 
 ## Architecture
 
@@ -70,24 +126,26 @@ cd host_test
 ```
 config.h            — All #define constants: pins, physical dims, tuning, derived values; DEBUG_SERIAL=0 by default
 mower_config.h/.cpp — Runtime-configurable MowerConfig struct; BLE SET_CONFIG updates this
-geometry.h/.cpp     — 2D polygon maths (inset, hull, intersect); geometry_test.h/.cpp for unit tests
+geometry.h/.cpp     — 2D polygon maths (hull, intersect, point-in-poly); hand-rolled inset retained for unit tests only
+clipper_offset.h/.cpp — robust polygon inset via vendored Clipper2 (src/clipper2/); used for the spiral rings + nav/working-area insets
+src/clipper2/       — vendored Clipper2 library (Boost license; the offset engine libslic3r/OpenMower use)
 nvs_storage.h/.cpp  — All NVS persistence (Preferences + blob API); CRC32 on every blob
 crsf_input.h/.cpp   — CRSF RC frame parse (420 kbaud, Serial2); runs FreeRTOS task Core 1
 crsf_telemetry.h/.cpp — 5-frame telemetry rotation to TX16S (GPS, Battery, Attitude, FlightMode, MOWER_STATUS 0x80)
 vesc_can.h/.cpp     — TWAI/CAN driver; SET_DUTY / SET_CURRENT / SET_RPM commands; STATUS_1–5 reception
 rtk_gps.h/.cpp      — Quectel LC29H NMEA parse (115200, Serial1); ENU origin management; Core 0 task
-imu_bmi270.h/.cpp   — BMI270 I2C at 200 Hz; gyro bias collection; feeds EKF + collision detect
+imu_bmi270.h/.cpp   — BMI270 I2C at 200 Hz; gyro bias collection; feeds EKF + collision detect + tilt. **Being replaced by a BNO055 (9-axis fused heading) — see "Planned: BNO055 IMU swap". The imu_*() API will be kept.**
 collision_detect.h/.cpp — Adaptive-baseline jolt detector; direction (fwd/side/rear) classification
 servo_output.h/.cpp — Cut-height servo; LEDC PWM; fixed mechanical calibration 1000–2000 µs (#defines, no NVS cal)
 obstacle_map.h/.cpp — Grid of detected obstacle positions; routes around them
-ekf_localiser.h/.cpp — 4-state EKF [x, y, θ, v]; GPS + odometry + gyro fusion; ENU frame
+ekf_localiser.h/.cpp — 4-state EKF [x, y, θ, v]; GPS + differential-wheel-odometry fusion (gyro NOT used for heading); reverse-aware GPS heading; publishes heading events for odo_calib; ENU frame
 perimeter.h/.cpp    — Polygon record/save/load; derives nav boundary and working area
 cutting_monitor.h/.cpp — Blade current monitoring; load fractions; CUTTING_STALLED / OVERLOADED / OBSTACLE_SUSPECTED
-coverage_planner.h/.cpp — Boustrophedon strip planner; headland passes; optimal angle selection
-pure_pursuit.h/.cpp — Path-following; lookahead scaling; cross-track error recovery
+coverage_planner.h/.cpp — Concentric inward spiral planner (replaced boustrophedon strips 2026-06-13); insets the nav boundary ring-by-ring to the centre
+node_follower.h/.cpp — Node-to-node follower (replaced pure_pursuit 2026-06-13): drives to the actual sparse node, pivots on the spot to aim at the next, P-controller drive arc; defines `WheelCmd`
+odo_calib.h/.cpp    — GPS-referenced self-calibration of distance `scale` + kinematic `track_m` (own NVS ns "odocal"); runs manual+auto; feeds EKF/odometry
 heading_controller.h/.cpp — Gyro-based heading stabilisation; PD correction used by manual drive
 wheel_duty_ramp.h/.cpp — AUTO drive control: fixed duty step (0.02/tick at 10 Hz) toward target speed via SET_DUTY
-wheel_speed_pi.h/.cpp — LEGACY: old PI current loop, superseded by wheel_duty_ramp; compiled but no longer called
 bog_recovery.h/.cpp — Progressive height-raise recovery when stalled; eRPM bogdown detection
 retrace.h/.cpp      — Strip re-trace at max height when overloaded
 battery_monitor.h/.cpp — Battery voltage from VESC CAN STATUS_5 (ID 1); warn/low thresholds
@@ -114,7 +172,7 @@ Recovery sub-states: `STATE_RETRACE`, `STATE_BOG_RECOVERY`, `STATE_OBSTACLE_AVOI
 
 Completion: `STATE_AUTO_RETURN` → `STATE_IDLE`
 
-Operator pause: `STATE_PAUSED` (CH7 switch, GPIO6 latching switch, BLE pause, serial `PAUSE`, or software safety fault — perimeter breach, blade fault, tilt limit all trigger this state; VESCs still powered, CAN stop sent)
+Operator pause: `STATE_PAUSED` (CH7 switch, GPIO6 latching switch, BLE pause, serial `PAUSE`, or software safety fault — **perimeter breach** and **tilt limit** trigger this state; VESCs still powered, CAN stop sent). Note: **blade fault no longer pauses** (blade is RC-only — it just warns and drives on).
 
 Hardware fault: `STATE_MOTORS_OFFLINE` (PILZ E-stop fired — VESC power cut; ESP32 runs on supercap)
 
@@ -123,18 +181,25 @@ Other behaviours wired into the FSM:
 - Battery WARNING/LOW → **operator notification only**: TX warning beep (repeated every 60 s) + MOWER_STATUS flags bit 0x20 (flashing banner on the Lua widget) + PWA toast/beep + amber LED overlay. **No blade lockout and no auto-return** (both removed 2026-06-12, operator decisions — the VESCs handle low-voltage power reduction internally; the operator selects Return. Auto-return may be reinstated when the mower can self-charge — future project).
 - IDLE entry runs a non-blocking "look-around" turret animation (`LOOK_*` phases, `state_machine.cpp:1599`).
 
-### Three nested polygons
+### Perimeter = STEERING-CENTRE limit (2026-06-13 clarification)
+The recorded perimeter is the path of the robot's **steering centre** driven to its
+maximum extent (body against the physical boundary). So the physical fence sits
+~one robot **diagonal-radius OUTSIDE** the perimeter — that margin is already baked
+into the recording, and **the steering centre may drive right up to the perimeter.**
+Consequences: the coverage spiral's outer ring (ring 0) IS the perimeter (no
+nav-inset subtracted — that would double-count the robot size); breach is measured
+directly against the perimeter; speed-scaling distance is to the perimeter.
 
-All derived from the user-taught perimeter and stored in NVS:
-1. **Perimeter** — as recorded (outermost blade edge)
-2. **Nav boundary** — inset by `NAV_EXCLUSION_INSET_M`; steering centre must stay inside
-3. **Working area** — inset further by `HEADLAND_WIDTH_M`; where boustrophedon strips are planned
+The legacy **Nav boundary** (perimeter inset by `NAV_EXCLUSION_INSET_M`) and
+**Working area** (inset by `HEADLAND_WIDTH_M`) are still derived/stored/displayed but
+are **no longer used for navigation** (vestigial under the spiral planner).
 
 ### EKF localiser
 
 4-state: `[x(m), y(m), θ(rad), v(m/s)]` in local ENU frame (origin set by perimeter upload, else auto-seeded at first RTK-fixed fix; persisted in NVS).
-- `ekf_predict(v_left, v_right, dt)` at 10 Hz from `state_machine_update()` — heading from **differential wheel odometry** `(v_right−v_left)/track_width`. **Deliberate decision (June 2026): the gyro is NOT used for heading** — the ground is too bumpy and the machine has near-zero wheel slip, so odometry is the better source. This requires live drive-VESC eRPM frames.
-- `ekf_update_gps()` at ~1 Hz — position **snaps** to GPS; heading corrected from GPS travel direction when RTK-quality and enough distance accumulated. Innovation gate = `max(5σ, 5 m)`; bypassed for the first fix after boot (cold-start seed).
+- `ekf_predict(v_left, v_right, gyro_rate_cw, dt)` at 10 Hz from `state_machine_update()` — heading from **differential wheel odometry** `(v_left−v_right)/track_width`. **Deliberate decision (June 2026): the gyro is NOT used for general heading** — the ground is too bumpy and the machine has near-zero wheel slip, so odometry is the better source. This requires live drive-VESC eRPM frames. **EXCEPTION (2026-06-13): heading rate switches to the gyro Z during on-the-spot pivots.** A zero-radius tank pivot scrubs the tracks, so the effective track is ~1.5× the GPS-arc-calibrated value and odometry **over-rotates** (measured: a 90° physical pivot read as 135°), and with no translation GPS cannot correct it. The pivot is *detected* by odometry (`|v| < GYRO_HEADING_MAX_V_MS=0.12` **and** `|omega_odo| > GYRO_HEADING_MIN_OMEGA=0.30`, config.h) and the rate *measured* by `imu_get_gz_rads()` (bias-corrected, CW+). Gyro is fine here because a slow on-the-spot spin produces little vibration and the 1–2 s window is too short to drift. **Status: partially working — pivot can hunt (turns one way, then reverses); hysteresis/gyro tuning is a follow-up.**
+- `ekf_update_gps()` at ~1 Hz — position **snaps** to GPS. Innovation gate = `max(5σ, 5 m)`; bypassed for the first fix after boot (cold-start seed).
+- **Heading LOCK to GPS (2026-06-13 redesign).** GPS travel direction is the only absolute heading truth, so the EKF heading is **locked** onto it (strong gain `HEADING_GPS_LOCK_GAIN=0.8`, not a weak blend) whenever the mower has driven a **straight, measurable** segment since the last heading reference; otherwise the IMU/odometry carries the heading. Three gates: (1) RTK quality (`fix_type>=4`); (2) **straight** — `s_hdg_turn_accum` (Σ|ω·dt| since the reference, summed in `ekf_predict`) `< HEADING_STRAIGHT_MAX_TURN_RAD` (0.20 rad ≈ 11°); a pivot/corner grows it → the chord is discarded and the segment restarts; (3) **measurable** — travel `> max(HEADING_FROM_GPS_MIN_DIST_M=0.30, HEADING_GPS_DIST_SIGMA_K×σ)` so the chord is long enough for GPS noise to give an accurate heading (≈0.3 m at RTK-fixed, ~3 m at float). At slow creep the reference is **held and travel accumulates** across fixes until the distance gate passes (the "doesn't correct at creep speed" bug). Reverse-corrected (front-facing) when `s_v<-0.03`. **Why this replaced the old weak blend:** at AUTO creep the old `K=P/(P+R)` partial correction left the heading 90° off and uncorrected over 10 m even on a straight line, while manual (faster) tracked fine. Between locks and during pivots, heading is dead-reckoned by odometry/gyro (see `ekf_predict` above).
 - Reported uncertainty = last GPS σ.
 
 ### VESC motor control
@@ -144,7 +209,7 @@ Drive VESCs (CAN ID 1, 2) are commanded by **duty cycle** (`vesc_set_duty()` →
 **Hardware note:** the drive VESCs are HW **v4** (older firmware, no per-message CAN-status selection — verify "Send CAN Status" is enabled in VESC Tool or they broadcast nothing); the blade VESC is HW **v6** with status 1–5 enabled. Closed-loop drive control, odometry heading, and slip/bog detection all require drive STATUS_1 (eRPM) frames.
 
 - **Manual drive** (`state_machine.cpp` `drive_manual`): tank-mix of expo/deadband sticks → per-wheel duty, with a gyro heading-stabilisation PD overlay (`heading_controller_compute()`) and a slew-rate limit (`MANUAL_DUTY_RAMP_PER_S`) to stop wheelies. Fully open-loop — works without VESC telemetry. BLE/WebUI drive sliders are only honoured while the RC TX is off (failsafe active); RC always wins when present.
-- **AUTO drive** (`wheel_duty_ramp.cpp`, called from `pure_pursuit.cpp`): steps each wheel's duty by a fixed `DUTY_RAMP_STEP` (0.02) per 10 Hz tick toward the target m/s, using live VESC eRPM as feedback; clamped to `manual_max_duty`. **Staleness guard:** if a drive VESC's status was never seen or is older than `DUTY_FEEDBACK_STALE_MS` (500 ms), the ramp does NOT integrate (a frozen 0 reading would wind duty to max — runaway); it falls back to bounded open-loop duty and logs once. The old PI-current loop (`wheel_speed_pi.h/.cpp`) still compiles but has no callers.
+- **AUTO drive** (`wheel_duty_ramp.cpp`, called from `node_follower.cpp`): steps each wheel's duty by a fixed `DUTY_RAMP_STEP` (0.02) per 10 Hz tick toward the target m/s, using live VESC eRPM (scaled by odo_calib via `vesc_erpm_to_velocity_scaled()`) as feedback; clamped to `manual_max_duty`. **Staleness guard:** if a drive VESC's status was never seen or is older than `DUTY_FEEDBACK_STALE_MS` (500 ms), the ramp does NOT integrate (a frozen 0 reading would wind duty to max — runaway); it falls back to bounded open-loop duty and logs once. (The legacy `wheel_speed_pi` PI-current loop was deleted 2026-06-13.)
 - **Blade** (CAN ID 3): **RPM control** — keepalive sends `SET_RPM` (target eRPM = `blade_target_rpm × pole_pairs`) every 100 ms; the VESC's internal current-limited RPM PID gives a smooth ~2 s spin-up. A firmware duty ramp was tried and **reverted 2026-06-12** (jerky steps, bad interaction with CAN dropouts) — don't reintroduce it. Disarm = zero-current command (freewheel, no regen). BLADE_FAULT requires `BLADE_FAULT_GRACE_MS` (4 s) after arm before it can fire (`cutting_monitor.cpp`). Telemetry flags bit 0x02 reports the real `s_blade_commanded` state.
 
 ### BLE ↔ PWA protocol
@@ -161,23 +226,25 @@ Five frames in rotation: `FLIGHT_MODE (0x1E)` → `GPS (0x02)` → `BATTERY (0x0
 
 All in `config.h` (compile-time `#define`) and mirrored in `mower_config.h` (runtime `MowerConfig` struct updatable via BLE). The runtime struct takes precedence after first boot.
 
+**Robot dimensions model (2026-06-13):** the footprint is an **overall bounding box** — `footprint_width_m` × `footprint_length_m` (outer extents) — kept *separate* from the **steering track** `track_width_m` (track centre-to-centre, for odometry). For tracks of width *w*, `track_width = overall_width − w` (the steer reference runs up the middle of each track). The old per-edge offsets (`robot_front/rear/left/right`) and `chassis_length_m` (wheelbase) were **removed** (NVS `mow_cfg` bumped v10→**v11**; saved MowerConfig resets to defaults on first boot — perimeter & odocal are separate keys and survive). `chassis_width_m` → renamed `track_width_m`.
+
 Key derived constants (computed in `config.h` and `mower_config.cpp`):
-- `NAV_EXCLUSION_INSET_M = max(robot_left, robot_right, wheel_half_track) + 0.05`
-- `HEADLAND_WIDTH_M = max(CUT_WIDTH_M×1.5, ROBOT_REAR_M + STRIP_OVERLAP_M, blade_fwd_reach + STRIP_OVERLAP_M)`
+- `NAV_EXCLUSION_INSET_M = 0.5·√(footprint_width² + footprint_length²) + 0.05` — **half the footprint diagonal** (the radius the footprint corners sweep when pivoting on the spot), not half the width. Half-width let a corner swing past the boundary during a corner pivot. Assumes the steering centre is ~central in the box. `mower_config_nav_inset_m()`.
+- `HEADLAND_WIDTH_M = max(CUT_WIDTH_M×1.5, footprint_length×0.5 + STRIP_OVERLAP_M, blade_fwd_reach + STRIP_OVERLAP_M)` — vestigial under the spiral planner (working area still derived/displayed).
 
 ## Project Map — Where to Find What
 
 Quick-lookup reference by function/topic. Line numbers are approximate; function names are stable.
 
 ### GPIO pin assignments
-All in `config.h` (~lines 57–100). Key pins: CAN TX/RX GPIO2/1 · servo GPIO5 · pause switch GPIO6 · external LED strip GPIO7 · IMU I2C SDA/SCL GPIO8/9 · GPS Serial1 RX/TX GPIO10/14 · CRSF Serial2 RX/TX GPIO11/12 · onboard NeoPixel GPIO48.
+All in `config.h` (~lines 57–100). Key pins: CAN TX/RX GPIO2/1 · servo GPIO5 · pause switch GPIO6 · external LED strip GPIO7 · IMU I2C SDA/SCL GPIO8/9 (BNO055 will share this bus; plan to drop it to 100 kHz for the BNO clock-stretch quirk) · GPS Serial1 RX/TX GPIO10/14 · CRSF Serial2 RX/TX GPIO11/12 · onboard NeoPixel GPIO48.
 
 ### State transitions
 - `state_machine_update()` entry: `state_machine.cpp:1334`; main FSM switch: `:1548` (state cases `:1551–2680`)
 - Transition helper: `state_machine.cpp:211` `transition_to(next, event_latch)`
-- Pre-FSM safety overrides (~`:1500–1650`): VESC silence → MOTORS_OFFLINE · perimeter breach → PAUSED · RC failsafe → IDLE · battery LOW → auto-return (no blade lockout) · CH7/GPIO6/BLE pause → PAUSED
-- In AUTO_MOWING: blade fault → PAUSED (latched) `:2025` · CUTTING_OVERLOADED → RETRACE `:2032` · CUTTING_STALLED → BOG_RECOVERY `:2048` · OBSTACLE_SUSPECTED → OBSTACLE_AVOID `:2059` · tilt → PAUSED `:2092` · collision → OBSTACLE_AVOID `:2198` · wheel slip → BOG_RECOVERY `:2211`
-- Fault responses are gated for `OBSTACLE_DETECT_STARTUP_MS` after AUTO entry (`obs_armed`, `:2019`) — blade spinup looks like a stall.
+- Pre-FSM safety overrides (~`:1500–1650`): VESC silence → MOTORS_OFFLINE · perimeter breach → PAUSED · RC failsafe → IDLE (operator-driving states only) · CH7/GPIO6/BLE pause → PAUSED. (Battery LOW is **notification-only** — no auto-return, no blade lockout.)
+- In AUTO_MOWING (current behaviour): **tilt → PAUSED** and **collision → OBSTACLE_AVOID** are the only active fault responses. **BLADE_FAULT just warns and drives on** (blade is RC-only — no state change). **OVERLOADED→RETRACE, STALLED→BOG_RECOVERY, OBSTACLE_SUSPECTED→OBSTACLE_AVOID, follower-stall→OBSTACLE_AVOID, follower-slip→BOG_RECOVERY are all GATED OFF** by `AUTO_FAULT_RESPONSES_ENABLED 0` (each `if (AUTO_FAULT_RESPONSES_ENABLED && obs_armed && …)`). See *Recovery modes* and *Known Issues*.
+- The (gated) fault responses are additionally armed only after `OBSTACLE_DETECT_STARTUP_MS` from AUTO entry (`obs_armed`) — blade spin-up looks like a stall.
 
 ### RC channel mapping
 `crsf_input.h:24–32` — CH1=steer, CH2=throttle, CH3=cut height, CH4=mode (manual/auto/return), CH5=learn perimeter, CH6=arm/blade, CH7=pause (`CRSF_CH_PAUSE` in `config.h:241`), CH8=momentary record point. Switch decode with hysteresis: `state_machine.cpp:1410–1417`. `ch[]` values are in **microseconds** (1000–2000), not raw CRSF units.
@@ -186,40 +253,52 @@ All in `config.h` (~lines 57–100). Key pins: CAN TX/RX GPIO2/1 · servo GPIO5 
 `crsf_telemetry.cpp:292` `sendMowerStatus()` — **19-byte** payload: state, progress, cut height, blade load, fix type, flags (+beep bits 7:6), obstacle count, EKF uncertainty, mowed area, **battery V×100 and heading deg×10 (offsets 15–18, added 2026-06-10 so the Lua widget does not depend on EdgeTX `RxBt`/`Yaw` sensor discovery)**. The Lua accepts both 15- and 19-byte payloads.
 
 ### EKF localiser
-- Prediction (gyro + wheel odometry model, 200 Hz): `ekf_localiser.cpp:226` `ekf_predict()`
-- GPS update + innovation gate (max(5σ, 5 m), cold-start bypass): `ekf_localiser.cpp:274` `ekf_update_gps()`; gate check at `:312–331`
+- Prediction (differential wheel-odometry, 10 Hz): `ekf_localiser.cpp` `ekf_predict()` — `omega_odo = (vL−vR)/odo_cal_track_m()` (calibrated kinematic track); fed SCALED wheel velocities. **Pivot exception (2026-06-13):** when `|v| < GYRO_HEADING_MAX_V_MS` and `|omega_odo| > GYRO_HEADING_MIN_OMEGA` (an on-the-spot turn), `omega` is taken from the gyro Z (`gyro_rate_cw` arg, CW+, bias-corrected) instead of odometry — odometry over-rotates ~1.5× from track scrub during a zero-radius pivot and GPS can't correct it with no translation. Forward driving/arcs are unchanged (odometry+GPS).
+- GPS update + innovation gate (max(5σ, 5 m), cold-start bypass): `ekf_localiser.cpp` `ekf_update_gps()`
+- **GPS heading LOCK (2026-06-13):** heading is locked (strong gain `HEADING_GPS_LOCK_GAIN`) to the GPS travel chord when the segment since the reference was **straight** (`s_hdg_turn_accum < HEADING_STRAIGHT_MAX_TURN_RAD`, accum'd in `ekf_predict`) AND **far enough** (`> max(HEADING_FROM_GPS_MIN_DIST_M, HEADING_GPS_DIST_SIGMA_K×σ)`); otherwise IMU/odometry carries it. Slow-creep travel buffers across fixes. (Replaced the old weak `K=P/(P+R)` blend that wouldn't correct at creep speed. The whole heading area is slated to be replaced by the BNO055 fused heading.)
+- **Reverse-aware heading:** GPS gives travel direction; when reversing (`s_v<0`) the fused `z_hdg` is flipped by π so the heading stays FRONT-facing (fixes the Tx-heading flip on reverse spurs)
+- **Heading establishment + events:** first GPS heading correction sets `ekf_heading_is_established()`; each clean straight-RTK fix publishes a front-facing heading event (`ekf_get_gps_heading_event()`) consumed by odo_calib. Reset on RESETEKF.
 - ENU origin lock: `rtk_gps.cpp` `rtk_gps_set_origin()` — called at first RTK-fixed GPS fix and when perimeter is received via BLE
+
+### Odometry self-calibration (`odo_calib.cpp`) + AUTO heading bootstrap
+- `odo_calib_update()` ticks from the 10 Hz EKF hook in ALL states (manual+auto). Distance `scale` from straight RTK runs (GPS chord / odometry), kinematic `track_m` from turns (Σ(vL−vR)·dt / Δθ_gps). EMA, ≤2 %/update, RTK-only. Stored in **its own NVS ns "odocal"** (keys `scale`, `track`); a `CAL …` line is logged to the PWA. Applied via `vesc_erpm_to_velocity_scaled()` (EKF feed, duty-ramp feedback, follower stall/slip) and `odo_cal_track_m()` (EKF omega, node_follower, bog_recovery).
+- **AUTO-start bootstrap** (`state_machine.cpp` STATE_AUTO_MOWING): every FRESH start requires **≥2 m perimeter clearance** (`AUTO_BOOTSTRAP_PERIM_MIN_M`, nearest edge in any direction) regardless of heading → else PAUSE; **skipped on resume from PAUSED** (so a mow paused at the edge can resume). Then, if heading is not yet established, creep straight (`AUTO_BOOTSTRAP_SPEED_MS`) to establish it before following; no RTK / not established within `AUTO_BOOTSTRAP_MAX_MS` (8 s) → PAUSE. Operator clears a start-gate PAUSE by selecting MANUAL.
 
 ### Motor commands
 - Drive duty: `vesc_can.cpp` `vesc_set_duty(id, duty)` → CAN PKT_SET_DUTY; stop via `vesc_set_current(id, 0)`
 - Blade SET_RPM: `vesc_can.cpp` `vesc_set_rpm(id, erpm)` → CAN PKT_SET_RPM
-- AUTO duty ramp: `wheel_duty_ramp.cpp:20` `wheel_duty_ramp_compute()` — step = `DUTY_RAMP_STEP` (0.02)/tick, called from `pure_pursuit.cpp:411`
+- AUTO duty ramp: `wheel_duty_ramp.cpp:20` `wheel_duty_ramp_compute()` — step = `DUTY_RAMP_STEP` (0.02)/tick, called from `node_follower.cpp`
 - Manual heading PD correction: `heading_controller.cpp:31` `heading_controller_compute()`, applied in `drive_manual` at `state_machine.cpp:775`
 - Blade spinup ramp (3 s): `s_blade_ramp_erpm` interpolation in MANUAL `state_machine.cpp:~1737` and AUTO handlers, gated by `s_last_armed`
 
 ### Safety watchdogs (`safety.cpp`, Core 1, 50 ms period)
 - Both drive VESCs stale > 2 s → STATE_MOTORS_OFFLINE: `safety.cpp:~190–215`
 - Blade VESC stale (separate, non-fatal for drive): `safety.cpp:217`
-- Perimeter breach > `PERIMETER_BREACH_DIST_M` outside nav boundary → pause request: `safety.cpp:246`
+- Perimeter breach > `PERIMETER_BREACH_DIST_M` outside the **PERIMETER** (the steering-centre limit; `safety_set_perimeter()`, not the nav boundary) → hard-stop + pause request: `safety.cpp` (~`:246`)
 - Tilt limit (normal vs careful, from MowerConfig) checked in AUTO: `state_machine.cpp:2088`
 - Uncertainty-aware navigation (speed scaling, careful collision multiplier, strip truncation): `state_machine.cpp:2070–2110`
 
-### Perimeter recording
-- Sample GPS point (0.2 m distance gate): `perimeter.cpp:184` `perimeter_record_point()`
-- Auto-close polygon on LEARN exit: `perimeter.cpp:221` `perimeter_close_track()`
+### Perimeter recording — SPARSE (turn-point nodes, ~10 points)
+- **The perimeter is sparse**: in LEARN mode the operator presses **CH8 at each corner** and a single node is recorded on the falling edge (`state_machine.cpp:2072`) via `perimeter_record_point(..., force=true)`, which **bypasses** the 0.2 m distance gate. Edges between corners are straight; nothing densifies them. (The `RECORD_DIST_M = 0.2` gate in `perimeter.cpp` only applies to non-forced calls, which LEARN does not use.)
+- `perimeter_close_track()` (`perimeter.cpp:221`) still uses a point-COUNT window (`PERIMETER_CLOSE_WINDOW`, tuned for dense 0.2 m points) to find the closest start/end pair — a latent dense assumption. For a sparse perimeter the window clamps to 3 nodes; it works in practice but could in theory discard a real corner if the last node lands closer to an interior start node than to node 0. Watch this if a recorded perimeter ever loses a corner.
 - Recompute nav boundary + working area insets: `perimeter.cpp:448` `perimeter_recompute()`
 
-### Coverage planning (`coverage_planner.cpp`)
-- Entry point (optimal angle, headland passes, boustrophedon strips): `coverage_planner_plan()` `:346`
-- Each strip region gets a **region-outline pass before its strips** (added 2026-06-12, Slic3r-style innermost perimeter) — seals the wedge gaps that parallel strips leave along boundary edges not parallel to the mow direction
-- Unreachable zones (area < 0.5 m²): detected during planning, logged, skipped; accessible via `UNREACHABLE` serial command
-- Waypoint drain: `coverage_planner_get_next()` `:767`; resume near position: `coverage_planner_reset_to_nearest(x, y)` `:796`
+### Coverage planning (`coverage_planner.cpp`) — CONCENTRIC SPIRAL (2026-06-13)
+- **The boustrophedon strip planner was REPLACED by a concentric inward spiral.** The strip planner (scan-line strips + headland passes + region-outline passes + spur reverses + U-turn transitions) never planned a *sparse* perimeter cleanly and produced corrupt fan-shaped plans (lines converging to a couple of points; paths leaving the perimeter — see `PathError.jpg`). All that machinery (`hLineIntersect`/`vLineIntersect`/`rotatePoint`/`addPolygonWaypoints`/`addTransition`, optimal-angle hull scan, strip/spur logic) is **gone**.
+- **The perimeter is SPARSE** — ~10 turn-point nodes joined by straight edges, recorded one node at a time (CH8). It is NOT densified anywhere. The spiral is native to this: each ring is the polygon's sparse vertices, and the node follower drives straight edge-to-edge and pivots at corners. The recorded perimeter (and its inset rings) keep their corner-only vertex set; the long straight runs between corners are expected, not a fault.
+- **Offsetting is done by Clipper2, NOT the hand-rolled `insetPolygon` (2026-06-13).** The custom inset spikes at concave (reflex) corners and inverts past the local inradius (no boolean-union cleanup), so repeated/deep insets of a notched garden fanned out / produced garbage. Clipper2 (the same engine libslic3r/OpenMower use) does the union cleanup, so it insets arbitrary concave gardens robustly. Wrapper: `clipper_offset.h/.cpp` (`offsetPolygonClipper` → all solid sub-polygons; `insetPolygonClipper` → largest single region). Clipper2 itself is vendored under `Robo-Mower-V2/src/clipper2/` (Boost license; flat includes; Arduino compiles `src/` recursively).
+- `coverage_planner_plan()`: **ring 0 = the perimeter itself** (the steering-centre limit — see "Perimeter = steering-centre limit" above; NO nav-inset subtracted, so the outer spacing is uniform with the rest, not an oversized border). **ring k>0 = the perimeter inset by k·step** (`CUT_WIDTH_M − STRIP_OVERLAP_M` = 0.36 m) via `offsetPolygonClipper`, **keeping ALL sub-regions** so a garden that **pinches into separate areas** (e.g. a neck to a side arm) is fully covered — each area gets its own concentric spiral (fixes the "big areas missed" bug, `PathError3.jpg`). Rings continue down to **`SPIRAL_RING_MIN_AREA_M2` (0.04 m²)** so the spiral reaches the centre (stopping at 0.5 m² left a multi-cut-width middle void). Round-joins are RDP-simplified (8 cm) → a handful of sparse nodes/ring; over-shrink returns empty (loop ends). Caps: `MAX_PLAN_WP` (960) / `MAX_RINGS` (400). All waypoints `mowing=true, headland=true`. No clamp (every vertex is inside the perimeter by construction). `g_headland_wp_end_idx = total`.
+- **Breach detection is against the PERIMETER** (`safety.cpp`, `safety_set_perimeter(perimeter_get_perimeter())`): breach when `distanceToNearestEdge(perimeter, pos) < -PERIMETER_BREACH_DIST_M` (centre more than the breach distance OUTSIDE the centre-limit perimeter). One polygon, so it covers all regions incl. pinched-off arms. Speed-scaling/`margin` (`state_machine.cpp`) also measures to the perimeter now.
+- **Nav boundary & working area** are also inset via Clipper (`insetPolygonClipper`, largest region) in `perimeter.cpp` / `state_machine.cpp` SEND_PERIMETER so the displayed boundary doesn't spike at notches. The hand-rolled `geometry.cpp` `insetPolygon`/`insetPolygonMulti` remain only for the unit tests.
+- Validated offline: `host_test/clipper_spiral_test.cpp` (direct), `clipper_wrapper_test.cpp` (real wrapper), `clipper_multiregion_test.cpp` (dumbbell/pinch → both regions covered). Build: `zig c++ -std=c++17 -I../Robo-Mower-V2/src/clipper2 ... clipper.engine.cpp clipper.offset.cpp clipper.rectclip.cpp`.
+- Waypoint drain: `coverage_planner_get_next()`; resume near position: `coverage_planner_reset_to_nearest(x, y)`. Unreachable-zone diagnostics retained but unused (spiral covers all an inset can reach).
 
 ### Recovery modes
+- **TEMPORARILY DISABLED (2026-06-13): all AUTO fault responses are gated off** by `AUTO_FAULT_RESPONSES_ENABLED 0` (config.h). The five transitions below (OVERLOADED→RETRACE, STALLED→BOG_RECOVERY, OBSTACLE_SUSPECTED→OBSTACLE_AVOID, follower-stall→OBSTACLE_AVOID, follower-slip→BOG_RECOVERY) are each gated `if (AUTO_FAULT_RESPONSES_ENABLED && obs_armed && …)` in `state_machine.cpp`, so RETRACE/BOG_RECOVERY/OBSTACLE_AVOID are currently unreachable. The detectors proved unreliable in the field and were triggering false recoveries (and a full-speed takeoff via the recovery sub-states). The blade is now **entirely RC-controlled** in AUTO exactly as in MANUAL — only **tilt** and **collision** remain as fault exceptions, plus the always-on perimeter-breach/VESC-silence safety. Re-enable by setting the flag to 1 once the detectors are trustworthy.
 - Stall vs overload classification: `cutting_monitor.cpp:83` `assessCuttingCondition()`
   - STALLED (not moving, load high) → BOG_RECOVERY; OVERLOADED (moving, load high) → RETRACE; OBSTACLE_SUSPECTED (blade commanded, load low, not moving) → OBSTACLE_AVOID
 - Bog recovery state machine: `bog_recovery.cpp:141` `bog_recovery_update()` (dwell → lower deck → forward pass, up to 6 retries)
-- eRPM bogdown / wheel slip: `pure_pursuit.cpp:397` `pure_pursuit_is_slipping()` → BOG_RECOVERY at `state_machine.cpp:2211`
+- eRPM bogdown / wheel slip: `node_follower.cpp` `node_follower_is_slipping()` → BOG_RECOVERY in `state_machine.cpp` AUTO follower
 - IMU collision spike: `collision_detect.cpp` `collisionDetected()` → OBSTACLE_AVOID at `state_machine.cpp:2198`
 
 ### BLE command handling
@@ -237,6 +316,10 @@ All in `config.h` (~lines 57–100). Key pins: CAN TX/RX GPIO2/1 · servo GPIO5 
 - GPS ENU origin (`gpsorigin`): `nvs_save_gps_origin()` / `nvs_load_gps_origin()`
 
 ### Blade load calibration
+**Load reference (2026-06-13): blade load % is now `compensated_current / BLADE_CURRENT_LIMIT_A` (fixed 15 A = VESC motor-current limit, config.h)** — `cutting_monitor.cpp` `cutting_monitor_get_load_fraction()` and the `load` in `assessCuttingCondition()`. Previously it divided by the auto-calibrated `g_blade_max_A`, whose P90 captured the **idle** current (~7 A) as 100 %, so idle read ~105 % (and crossed the 0.75 HIGH threshold, falsely flagging overload). With the fixed 15 A reference, idle (~7.5 A) reads ~50 % and HIGH sits at 11.25 A. `BLADE_CURRENT_LIMIT_A` **must match the "Motor Current Max" set in VESC Tool.**
+
+The auto-calibration below still runs and still writes the `blade_cal` NVS float, but its result (`g_blade_max_A`) is **no longer used** for the load fraction or thresholds — it is vestigial until the detectors are re-enabled.
+
 `cutting_monitor.cpp:117` `updateCalibration()` — P90 percentile of blade current samples collected over first 3 s of AUTO_MOWING. Minimum valid: 2.0 A. Voltage-compensated against nominal 54.6 V (13S × 4.2 V).
 
 ### 2 Hz JSON telemetry (USB Serial, requires DEBUG_SERIAL=1)
@@ -255,8 +338,12 @@ Key NVS keys (namespace `"mower"`):
 - `estops` — circular E-stop log (20 × 44 bytes)
 - `gyro_bias` — float; Z-axis gyro offset (rad/s)
 - `blade_cal` — float; auto-calibrated blade reference current (A)
-- `mow_cfg` — MowerConfig blob (all runtime physical constants)
+- `mow_cfg_v11` — MowerConfig blob (all runtime physical constants). **Key bumped v10→v11 on 2026-06-13** (footprint W×L box + `track_width_m`, removed `robot_*`/`chassis_length_m`); the `sizeof` guard also rejects the old blob, so saved MowerConfig resets to defaults — operator re-enters dimensions/tuning.
 - `coll_base` — float; adaptive collision baseline (g)
+
+Separate namespace `"odocal"` (kept apart from `mow_cfg` so the operator's manual config is untouched):
+- `scale` — float; GPS-calibrated distance multiplier on wheel odometry (default 1.0)
+- `track` — float; GPS-calibrated kinematic track width (m, default = nominal `track_width_m`)
 
 (The old `servo_min_us` / `servo_max_us` keys are gone — the cut-height servo now uses fixed 1000–2000 µs `#define` calibration in `servo_output.cpp`.)
 

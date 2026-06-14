@@ -46,7 +46,10 @@ float wheel_duty_ramp_compute(uint8_t vesc_id, float desired_ms) {
         return duty;
     }
 
-    float actual_ms = vesc_erpm_to_velocity(st.erpm);
+    // Use the SCALED velocity so the closed loop runs on the same calibrated
+    // odometry the EKF and follower use (otherwise it would settle at
+    // desired/scale ground speed). See odo_calib.h.
+    float actual_ms = vesc_erpm_to_velocity_scaled(st.erpm);
     float error_ms  = desired_ms - actual_ms;
 
     // Step duty toward target — one fixed step per tick, no proportional jump

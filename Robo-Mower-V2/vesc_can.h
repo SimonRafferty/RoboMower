@@ -240,6 +240,16 @@ bool vesc_can_bus_ok();
  *  @return      Signed wheel velocity in m/s */
 float vesc_erpm_to_velocity(float erpm);
 
+/** Convert electrical RPM to wheel-surface velocity (m/s), then multiply by the
+ *  GPS-referenced distance calibration (odo_cal_scale()). Use this at the
+ *  motion-estimate consumers (EKF feed, duty-ramp feedback, follower stall/slip)
+ *  so the calibrated scale is applied consistently. The raw (unscaled)
+ *  vesc_erpm_to_velocity() remains for the cross-core RX-task odometry.
+ *
+ *  @param erpm  Signed electrical RPM from CAN_PACKET_STATUS
+ *  @return      Signed, scale-corrected wheel velocity in m/s */
+float vesc_erpm_to_velocity_scaled(float erpm);
+
 /** Convert wheel-surface velocity (m/s) to electrical RPM — inverse of vesc_erpm_to_velocity.
  *
  *  Formula:  erpm = velocity_ms * GEAR_RATIO / (2π * WHEEL_RADIUS_M) * MOTOR_POLE_PAIRS * 60

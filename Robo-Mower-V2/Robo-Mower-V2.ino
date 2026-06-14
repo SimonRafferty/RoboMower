@@ -154,7 +154,8 @@
 #include "perimeter.h"
 #include "cutting_monitor.h"
 #include "coverage_planner.h"
-#include "pure_pursuit.h"
+#include "node_follower.h"
+#include "odo_calib.h"
 #include "bog_recovery.h"
 #include "retrace.h"
 #include "battery_monitor.h"
@@ -189,6 +190,9 @@ void setup() {
     // 1b. Runtime mower config (after NVS, before any module that uses dimensions)
     mower_config_init();
 
+    // 1c. Odometry self-calibration (after mower_config — needs nominal track/wheel)
+    odo_calib_init();
+
     // 2. Hardware peripherals
     pinMode(PAUSE_PIN, INPUT_PULLUP);   // physical pause switch, GPIO6, active LOW
     servo_output_init();
@@ -216,7 +220,7 @@ void setup() {
 
     obstacle_map_init(perimeter_get_perimeter());  // init grid
     coverage_planner_init();
-    pure_pursuit_init();
+    node_follower_init();
     cutting_monitor_init();
 
     // 4. Battery monitor (before safety — safety checks battery state)

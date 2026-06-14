@@ -9,10 +9,14 @@
 //
 //  Generates the full mowing plan before execution begins.
 //
-//  Execution order (HEADLAND_FIRST = 1, always):
-//    1. Headland perimeter passes   — outermost first, inward
-//    2. Boustrophedon strip passes  — across the working area
-//    3. Strip-end transitions       — arc/pivot turns within headland
+//  Strategy (2026-06-13): CONCENTRIC INWARD SPIRAL. The boustrophedon strip
+//  planner was removed — it never planned a sparse perimeter cleanly and
+//  produced corrupt fan-shaped paths. The spiral starts on the nav boundary
+//  and insets inward by one strip step per ring until the polygon collapses
+//  at the centre; concave shapes that pinch into separate lobes are each
+//  spiralled to their own centre. See coverage_planner.cpp for the rationale.
+//
+//  Waypoints are steering-centre positions and never leave the nav boundary.
 //
 //  Call sequence:
 //    coverage_planner_init()
@@ -21,11 +25,6 @@
 //        Waypoint wp;
 //        if (coverage_planner_get_next(wp)) { follow wp; }
 //    }
-//
-//  Source references:
-//    Spec: Robo_Mower_claudecode_prompt_v3.md §Coverage Planner
-//    Assumptions: ASSUMPTIONS.md A07, A09, A19
-//    Handoff: HANDOFFS/15_coverage_planner/HANDOFF.md
 // ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -48,20 +47,16 @@ void coverage_planner_init();
 
 /** Generate the complete mowing plan. Call once on entering AUTO_MOWING.
  *
- *  Planning steps (in order):
- *    1. Headland passes — n_passes inset polygons, outermost first
- *    2. Optimal mowing angle — minimise strip count via convex hull edge scan
- *    3. Strip generation — horizontal intersection in rotated frame
- *    4. Boustrophedon sequencing — alternating direction per strip
- *    5. Strip-end transitions — arc or pivot, with rear-swing validation
+ *  Builds a concentric inward spiral: ring 0 = nav boundary, ring i = ring i-1
+ *  inset by mower_config_strip_step_m(), until the polygon collapses. Each ring
+ *  is a closed loop of waypoints at the polygon vertices; the next ring starts
+ *  at the vertex nearest the previous ring's start. All waypoints are flagged
+ *  mowing=true, headland=true (edge-following, exempt from strip truncation).
  *
- *  Arc-sweep credit (Step 6/7) is disabled when
- *  STEER_CENTRE_TO_CUT_CENTRE_M <= 0 (front-drive configuration).
- *
- *  @param perimeter    Recorded perimeter polygon (≥ 3 vertices, CCW)
- *  @param navBoundary  Navigation boundary (inset of perimeter)
- *  @param workingArea  Strip mowing area (inset of navBoundary by HEADLAND_WIDTH_M)
- *  @return true on success; false if polygons are invalid or working area is empty
+ *  @param perimeter    Recorded perimeter polygon (unused; spiral derives from nav)
+ *  @param navBoundary  Navigation boundary (inset of perimeter) — the outer ring
+ *  @param workingArea  Unused (kept for call-site compatibility)
+ *  @return true on success; false if the nav boundary is invalid or too small
  */
 bool coverage_planner_plan(const Polygon &perimeter,
                            const Polygon &navBoundary,

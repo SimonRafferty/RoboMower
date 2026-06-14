@@ -34,7 +34,7 @@
 #include "sys_log.h"
 #include "imu_bmi270.h"
 #include "crsf_input.h"
-#include "pure_pursuit.h"
+#include "node_follower.h"
 #include "heading_controller.h"
 
 #include <BLEDevice.h>
@@ -517,9 +517,8 @@ static String build_status_json() {
     static char cbuf[1400];  // static: BSS segment, not stack — build_status_json() is called from one BLE task only
     snprintf(cbuf, sizeof(cbuf),
         "\"cfg\":{"
-        "\"robot_front_m\":%.3f,\"robot_rear_m\":%.3f,"
-        "\"robot_left_m\":%.3f,\"robot_right_m\":%.3f,"
-        "\"chassis_width_m\":%.3f,\"chassis_length_m\":%.3f,"
+        "\"footprint_width_m\":%.3f,\"footprint_length_m\":%.3f,"
+        "\"track_width_m\":%.3f,"
         "\"wheel_radius_m\":%.4f,\"motor_pole_pairs\":%d,\"gear_ratio\":%.2f,"
         "\"antenna_fwd_m\":%.3f,\"antenna_right_m\":%.3f,"
         "\"steer_to_cut_m\":%.3f,\"cut_disc_radius_m\":%.3f,"
@@ -537,9 +536,8 @@ static String build_status_json() {
         "\"wheel_pi_kp\":%.2f,\"wheel_pi_ki\":%.2f,"
         "\"manual_max_duty\":%.2f,\"manual_max_speed_ms\":%.3f,"
         "\"min_turn_radius_m\":%.3f},",
-        mc.robot_front_m, mc.robot_rear_m,
-        mc.robot_left_m,  mc.robot_right_m,
-        mc.chassis_width_m, mc.chassis_length_m,
+        mc.footprint_width_m, mc.footprint_length_m,
+        mc.track_width_m,
         mc.wheel_radius_m, (int)mc.motor_pole_pairs, mc.gear_ratio,
         mc.antenna_fwd_m, mc.antenna_right_m,
         mc.steer_to_cut_m, mc.cut_disc_radius_m,
@@ -682,15 +680,15 @@ static String build_diag_json() {
 
     // VESCs — commanded duty (replacing old current readback)
     float cmd_left_duty = 0, cmd_right_duty = 0;
-    pure_pursuit_get_last_duty(&cmd_left_duty, &cmd_right_duty);
+    node_follower_get_last_duty(&cmd_left_duty, &cmd_right_duty);
 
     // EKF
     Pose2D pose = ekf_get_pose();
     float  spd  = ekf_get_speed();
     float  unc  = ekf_get_position_uncertainty();
 
-    // Pure pursuit & cutting
-    float xte    = pure_pursuit_get_cross_track_error();
+    // Path follower & cutting
+    float xte    = node_follower_get_cross_track_error();
     float cut_avg = cutting_monitor_get_avg_current();
     float cut_lf  = cutting_monitor_get_load_fraction();
 

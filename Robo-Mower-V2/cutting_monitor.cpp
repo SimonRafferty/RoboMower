@@ -102,15 +102,18 @@ static CuttingStatus assessCuttingCondition(
     // duty control there is no firmware RPM target to compare against.
     if (blade_commanded && g_blade_cmd_since_ms != 0
         && (millis() - g_blade_cmd_since_ms) > BLADE_FAULT_GRACE_MS) {
-        if (blade_current_A < (BLADE_LOAD_MIN * g_blade_max_A)
+        if (blade_current_A < (BLADE_LOAD_MIN * BLADE_CURRENT_LIMIT_A)
             && fabsf(blade_actual_erpm) < BLADE_FAULT_MIN_ERPM) {
             return BLADE_FAULT;
         }
     }
 
     // ── All other conditions: use rolling average of compensated current ───
+    // Load is fraction of the fixed VESC current limit (BLADE_CURRENT_LIMIT_A),
+    // NOT the auto-calibrated g_blade_max_A — the auto-cal captured idle current
+    // as 100% and made everything read overloaded. See config.h (2026-06-13).
     bool  moving = (fabsf(fused_velocity) > STALL_SPEED_THRESHOLD_MS);
-    float load   = g_rolling_avg / g_blade_max_A;
+    float load   = g_rolling_avg / BLADE_CURRENT_LIMIT_A;
 
     if ( moving && load < BLADE_LOAD_HIGH)  return CUTTING_NORMAL;
     if ( moving && load >= BLADE_LOAD_HIGH) return CUTTING_OVERLOADED;
@@ -316,11 +319,12 @@ float cutting_monitor_get_avg_current() {
 
 float cutting_monitor_get_load_fraction() {
     portENTER_CRITICAL(&g_mux);
-    float avg     = g_rolling_avg;
-    float max_a   = g_blade_max_A;
+    float avg = g_rolling_avg;
     portEXIT_CRITICAL(&g_mux);
-    if (max_a <= 0.0f) return 0.0f;
-    return avg / max_a;
+    // Fraction of the fixed VESC current limit (see config.h, 2026-06-13). The
+    // auto-calibrated g_blade_max_A is no longer used as the load reference — it
+    // was capturing idle current as 100%, so idle read ~105%.
+    return avg / BLADE_CURRENT_LIMIT_A;
 }
 
 void cutting_monitor_start_auto_cal() {

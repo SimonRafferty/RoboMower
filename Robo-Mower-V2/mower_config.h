@@ -21,15 +21,13 @@
 // ══════════════════════════════════════════════════════════════════════════════
 
 struct MowerConfig {
-    // ── Robot footprint (metres from steering centre) ─────────────────────────
-    float    robot_front_m;            // steering centre → front chassis edge
-    float    robot_rear_m;             // steering centre → rear chassis edge
-    float    robot_left_m;             // steering centre → left chassis edge
-    float    robot_right_m;            // steering centre → right chassis edge
+    // ── Robot footprint — OVERALL bounding box (outer extents) ────────────────
+    // Boundary-clearance only: nav inset = half the diagonal of this box.
+    float    footprint_width_m;        // overall outer width [m]
+    float    footprint_length_m;       // overall outer length [m]
 
-    // ── Chassis reference ─────────────────────────────────────────────────────
-    float    chassis_width_m;          // left to right wheel centres (= track width)
-    float    chassis_length_m;         // front to rear wheel centres
+    // ── Steering track (drivetrain) ───────────────────────────────────────────
+    float    track_width_m;            // track centre-to-centre [m] (steering odometry)
 
     // ── Drive system ──────────────────────────────────────────────────────────
     float    wheel_radius_m;           // driven wheel radius [m]
@@ -121,11 +119,12 @@ MowerConfig mower_config_get();
 
 // ── Derived geometry (computed from current config) ───────────────────────────
 
-/** Wheel track width = chassis_width_m. */
+/** Steering track width = track_width_m (track centre-to-centre). */
 float mower_config_track_width_m();
 
 /** Navigation exclusion inset: steering centre must stay this far inside the
- *  perimeter.  = max(robot_left_m, robot_right_m, track/2) + 0.05 m GPS margin. */
+ *  perimeter so no footprint corner sweeps past it during an on-the-spot pivot.
+ *  = 0.5·√(footprint_width² + footprint_length²) + 0.05 m GPS margin. */
 float mower_config_nav_inset_m();
 
 /** Headland width: inset from nav boundary to working area. */

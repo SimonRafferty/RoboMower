@@ -115,15 +115,20 @@ void ekf_init();
  * @brief EKF prediction step — differential wheel odometry. Call at 10 Hz from Core 0.
  *
  * Propagates state forward using differential drive kinematics:
- *   dx = v·sin(θ)·dt,  dy = v·cos(θ)·dt,  dθ = (v_right-v_left)/track·dt
- * Heading comes from wheel differential, not IMU — no magnetometer means
- * gyro-only heading drifts unbounded; wheel odometry is self-correcting via GPS.
+ *   dx = v·sin(θ)·dt,  dy = v·cos(θ)·dt,  dθ = (v_left-v_right)/track·dt
+ * Heading normally comes from the wheel differential (no magnetometer; wheel
+ * odometry is self-correcting via GPS while translating). EXCEPTION: during an
+ * on-the-spot pivot (near-zero translation + real yaw) the odometry over-rotates
+ * from track scrub and GPS cannot correct it, so the heading rate is taken from
+ * the gyro instead. See GYRO_HEADING_* in config.h.
  *
- * @param v_left   Left wheel surface velocity (m/s).
- * @param v_right  Right wheel surface velocity (m/s).
- * @param dt       Time step (seconds).
+ * @param v_left      Left wheel surface velocity (m/s).
+ * @param v_right     Right wheel surface velocity (m/s).
+ * @param gyro_rate_cw Gyro Z yaw rate, bias-corrected, CW-positive (rad/s) —
+ *                     used for heading ONLY during pivots (see above).
+ * @param dt          Time step (seconds).
  */
-void ekf_predict(float v_left, float v_right, float dt);
+void ekf_predict(float v_left, float v_right, float gyro_rate_cw, float dt);
 
 /**
  * @brief EKF GPS position (and optional heading) update. Call at 1 Hz from Core 0.
@@ -189,6 +194,40 @@ float ekf_get_position_uncertainty();
  * moved by the operator) so the filter rapidly accepts new GPS measurements.
  */
 void ekf_reset_covariance();
+
+/**
+ * @brief True once a GPS heading correction has been applied at least once
+ *        since boot (or RESETEKF).
+ *
+ * After this, the heading is trustworthy and is carried by wheel odometry
+ * through on-the-spot pivots. The AUTO-start bootstrap waits for this before
+ * following nodes (otherwise it would steer on a stale/unknown heading).
+ *
+ * Thread-safe: single bool — atomic read.
+ */
+bool ekf_heading_is_established();
+
+/**
+ * @brief Latest GPS-derived FRONT-FACING heading event (for odo_calib).
+ *
+ * Each clean straight-RTK heading fix publishes a monotonically increasing seq
+ * together with the front-facing travel heading (reverse-corrected) and the
+ * steering-centre ENU position at that fix. A consumer detects a new event by a
+ * changed seq.
+ *
+ * @param[out] seq    Monotonic event counter (0 = none yet).
+ * @param[out] theta  Front-facing heading (rad, 0=North, CW+, ±π).
+ * @param[out] east   Steering-centre ENU east at the fix (m).
+ * @param[out] north  Steering-centre ENU north at the fix (m).
+ * @return true if at least one event has been published.
+ */
+bool ekf_get_gps_heading_event(uint32_t *seq, float *theta,
+                               float *east, float *north);
+
+/**
+ * @brief Heading 1-sigma uncertainty (rad) = sqrt(P[2][2]). Thread-safe.
+ */
+float ekf_get_heading_uncertainty();
 
 /**
  * @brief Returns true once the EKF has received its first valid GPS fix.

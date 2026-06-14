@@ -31,7 +31,9 @@
 #include "perimeter.h"
 #include "geometry.h"
 #include "coverage_planner.h"
-#include "pure_pursuit.h"
+#include "node_follower.h"
+#include "clipper_offset.h"
+#include "odo_calib.h"
 #include "cutting_monitor.h"
 #include "bog_recovery.h"
 #include "retrace.h"
@@ -430,6 +432,63 @@ static int load_waypoints_from_planner() {
 }
 
 
+// ── Plan geometry dump (BLE field diagnostic) ──────────────────────────────────
+// Emit a compact summary of the planned path to the system log so it can be read
+// over Bluetooth (no serial, no PWA "Plan Test" button needed). Reports counts by
+// type, total path length, and — crucially — the largest jump between consecutive
+// waypoints, both overall and WITHIN the headland pass. A large headland gap means
+// the stored perimeter polygon is sparse, so the follower tracks long straight
+// chords instead of hugging the edge — the "drives diagonally across, ignores the
+// perimeter, ends in the flower bed" symptom (cross-track stays 0 because the mower
+// IS perfectly on the chord). Also shows where waypoint 0 sits relative to the
+// mower, to reveal a plan that starts far from home.
+static void log_plan_stats(const Waypoint *wps, int n, const Pose2D &ps) {
+    if (!wps || n <= 0) { sys_log_push("PLAN empty (0 wp)"); return; }
+
+    int   n_hl = 0, n_mow = 0, n_tr = 0;
+    float total_len   = 0.0f;
+    float maxgap      = 0.0f;  int maxgap_i    = -1;   // largest gap (any type)
+    float maxgap_hl   = 0.0f;  int maxgap_hl_i = -1;   // largest headland-to-headland gap
+    int   big_gaps    = 0, big_gaps_hl = 0;            // count of gaps > 1.0 m
+    for (int i = 0; i < n; i++) {
+        if (wps[i].headland)    n_hl++;
+        else if (wps[i].mowing) n_mow++;
+        else                    n_tr++;
+        if (i > 0) {
+            float gx = wps[i].x - wps[i-1].x;
+            float gy = wps[i].y - wps[i-1].y;
+            float d  = sqrtf(gx*gx + gy*gy);
+            total_len += d;
+            if (d > maxgap) { maxgap = d; maxgap_i = i; }
+            if (d > 1.0f) big_gaps++;
+            if (wps[i].headland && wps[i-1].headland) {
+                if (d > maxgap_hl) { maxgap_hl = d; maxgap_hl_i = i; }
+                if (d > 1.0f) big_gaps_hl++;
+            }
+        }
+    }
+
+    char l[SYS_LOG_MAX_LEN];
+    snprintf(l, sizeof(l), "PLAN n=%d hl=%d mow=%d tr=%d len=%.0fm",
+             n, n_hl, n_mow, n_tr, total_len);
+    sys_log_push(l);
+    snprintf(l, sizeof(l), "PLAN maxgap=%.1f@%d big>1m=%d (hl:%.1f@%d x%d)",
+             maxgap, maxgap_i, big_gaps, maxgap_hl, maxgap_hl_i, big_gaps_hl);
+    sys_log_push(l);
+    float d0 = sqrtf((wps[0].x - ps.x) * (wps[0].x - ps.x)
+                   + (wps[0].y - ps.y) * (wps[0].y - ps.y));
+    snprintf(l, sizeof(l), "PLAN pos=%.1f,%.1f w0=%.1f,%.1f d0=%.1f",
+             ps.x, ps.y, wps[0].x, wps[0].y, d0);
+    sys_log_push(l);
+    if (maxgap_i > 0) {
+        snprintf(l, sizeof(l), "PLAN gap@%d %.1f,%.1f->%.1f,%.1f",
+                 maxgap_i, wps[maxgap_i-1].x, wps[maxgap_i-1].y,
+                 wps[maxgap_i].x, wps[maxgap_i].y);
+        sys_log_push(l);
+    }
+}
+
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  State machine initialisation
 // ══════════════════════════════════════════════════════════════════════════════
@@ -797,10 +856,13 @@ static void drive_manual(const CRSFChannels &rc, const Pose2D &pose, float dt) {
         float corr_ms = heading_controller_compute(heading_error, yaw_rate_error,
                                                     mc.heading_kp, mc.heading_kd, dt);
         float corr_duty = corr_ms / mc.max_wheel_speed_ms * mc.manual_max_duty;
-        // Sign flips between forward and reverse so correction always opposes drift
-        float dir = (throttle >= 0.0f) ? 1.0f : -1.0f;
-        target_l += dir * corr_duty;
-        target_r -= dir * corr_duty;
+        // Yaw rate from a differential drive is (v_left - v_right)/track REGARDLESS
+        // of travel direction — backing up does NOT reverse which wheel-speed
+        // differential produces a CW yaw. So the heading-hold correction is applied
+        // with the SAME sign forward and reverse. (An earlier throttle-sign flip here
+        // turned the loop into positive feedback in reverse — the "haywire" symptom.)
+        target_l += corr_duty;
+        target_r -= corr_duty;
     }
 
     target_l = clampf(target_l, -1.0f, 1.0f);
@@ -912,8 +974,8 @@ static void handle_send_perimeter(const char *json) {
         ble_server_send_ack("SEND_PERIMETER", false, "nvs save failed"); return;
     }
     // Derive nav boundary and working area
-    Polygon nav  = insetPolygon(poly, mower_config_nav_inset_m());
-    Polygon work = insetPolygon(nav, mower_config_headland_m());
+    Polygon nav  = insetPolygonClipper(poly, mower_config_nav_inset_m());
+    Polygon work = insetPolygonClipper(nav, mower_config_headland_m());
     nvs_save_nav_boundary(nav);
     nvs_save_working_area(work);
 
@@ -1093,6 +1155,13 @@ static void handle_ble_command(const char *json) {
             snprintf(msg, sizeof(msg), "plan FAILED (see log)");
         }
         sys_log_push(msg);
+
+        // Dump the planned path geometry to the system log (see log_plan_stats).
+        if (ok) {
+            const std::vector<Waypoint> &wps = coverage_planner_get_waypoints();
+            log_plan_stats(wps.data(), (int)wps.size(), ekf_get_pose());
+        }
+
         ble_server_send_ack(cmd, ok, msg);
         return;
     }
@@ -1129,7 +1198,7 @@ static void handle_ble_command(const char *json) {
                     if (org.set) {
                         rtk_gps_set_origin(org.lat_deg, org.lon_deg);
                     }
-                    safety_set_nav_boundary(perimeter_get_nav_boundary());
+                    safety_set_perimeter(perimeter_get_perimeter());
                     ledFlashWhite3x();
                     ble_server_send_ack(cmd, true, "perimeter saved");
                 } else {
@@ -1194,12 +1263,9 @@ static void handle_ble_command(const char *json) {
                 if (p) { long v = strtol(p + 1, nullptr, 10); dst = v; }
             }
         };
-        gf("\"robot_front_m\"",          cfg.robot_front_m);
-        gf("\"robot_rear_m\"",           cfg.robot_rear_m);
-        gf("\"robot_left_m\"",           cfg.robot_left_m);
-        gf("\"robot_right_m\"",          cfg.robot_right_m);
-        gf("\"chassis_width_m\"",        cfg.chassis_width_m);
-        gf("\"chassis_length_m\"",       cfg.chassis_length_m);
+        gf("\"footprint_width_m\"",      cfg.footprint_width_m);
+        gf("\"footprint_length_m\"",     cfg.footprint_length_m);
+        gf("\"track_width_m\"",          cfg.track_width_m);
         gf("\"wheel_radius_m\"",         cfg.wheel_radius_m);
         gi("\"motor_pole_pairs\"",        cfg.motor_pole_pairs);
         gf("\"gear_ratio\"",             cfg.gear_ratio);
@@ -1472,9 +1538,18 @@ void state_machine_update() {
         float dt = (s_ekf_last_ms == 0) ? 0.1f
                                         : (now_ekf - s_ekf_last_ms) * 0.001f;
         s_ekf_last_ms = now_ekf;
-        float v_left  = vesc_erpm_to_velocity(vesc_get_status(VESC_ID_LEFT).erpm);
-        float v_right = vesc_erpm_to_velocity(vesc_get_status(VESC_ID_RIGHT).erpm);
-        ekf_predict(v_left, v_right, dt);
+        // SCALED velocities: the GPS-referenced distance calibration feeds the EKF
+        // (position + odometry heading) and the self-calibrator together.
+        float v_left  = vesc_erpm_to_velocity_scaled(vesc_get_status(VESC_ID_LEFT).erpm);
+        float v_right = vesc_erpm_to_velocity_scaled(vesc_get_status(VESC_ID_RIGHT).erpm);
+        // Gyro Z (bias-corrected, CW+) — used by the EKF for heading ONLY during
+        // on-the-spot pivots, where wheel-odometry heading over-rotates (scrub)
+        // and GPS cannot correct it. Odometry+GPS remain the source otherwise.
+        float gyro_cw = imu_get_gz_rads();
+        ekf_predict(v_left, v_right, gyro_cw, dt);
+        // Self-calibrate scale (straights) + track width (turns) from GPS, in
+        // every state where the wheels turn (manual and auto).
+        odo_calib_update(v_left, v_right, dt);
     }
 
     // ── Collect RC snapshot ───────────────────────────────────────────────────
@@ -1710,6 +1785,7 @@ void state_machine_update() {
             s_blade_commanded = false;
             s_blade_ramp_erpm = 0.0f;
             s_pause_event_latch = false;  // clear any residual event latch on IDLE entry
+            odo_calib_flush();            // persist any pending odometry calibration
             DBG_PRINTLN("[IDLE] Entered IDLE state.");
         }
 
@@ -1767,11 +1843,22 @@ void state_machine_update() {
 
         uint16_t ch4 = rc.ch[CRSF_CH_MODE];
 
-        // CH4 == MANUAL → MANUAL
-        if (ch4_is_manual(ch4) && !rc.failsafe) {
-            s_look_phase = LOOK_DONE;   // cancel look-around if still running
-            transition_to(STATE_MANUAL);
-            break;
+        // CH4 == MANUAL → MANUAL, but ONLY when the operator actually moves a
+        // stick — not on switch position alone. Gating on position alone made
+        // this fight the MANUAL "throttle centred > 2 s → IDLE" auto-idle: with
+        // CH4 held in the manual position and the sticks centred, the two flapped
+        // MANUAL↔IDLE every ~2 s (1-tick IDLE, ~2.1 s MANUAL — spamming the log
+        // and restarting drive each cycle). Requiring a deflected stick makes the
+        // auto-idle stable: it rests in IDLE until the operator drives again.
+        {
+            float thr_in = crsf_us_to_norm(rc.ch[CRSF_CH_THROTTLE]);
+            float str_in = crsf_us_to_norm(rc.ch[CRSF_CH_STEERING]);
+            bool stick_active = (fabsf(thr_in) >= 0.05f) || (fabsf(str_in) >= 0.05f);
+            if (ch4_is_manual(ch4) && !rc.failsafe && stick_active) {
+                s_look_phase = LOOK_DONE;   // cancel look-around if still running
+                transition_to(STATE_MANUAL);
+                break;
+            }
         }
 
         // CH5 activated → LEARN_PERIMETER
@@ -2003,7 +2090,7 @@ void state_machine_update() {
                 if (org.set) {
                     rtk_gps_set_origin(org.lat_deg, org.lon_deg);
                 }
-                safety_set_nav_boundary(perimeter_get_nav_boundary());
+                safety_set_perimeter(perimeter_get_perimeter());
                 ledFlashWhite3x();
                 DBG_PRINTF("[LEARN] Perimeter saved (%d points).\r\n",
                     (int)perimeter_get_perimeter().pts.size());
@@ -2020,12 +2107,23 @@ void state_machine_update() {
     // ── STATE_AUTO_MOWING ─────────────────────────────────────────────────────
     case STATE_AUTO_MOWING: {
         static uint32_t s_auto_entry_ms = 0;  // time AUTO was entered; used to gate obstacle detection
+        static float    s_auto_entry_x  = 0;  // mower position at AUTO entry — segment start
+        static float    s_auto_entry_y  = 0;  // for the index-0 pass-through projection
+        static bool     s_in_bootstrap  = false; // true during the start phase (2 m gate + heading establish)
+        static bool     s_auto_resumed  = false; // true when this AUTO run resumed from PAUSED
 
         if (g_state_entry) {
             heading_controller_reset();
             DBG_PRINTLN("[AUTO] Entering AUTO_MOWING — planning path...");
             s_session_start_ms = millis();
             s_auto_entry_ms    = millis();
+            s_auto_entry_x     = pose.x;
+            s_auto_entry_y     = pose.y;
+            // Run the start-phase checks (2 m perimeter gate + heading bootstrap)
+            // on every entry. A resume from PAUSED skips the 2 m gate so a mow
+            // paused near the edge (e.g. mid headland pass) can resume.
+            s_in_bootstrap     = true;
+            s_auto_resumed     = (g_prev_state == STATE_PAUSED);
 
             // When resuming from PAUSED, the coverage planner already has a
             // valid plan (or was re-generated by MOTORS_OFFLINE resume logic).
@@ -2047,7 +2145,7 @@ void state_machine_update() {
                     break;
                 }
                 // Reset collision baseline settle distance (fresh session only)
-                pure_pursuit_reset_session_distance();
+                node_follower_reset_session_distance();
             }
 
             // Load all waypoints into local buffer for pure pursuit
@@ -2071,6 +2169,9 @@ void state_machine_update() {
                          s_wp_count, (int)resuming);
                 sys_log_push(line);
             }
+            // Dump the planned path geometry to the system log on every AUTO start,
+            // so it is readable over BLE without the PWA "Plan Test" button.
+            log_plan_stats(s_wp_buf, s_wp_count, pose);
             // Audible confirm: one short beep on TX16S so operator knows mowing has started
             request_beep(BEEP_CONFIRM);
 
@@ -2086,7 +2187,7 @@ void state_machine_update() {
             // Reset cross-track timer
             s_cross_track_exceed_ms = 0;
 
-            pure_pursuit_reset_stall();
+            node_follower_reset_stall();
             wheel_duty_ramp_reset(); // zero stale duty from manual driving; prevents carry-over reverse
             collisionClear();        // flush stale jolt data from manual driving
         }
@@ -2151,15 +2252,25 @@ void state_machine_update() {
             DBG_PRINTF("[SM] Cutting status: %d\n", (int)cs);
         }
 #if !BENCH_TEST_NO_VESC
-        if (cs == BLADE_FAULT) {
-            DBG_PRINTLN("[SM] Blade fault in AUTO_MOWING — pausing");
-            sys_log_push("AUTO: BLADE FAULT (no current/rpm while commanded)");
-            collisionSaveBaselineForced();
-            transition_to(STATE_PAUSED, true);
-            break;
+        // Blade fault (commanded but no current/rpm) must NOT change the drive mode:
+        // the blade is the operator's to control (CH6) and there is no blade<->mode
+        // interlock. Warn once per fault episode and keep driving the path; the blade
+        // keepalive keeps issuing SET_RPM so a transient fault self-recovers.
+        {
+            static bool s_blade_fault_warned = false;
+            if (cs == BLADE_FAULT) {
+                if (!s_blade_fault_warned) {
+                    s_blade_fault_warned = true;
+                    DBG_PRINTLN("[SM] Blade not cutting (commanded, no rpm) — driving on");
+                    sys_log_push("AUTO: blade not cutting (commanded, no rpm) - driving on");
+                    request_beep(BEEP_WARNING);
+                }
+            } else {
+                s_blade_fault_warned = false;
+            }
         }
 
-        if (obs_armed && cs == CUTTING_OVERLOADED) {
+        if (AUTO_FAULT_RESPONSES_ENABLED && obs_armed && cs == CUTTING_OVERLOADED) {
             // Save strip end for retrace
             if (s_wp_index < s_wp_count) {
                 s_retrace_strip_end_x = s_wp_buf[s_wp_index].x;
@@ -2175,7 +2286,7 @@ void state_machine_update() {
             transition_to(STATE_RETRACE);
             break;
         }
-        if (obs_armed && cs == CUTTING_STALLED) {
+        if (AUTO_FAULT_RESPONSES_ENABLED && obs_armed && cs == CUTTING_STALLED) {
             vesc_set_current(VESC_ID_BLADE, 0);
             s_blade_commanded = false;
             s_blade_ramp_erpm = 0.0f;
@@ -2186,7 +2297,7 @@ void state_machine_update() {
         // OBSTACLE_SUSPECTED means blade-current low + mower not moving.
         // Only meaningful when blade is actually commanded — the condition is
         // trivially true (blade load = 0) whenever the blade is off.
-        if (obs_armed && s_blade_commanded && cs == OBSTACLE_SUSPECTED) {
+        if (AUTO_FAULT_RESPONSES_ENABLED && obs_armed && s_blade_commanded && cs == OBSTACLE_SUSPECTED) {
             vesc_set_current(VESC_ID_BLADE, 0);
             s_blade_commanded = false;
             s_blade_ramp_erpm = 0.0f;
@@ -2198,8 +2309,11 @@ void state_machine_update() {
 #endif  // !BENCH_TEST_NO_VESC
 
         // ── Uncertainty-aware perimeter navigation ─────────────────────────
+        // Distance is to the PERIMETER (the steering-centre limit), not the inset
+        // nav boundary — the centre may drive up to the perimeter, so speed only
+        // ramps down approaching the perimeter itself (not half a robot earlier).
         float uncertainty = ekf_get_position_uncertainty();
-        float dist_to_edge = distanceToNearestEdge(perimeter_get_nav_boundary(),
+        float dist_to_edge = distanceToNearestEdge(perimeter_get_perimeter(),
                                                     pose.x, pose.y);
         float margin = dist_to_edge - uncertainty;
         const MowerConfig &mc_ua = mower_config_get();
@@ -2237,20 +2351,41 @@ void state_machine_update() {
             break;
         }
 
-        // Strip truncation: if margin <= 0 and on a mowing waypoint, skip strip
+        // Strip truncation: if margin <= 0 and on a mowing STRIP waypoint, skip
+        // the rest of that strip. Headland passes are EXEMPT: they are flagged
+        // mowing=true but are deliberately driven along the perimeter edge, where
+        // margin is naturally <= 0 (especially under RTK-Float uncertainty).
+        // Without this exemption the uncertainty logic skipped the entire headland
+        // on AUTO entry ("skip strip wp 0..35"), so the mower never followed the
+        // perimeter round to home. Only true working strips (headland=false) are
+        // truncated here.
         if (margin <= 0.0f && s_wp_index < s_wp_count
-            && s_wp_buf[s_wp_index].mowing) {
+            && s_wp_buf[s_wp_index].mowing && !s_wp_buf[s_wp_index].headland) {
             DBG_PRINTF("[AUTO] Margin=%.2f — skipping rest of strip at wp %d\n",
                           margin, s_wp_index);
             int skip_to = s_wp_index;
-            while (skip_to < s_wp_count && s_wp_buf[skip_to].mowing) {
+            while (skip_to < s_wp_count && s_wp_buf[skip_to].mowing
+                   && !s_wp_buf[skip_to].headland) {
                 skip_to++;
+            }
+            {
+                char line[SYS_LOG_MAX_LEN];
+                snprintf(line, sizeof(line),
+                         "AUTO margin %.2f<=0 -> skip strip wp %d..%d",
+                         margin, s_wp_index, skip_to);
+                sys_log_push(line);
             }
             s_wp_index = skip_to;
         }
 
-        // Check plan complete
-        bool plan_done = (s_wp_index >= s_wp_count) || coverage_planner_is_complete();
+        // Check plan complete.
+        // Use ONLY the local waypoint counter. The global coverage_planner_is_complete()
+        // is unusable here: load_waypoints_from_planner() drains the planner via
+        // coverage_planner_get_next(), which runs the planner's internal g_wp_index up to
+        // the end the instant the plan loads — so is_complete() is true on the very first
+        // AUTO tick and used to bounce AUTO straight back to IDLE every tick. s_wp_index
+        // (advanced at waypoint-reached, below) is the authoritative progress tracker.
+        bool plan_done = (s_wp_index >= s_wp_count);
         if (plan_done) {
             vesc_set_current(VESC_ID_LEFT,  0);
             vesc_set_current(VESC_ID_RIGHT, 0);
@@ -2269,45 +2404,158 @@ void state_machine_update() {
             break;
         }
 
-        // Execute pure pursuit
+        // Execute node follower
         if (s_wp_index < s_wp_count) {
-            WheelCmd cmd = pure_pursuit_compute(pose, speed,
+            // ── Start phase: 2 m perimeter gate + heading bootstrap ───────────
+            // Every FRESH AUTO start requires ≥2 m clearance from the perimeter in
+            // any direction (distanceToNearestEdge ≥ 2 m), so behaviour is the same
+            // each time and the heading-establish creep — which goes in the still
+            // unknown heading direction — can never drive into the boundary. A
+            // RESUME from PAUSED skips the 2 m gate so a mow paused near the edge
+            // (e.g. mid headland pass) can resume.
+            if (s_in_bootstrap) {
+                if (!s_auto_resumed) {
+                    float d_edge = distanceToNearestEdge(perimeter_get_perimeter(),
+                                                         pose.x, pose.y);
+                    if (d_edge < AUTO_BOOTSTRAP_PERIM_MIN_M) {
+                        vesc_set_current(VESC_ID_LEFT,  0);
+                        vesc_set_current(VESC_ID_RIGHT, 0);
+                        char line[SYS_LOG_MAX_LEN];
+                        snprintf(line, sizeof(line),
+                                 "AUTO: perim %.1fm<2m at start -> PAUSE (clear in Manual)",
+                                 (double)d_edge);
+                        sys_log_push(line);
+                        request_beep(BEEP_WARNING);
+                        transition_to(STATE_PAUSED);
+                        break;
+                    }
+                }
+
+                // Heading bootstrap: never steer toward a node on an unknown
+                // heading (the start-point orbit / drive-through-perimeter
+                // failure). Creep a short straight until GPS locks the heading.
+                if (!ekf_heading_is_established()) {
+                    bool rtk_ok    = gps.valid && (gps.fix_type >= 4);
+                    bool timed_out = (millis() - s_auto_entry_ms) > AUTO_BOOTSTRAP_MAX_MS;
+                    if (!rtk_ok) {
+                        // No RTK heading source — hold still; PAUSE if none arrives.
+                        vesc_set_current(VESC_ID_LEFT,  0);
+                        vesc_set_current(VESC_ID_RIGHT, 0);
+                        if (timed_out) {
+                            sys_log_push("AUTO: no RTK to establish heading -> PAUSE");
+                            request_beep(BEEP_WARNING);
+                            transition_to(STATE_PAUSED);
+                        }
+                        break;
+                    }
+                    if (timed_out) {
+                        vesc_set_current(VESC_ID_LEFT,  0);
+                        vesc_set_current(VESC_ID_RIGHT, 0);
+                        sys_log_push("AUTO: heading not established (8s) -> PAUSE");
+                        request_beep(BEEP_WARNING);
+                        transition_to(STATE_PAUSED);
+                        break;
+                    }
+                    // Creep straight (equal duty) so GPS sees a travel direction.
+                    wheel_duty_ramp_compute(VESC_ID_LEFT,  AUTO_BOOTSTRAP_SPEED_MS);
+                    wheel_duty_ramp_compute(VESC_ID_RIGHT, AUTO_BOOTSTRAP_SPEED_MS);
+                    break;  // stay in start phase; re-check next tick
+                }
+
+                // 2 m clearance ok (or resumed) AND heading established → follow.
+                s_in_bootstrap = false;
+                sys_log_push("AUTO: start checks ok -> following nodes");
+            }
+
+            WheelCmd cmd = node_follower_compute(pose, speed,
                                                  s_wp_buf, s_wp_count, s_wp_index,
                                                  s_desired_cut_height_mm, speed_scale);
 
-            // ── Yaw rate damping ─────────────────────────────────────────────
-            // Compare commanded yaw rate (from velocity differential) with
-            // actual gyro yaw rate.  Kp=0 so only D-term is active — pure
-            // pursuit handles heading through geometry.
-            {
-                const MowerConfig &mc_hd = mower_config_get();
-                float track = mower_config_track_width_m();
-                float cmd_yaw  = (cmd.right_ms - cmd.left_ms) / track;
-                float act_yaw  = imu_get_gz_rads();
-                float corr = heading_controller_compute(
-                    0.0f, cmd_yaw - act_yaw,
-                    0.0f, mc_hd.heading_kd, sm_dt);
-                float corr_ms = corr * mc_hd.max_wheel_speed_ms;
-                cmd.left_ms  -= corr_ms;
-                cmd.right_ms += corr_ms;
-            }
-
-            // Hard velocity cap: forward-only, never exceeds max mowing speed
+            // Per-track velocity cap: ALLOW REVERSE on a track so the tracked
+            // vehicle can counter-rotate (tank steer / pivot on the spot) to reach
+            // tight corner nodes. Previously clamped to [0, max_v] (forward only),
+            // which killed every tight turn — the inner track could never slow
+            // below zero, so the minimum turn radius was ~half the track width and
+            // sharp nodes were overshot. Now bounded to ±max_v in both directions.
             {
                 float max_v = mower_config_get().max_mowing_speed_ms;
-                cmd.left_ms  = clampf(cmd.left_ms,  0.0f, max_v);
-                cmd.right_ms = clampf(cmd.right_ms, 0.0f, max_v);
+                cmd.left_ms  = clampf(cmd.left_ms,  -max_v, max_v);
+                cmd.right_ms = clampf(cmd.right_ms, -max_v, max_v);
             }
             // Duty-cycle ramp toward desired wheel velocities (forward-only; ramp is reset on AUTO entry)
-            pure_pursuit_to_vesc_duty(cmd);
+            node_follower_to_vesc_duty(cmd);
 
-            // Advance waypoint index when reached
-            if (pure_pursuit_waypoint_reached(pose, s_wp_buf[s_wp_index])) {
-                s_wp_index++;
+            // ── Robust waypoint advancement (reached OR passed) ───────────────
+            // Advancing only on a tight physical-arrival window (waypoint_arrive_dist_m,
+            // default 0.15 m) is fragile: the steering centre overshoots corners and
+            // GPS/EKF noise means the window is essentially never hit, so the index
+            // sticks and the pure-pursuit lookahead stays anchored to one waypoint —
+            // producing the ~180° U-turn weave. Also clear a waypoint once the mower has
+            // driven PAST it (projection onto the incoming segment t >= 1), keeping
+            // progress monotonic. Reverse spurs back toward their point (inverted
+            // projection sign), so those still advance on arrival only.
+            {
+                const MowerConfig &mc_adv = mower_config_get();
+                const float arrive   = mc_adv.waypoint_arrive_dist_m;
+                const float arrive2  = arrive * arrive;
+                float lookahead_est  = max(mc_adv.pp_lookahead_base_m,
+                                           mc_adv.pp_lookahead_k * speed);
+                const float near2    = (lookahead_est + arrive) * (lookahead_est + arrive);
+
+                int advanced = 0;
+                while (s_wp_index < s_wp_count && advanced < 4) {
+                    const Waypoint &w = s_wp_buf[s_wp_index];
+                    float dxr  = w.x - pose.x, dyr = w.y - pose.y;
+                    float d2   = dxr * dxr + dyr * dyr;
+
+                    bool reached = (d2 <= arrive2);
+
+                    bool passed = false;
+                    if (!reached && !w.reverse) {
+                        float ax = (s_wp_index > 0) ? s_wp_buf[s_wp_index - 1].x : s_auto_entry_x;
+                        float ay = (s_wp_index > 0) ? s_wp_buf[s_wp_index - 1].y : s_auto_entry_y;
+                        float sx = w.x - ax, sy = w.y - ay;
+                        float seg2 = sx * sx + sy * sy;
+                        if (seg2 > 1e-6f) {
+                            float t = ((pose.x - ax) * sx + (pose.y - ay) * sy) / seg2;
+                            // Gate on proximity to the segment end so a wildly off-track
+                            // pose can't skip ahead — cross-track recovery handles that.
+                            passed = (t >= 1.0f) && (d2 <= near2);
+                        }
+                    }
+
+                    if (reached || passed) { s_wp_index++; advanced++; }
+                    else break;
+                }
+            }
+
+            // ── AUTO nav diagnostics (~1 Hz, surfaced in the PWA System Log) ──
+            {
+                static uint32_t s_nav_log_ms = 0;
+                if ((millis() - s_nav_log_ms) >= 1000 && s_wp_index < s_wp_count) {
+                    s_nav_log_ms = millis();
+                    const Waypoint &w = s_wp_buf[s_wp_index];
+                    float d = sqrtf((w.x - pose.x) * (w.x - pose.x)
+                                  + (w.y - pose.y) * (w.y - pose.y));
+                    // Bearing to target and own heading, both deg CW-from-North,
+                    // so we can tell a circling/heading problem (h sweeps while b
+                    // holds) from a plan/arrival problem (h tracks b, no progress).
+                    float brg = atan2f(w.x - pose.x, w.y - pose.y) * 57.29578f;
+                    if (brg < 0.0f) brg += 360.0f;
+                    float hdg = pose.heading * 57.29578f;
+                    if (hdg < 0.0f) hdg += 360.0f;
+                    char line[SYS_LOG_MAX_LEN];
+                    snprintf(line, sizeof(line),
+                             "AUTO i=%d/%d pos=%.1f,%.1f h=%.0f tgt=%.1f,%.1f b=%.0f d=%.2f x=%.2f",
+                             s_wp_index, s_wp_count, pose.x, pose.y, hdg,
+                             w.x, w.y, brg, d,
+                             node_follower_get_cross_track_error());
+                    sys_log_push(line);
+                }
             }
 
             // Cross-track error check: if |XTE| > 0.5 m for > 2 s → reset to nearest
-            float xte = fabsf(pure_pursuit_get_cross_track_error());
+            float xte = fabsf(node_follower_get_cross_track_error());
             if (xte > 0.5f) {
                 if (s_cross_track_exceed_ms == 0) s_cross_track_exceed_ms = millis();
                 if (millis() - s_cross_track_exceed_ms > 2000) {
@@ -2316,6 +2564,12 @@ void state_machine_update() {
                     s_wp_count = load_waypoints_from_planner();
                     s_wp_index = 0;
                     s_cross_track_exceed_ms = 0;
+                    {
+                        char line[SYS_LOG_MAX_LEN];
+                        snprintf(line, sizeof(line),
+                                 "AUTO xte>0.5m 2s -> reset to nearest (%d wp)", s_wp_count);
+                        sys_log_push(line);
+                    }
                 }
             } else {
                 s_cross_track_exceed_ms = 0;
@@ -2323,7 +2577,7 @@ void state_machine_update() {
 
             // Wheel stall: commanded to move, VESC ERPM low, AND GPS/EKF confirms
             // robot not moving → hard obstacle or physical stop.
-            if (obs_armed && pure_pursuit_is_stalled()) {
+            if (AUTO_FAULT_RESPONSES_ENABLED && obs_armed && node_follower_is_stalled()) {
                 DBG_PRINTLN("[AUTO] Wheel stall detected (eRPM + GPS) — entering OBSTACLE_AVOID.");
                 sys_log_push("AUTO: wheel stall -> OBS-AVOID");
                 vesc_set_current(VESC_ID_BLADE, 0);
@@ -2338,7 +2592,7 @@ void state_machine_update() {
             // Wheel slip: wheels spinning but GPS/EKF says robot barely moving →
             // sinking into soft/wet ground. Trigger BOG_RECOVERY early.
 #if !BENCH_TEST_NO_VESC
-            if (obs_armed && pure_pursuit_is_slipping()) {
+            if (AUTO_FAULT_RESPONSES_ENABLED && obs_armed && node_follower_is_slipping()) {
                 DBG_PRINTLN("[AUTO] Wheel slip detected — entering BOG_RECOVERY.");
                 sys_log_push("AUTO: wheel slip -> BOG");
                 vesc_set_current(VESC_ID_BLADE, 0);
@@ -2613,16 +2867,16 @@ void state_machine_update() {
 
         showLedsWithGps(COL_RED);
 
-        // Follow path to return waypoint via pure pursuit
+        // Follow path to return waypoint via the node follower
         {
-            WheelCmd cmd = pure_pursuit_compute(pose, speed,
+            WheelCmd cmd = node_follower_compute(pose, speed,
                                                  &s_return_wp, 1, 0,
                                                  (float)mower_config_get().cut_height_max_mm);
-            pure_pursuit_to_vesc_duty(cmd);
+            node_follower_to_vesc_duty(cmd);
         }
 
         // Arrived?
-        if (pure_pursuit_waypoint_reached(pose, s_return_wp)) {
+        if (node_follower_waypoint_reached(pose, s_return_wp)) {
             vesc_set_current(VESC_ID_LEFT,  0);
             vesc_set_current(VESC_ID_RIGHT, 0);
             DBG_PRINTLN("[RETURN] Arrived at start point → STATE_IDLE.");
@@ -2852,10 +3106,12 @@ void state_machine_update() {
         showLeds(COL_RED, LED_FAST_FLASH);
     }
 
-    // ── VESC raw RX dump → PWA log (every 5 s while BLE connected) ───────────
-    // One compact line per dump: a<ms since last STATUS frame> (a-1 = never
-    // received), e<eRPM>, i<current A>, V<battery from blade STATUS_5>.
-    // Lets the operator paste hard evidence of what the TWAI RX actually sees.
+    // ── VESC raw RX dump → PWA log — DISABLED (declutters the System Log) ────
+    // This 5 s heartbeat of raw TWAI RX state (status age / eRPM / current /
+    // battery / bus-ok) was useful while chasing the v4-VESC "is it broadcasting
+    // CAN status at all?" question, but it churns the log ring and buries the
+    // PLAN / AUTO-nav diagnostics. Re-enable (#if 1) if VESC RX needs auditing.
+    #if 0
     {
         static uint32_t s_vesc_dump_ms = 0;
         if (ble_server_is_connected() && millis() - s_vesc_dump_ms >= 5000) {
@@ -2875,6 +3131,7 @@ void state_machine_update() {
             sys_log_push(line);
         }
     }
+    #endif
 
     // ── CRSF telemetry snapshot (2 Hz) ──────────────────────────────────────
     static uint32_t s_crsf_telem_last_ms = 0;

@@ -21,6 +21,7 @@
 #include "perimeter.h"
 #include "config.h"
 #include "mower_config.h"
+#include "clipper_offset.h"
 #include <cmath>
 #include <cfloat>
 #include <cstring>
@@ -142,8 +143,8 @@ void perimeter_init() {
         // Recompute them from the raw perimeter (which loaded OK) and re-save.
         DBG_PRINTLN("[PERIM] Nav/working-area blobs corrupt — recomputing from perimeter");
         perim.ensureCCW();
-        nav  = insetPolygon(perim, mower_config_nav_inset_m());
-        work = insetPolygon(nav,   mower_config_headland_m());
+        nav  = insetPolygonClipper(perim, mower_config_nav_inset_m());
+        work = insetPolygonClipper(nav,   mower_config_headland_m());
         if (nav.pts.empty() || work.pts.empty()) {
             DBG_PRINTLN("[PERIM] Recompute failed — re-learn perimeter");
             return;
@@ -319,14 +320,14 @@ bool perimeter_finish_recording(char *error_msg) {
     }
 
     // ── Validation check 4: NAV inset produces valid polygon ───────────────
-    Polygon nav = insetPolygon(poly, mower_config_nav_inset_m());
+    Polygon nav = insetPolygonClipper(poly, mower_config_nav_inset_m());
     if (nav.pts.empty() || nav.area() <= 0.0f) {
         strncpy(error_msg, "perimeter too small for robot (nav inset fails)", 64);
         return false;
     }
 
     // ── Derive working area ────────────────────────────────────────────────
-    Polygon work = insetPolygon(nav, mower_config_headland_m());
+    Polygon work = insetPolygonClipper(nav, mower_config_headland_m());
     if (work.pts.empty() || work.area() <= 0.0f) {
         strncpy(error_msg, "perimeter too small for robot (headland inset fails)", 64);
         return false;
@@ -457,8 +458,8 @@ void perimeter_recompute() {
     // NVS perimeter is already smoothed from perimeter_finish_recording().
     // No re-smoothing needed here — corners are already arcs.
 
-    Polygon nav  = insetPolygon(poly, mower_config_nav_inset_m());
-    Polygon work = insetPolygon(nav,  mower_config_headland_m());
+    Polygon nav  = insetPolygonClipper(poly, mower_config_nav_inset_m());
+    Polygon work = insetPolygonClipper(nav,  mower_config_headland_m());
 
     if (nav.pts.empty() || work.pts.empty()) {
         DBG_PRINTLN("[PERIM] recompute: inset failed — perimeter may be too small for new config");

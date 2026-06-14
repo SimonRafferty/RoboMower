@@ -24,6 +24,7 @@
 #include "vesc_can.h"
 #include "config.h"
 #include "mower_config.h"
+#include "odo_calib.h"
 #include "sys_log.h"
 
 #include "driver/twai.h"
@@ -121,6 +122,14 @@ float vesc_erpm_to_velocity(float erpm) {
     return (erpm / (float)c.motor_pole_pairs / 60.0f)
            / c.gear_ratio
            * (2.0f * (float)M_PI * c.wheel_radius_m);
+}
+
+float vesc_erpm_to_velocity_scaled(float erpm) {
+    // Same conversion, then ×odo_cal_scale() — the GPS-referenced distance
+    // calibration. Applied ONLY at the motion-estimate consumers (EKF feed,
+    // duty-ramp feedback, follower stall/slip); the raw RX-task odometry stays
+    // unscaled. See odo_calib.h.
+    return vesc_erpm_to_velocity(erpm) * odo_cal_scale();
 }
 
 float vesc_velocity_to_erpm(float velocity_ms) {

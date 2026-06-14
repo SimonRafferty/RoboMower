@@ -20,6 +20,7 @@
 #include "battery_monitor.h"
 #include "rtk_gps.h"
 #include "geometry.h"
+#include "mower_config.h"   // mower_config_nav_inset_m() for the breach threshold
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -47,13 +48,13 @@ static volatile bool s_battery_warning = false;
 /** True when the safety task should check the perimeter boundary. */
 static volatile bool s_in_auto_mode = false;
 
-/** Navigation boundary polygon for perimeter breach detection. */
-static Polygon s_nav_boundary;
+/** Perimeter polygon for breach detection (covers all regions incl. side arms). */
+static Polygon s_perimeter;
 
-/** True once safety_set_nav_boundary() has been called with a valid polygon. */
-static volatile bool s_nav_boundary_set = false;
+/** True once safety_set_perimeter() has been called with a valid polygon. */
+static volatile bool s_perimeter_set = false;
 
-/** Mutex protecting s_nav_boundary (Polygon contains std::vector — not spinlock-safe). */
+/** Mutex protecting s_perimeter (Polygon contains std::vector — not spinlock-safe). */
 static SemaphoreHandle_t s_nav_mutex = nullptr;
 
 /** Suppresses repeated GPS-timeout log messages once printed. */
@@ -108,11 +109,11 @@ bool safety_is_armed()
 //  Public API — perimeter and mode control
 // ─────────────────────────────────────────────────────────────────────────────
 
-void safety_set_nav_boundary(const Polygon &nav_boundary)
+void safety_set_perimeter(const Polygon &perimeter)
 {
     if (xSemaphoreTake(s_nav_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        s_nav_boundary = nav_boundary;
-        s_nav_boundary_set = (nav_boundary.pts.size() >= 3);
+        s_perimeter = perimeter;
+        s_perimeter_set = (perimeter.pts.size() >= 3);
         xSemaphoreGive(s_nav_mutex);
     }
 }
@@ -243,21 +244,24 @@ static void safety_task(void * /*pv*/)
             s_imu_fault_warned = false;
         }
 
-        // ── 4. Perimeter breach (AUTO states only) ────────────────────────────
-        // When the steering centre moves outside the nav boundary by more than
-        // PERIMETER_BREACH_DIST_M, request a pause. The state machine handles
-        // the stop and transitions to STATE_PAUSED with an event latch.
-        if (s_in_auto_mode && s_nav_boundary_set) {
+        // -- 4. Perimeter breach (AUTO states only) ----------------------------
+        // The recorded PERIMETER is the steering centre's maximum extent (driven
+        // body-against-boundary), so the centre is meant to stay inside it. Breach
+        // when the centre goes more than PERIMETER_BREACH_DIST_M OUTSIDE the
+        // perimeter, i.e. distance-to-perimeter-edge < -PERIMETER_BREACH_DIST_M.
+        // (One polygon, so it covers all regions incl. pinched-off side arms.)
+        if (s_in_auto_mode && s_perimeter_set) {
             bool checked = false;
             float dist = 0.0f;
             if (xSemaphoreTake(s_nav_mutex, 0) == pdTRUE) {
                 Pose2D pose = ekf_get_pose();
-                dist = distanceToNearestEdge(s_nav_boundary, pose.x, pose.y);
+                dist = distanceToNearestEdge(s_perimeter, pose.x, pose.y);
                 checked = true;
                 xSemaphoreGive(s_nav_mutex);
             }
+            const float breach_thresh = -PERIMETER_BREACH_DIST_M;
             static bool s_perim_breach_warned = false;
-            if (checked && (dist < -PERIMETER_BREACH_DIST_M)) {
+            if (checked && (dist < breach_thresh)) {
                 // Hard-stop motors every 50 ms tick while breach persists.
                 // Emergency frames go to the front of the VESC TX queue so they
                 // arrive before any motion command the state machine may have queued.

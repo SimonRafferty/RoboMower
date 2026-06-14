@@ -156,10 +156,12 @@ input[type=range] { width: 100%; }
 
 /* System log box */
 .log-box {
-  margin-top: 6px; max-height: 160px; overflow-y: auto;
+  margin-top: 6px; max-height: 60vh; overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
   background: #111; border-radius: 4px; padding: 6px;
   font-size: 0.75rem; font-family: monospace; color: #aaa;
   border: 1px solid #333;
+  user-select: text; -webkit-user-select: text;  /* allow manual selection too */
 }
 .log-box .log-entry { padding: 1px 0; border-bottom: 1px solid #1e1e1e; }
 .log-box .log-entry:last-child { border-bottom: none; }
@@ -382,17 +384,14 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
           <label>Heading Kp<input type="number" class="cfg-input" id="cfg-heading_kp" step="0.05" title="Proportional gain for gyro heading stabilisation ((m/s)/rad). Higher = stronger heading hold."></label>
           <label>Heading Kd<input type="number" class="cfg-input" id="cfg-heading_kd" step="0.01" title="Derivative gain for yaw rate damping ((m/s)/(rad/s)). Damps oscillation. Higher = more damping."></label>
         </div>
-        <div class="cfg-group-label">Robot Footprint (m from steering centre)</div>
+        <div class="cfg-group-label">Robot Footprint — overall outer size (m)</div>
         <div class="cfg-grid">
-          <label>Front<input type="number" class="cfg-input" id="cfg-robot_front_m"   step="0.01" title="Distance from the steering centre to the front edge of the chassis (metres)"></label>
-          <label>Rear<input  type="number" class="cfg-input" id="cfg-robot_rear_m"    step="0.01" title="Distance from the steering centre to the rear edge of the chassis (metres)"></label>
-          <label>Left<input  type="number" class="cfg-input" id="cfg-robot_left_m"    step="0.01" title="Distance from the steering centre to the left edge of the chassis (metres)"></label>
-          <label>Right<input type="number" class="cfg-input" id="cfg-robot_right_m"   step="0.01" title="Distance from the steering centre to the right edge of the chassis (metres)"></label>
+          <label>Width<input  type="number" class="cfg-input" id="cfg-footprint_width_m"  step="0.01" title="OVERALL width of the robot, outer edge to outer edge (metres). Used for boundary clearance: the nav inset = half the diagonal of this box, so corners clear when pivoting. Include any blade/guard overhang."></label>
+          <label>Length<input type="number" class="cfg-input" id="cfg-footprint_length_m" step="0.01" title="OVERALL length of the robot, front-most to rear-most point (metres). Used for boundary clearance (half-diagonal nav inset). Include any blade/guard overhang."></label>
         </div>
-        <div class="cfg-group-label">Chassis</div>
+        <div class="cfg-group-label">Steering Track (drivetrain)</div>
         <div class="cfg-grid">
-          <label>Width m<input  type="number" class="cfg-input" id="cfg-chassis_width_m"  step="0.01" title="Distance between left and right wheel centres (track width, metres)"></label>
-          <label>Length m<input type="number" class="cfg-input" id="cfg-chassis_length_m" step="0.01" title="Distance between front and rear wheel centres (metres)"></label>
+          <label>Track width m<input type="number" class="cfg-input" id="cfg-track_width_m" step="0.01" title="Track CENTRE-to-centre distance — the steering reference up the middle of each track (metres). NOT the overall width: it is (overall width − one track width). Drives differential-steering odometry. Seeds odo-cal, which then GPS-calibrates it."></label>
         </div>
         <div class="cfg-group-label">Drive</div>
         <div class="cfg-grid">
@@ -1974,8 +1973,8 @@ async function main() {
   // ── Mower config form ───────────────────────────────────
   // Config fields: key = cfg-<field_name>
   const CFG_FIELDS = [
-    'robot_front_m','robot_rear_m','robot_left_m','robot_right_m',
-    'chassis_width_m','chassis_length_m',
+    'footprint_width_m','footprint_length_m',
+    'track_width_m',
     'wheel_radius_m','motor_pole_pairs','gear_ratio',
     'antenna_fwd_m','antenna_right_m',
     'steer_to_cut_m','cut_disc_radius_m','cut_width_m','strip_overlap_m',
@@ -1993,12 +1992,14 @@ async function main() {
   ];
 
   function cfgUpdateDerived(cfg) {
-    const trackW    = cfg.chassis_width_m || 0;
-    const navInset  = Math.max(cfg.robot_left_m||0, cfg.robot_right_m||0, trackW/2) + 0.05;
+    const fw        = cfg.footprint_width_m  || 0;
+    const fl        = cfg.footprint_length_m || 0;
+    // Nav inset = half the footprint diagonal + GPS margin (corner clearance when pivoting).
+    const navInset  = 0.5 * Math.sqrt(fw*fw + fl*fl) + 0.05;
     const bladeFwd  = Math.max(0, (cfg.steer_to_cut_m||0) + (cfg.cut_disc_radius_m||0));
     const headland  = Math.max(
       (cfg.cut_width_m||0) * 1.5,
-      (cfg.robot_rear_m||0) + (cfg.strip_overlap_m||0),
+      fl * 0.5 + (cfg.strip_overlap_m||0),
       bladeFwd + (cfg.strip_overlap_m||0)
     );
     const stripStep = (cfg.cut_width_m||0) - (cfg.strip_overlap_m||0);

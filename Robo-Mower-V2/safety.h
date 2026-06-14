@@ -63,16 +63,19 @@ bool safety_is_armed();
 // ── Perimeter and mode control ────────────────────────────────────────────────
 
 /**
- * @brief Update the navigation boundary polygon used for breach detection.
+ * @brief Update the PERIMETER polygon used for breach detection.
  *
- * Copies the polygon into the safety module.  Call once after the perimeter
- * is loaded from NVS and the nav boundary is computed.
+ * Copies the polygon into the safety module. Breach is measured against the
+ * perimeter (not the inset nav boundary) so gardens that pinch into multiple
+ * regions — where the largest-region nav boundary would exclude a side arm —
+ * are handled correctly. The breach threshold accounts for the nav inset
+ * internally. Call once after the perimeter is loaded/recorded.
  *
  * Thread-safe: protected by an internal FreeRTOS mutex.
  *
- * @param nav_boundary  The inset navigation boundary polygon.
+ * @param perimeter  The recorded perimeter polygon.
  */
-void safety_set_nav_boundary(const Polygon &nav_boundary);
+void safety_set_perimeter(const Polygon &perimeter);
 
 /**
  * @brief Enable or disable perimeter breach checking.

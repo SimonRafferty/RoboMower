@@ -21,6 +21,7 @@
 #include "bog_recovery.h"
 #include "config.h"
 #include "mower_config.h"
+#include "odo_calib.h"
 #include "servo_output.h"
 #include "vesc_can.h"
 #include "geometry.h"
@@ -93,7 +94,7 @@ static void drive_forward(const Pose2D &pose) {
     // Heading error: positive when we need to turn right (CW) to reach bog_heading
     float heading_error = wrapAngle(g_bog_heading - pose.heading);
 
-    float T = mower_config_track_width_m();
+    float T = odo_cal_track_m();   // GPS-calibrated kinematic track
     float v_left  = LONG_GRASS_SPEED_MS - (heading_error * T * 0.5f);
     float v_right = LONG_GRASS_SPEED_MS + (heading_error * T * 0.5f);
 

@@ -18,6 +18,7 @@
 #include "ekf_localiser.h"
 #include "config.h"
 #include "mower_config.h"
+#include "odo_calib.h"  // for odo_cal_track_m() — calibrated kinematic track
 #include "geometry.h"   // for clampf(), wrapAngle()
 
 #include <freertos/FreeRTOS.h>
@@ -48,6 +49,11 @@ static float s_prev_hdg_east  = 0.0f;
 static float s_prev_hdg_north = 0.0f;
 /** True once the first RTK-quality fix (fix_type >= 4) has been stored */
 static bool  s_prev_hdg_valid = false;
+/** Total |heading change| (rad) accumulated since the heading reference above was
+ *  set. Summed in ekf_predict() from the per-tick yaw rate; reset whenever the
+ *  reference moves. Used to tell whether the travel since the reference was
+ *  STRAIGHT — only then is the GPS chord a valid absolute heading to lock onto. */
+static float s_hdg_turn_accum = 0.0f;
 
 /** False until the first valid GPS update has been used to seed the EKF position.
  *  On boot the EKF starts at (0,0) which may be many metres from the actual ENU
@@ -60,6 +66,22 @@ static bool  s_gps_seeded = false;
  *  Set by ekf_update_gps(); held constant in ekf_predict() so reported
  *  uncertainty tracks GPS accuracy rather than growing between fixes. */
 static float s_gps_p_ceil = EKF_P_MAX_POS;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GPS heading-event publication (for AUTO bootstrap + odo_calib)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** True once a GPS heading correction has been applied at least once since boot
+ *  (or RESETEKF). Heading is then carried by odometry through pivots. */
+static bool     s_heading_established = false;
+
+/** Monotonic counter + the latest GPS-derived FRONT-FACING travel heading and
+ *  the steering-centre ENU position at that fix. Consumed by odo_calib to detect
+ *  new straight/turn intervals. The heading is reverse-corrected (front-facing). */
+static uint32_t s_gps_hdg_seq   = 0;
+static float    s_gps_hdg_theta = 0.0f;
+static float    s_gps_hdg_east  = 0.0f;
+static float    s_gps_hdg_north = 0.0f;
 
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -210,7 +232,11 @@ void ekf_init() {
     s_prev_hdg_valid = false;
     s_prev_hdg_east  = 0.0f;
     s_prev_hdg_north = 0.0f;
+    s_hdg_turn_accum = 0.0f;
     s_gps_seeded     = false;
+
+    s_heading_established = false;
+    s_gps_hdg_seq         = 0;
 
     xSemaphoreGive(g_ekf_mutex);
 }
@@ -223,12 +249,33 @@ bool ekf_is_seeded() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-void ekf_predict(float v_left, float v_right, float dt) {
+void ekf_predict(float v_left, float v_right, float gyro_rate_cw, float dt) {
     float v     = 0.5f * (v_left + v_right);
     // Differential odometry: no magnetometer available, so the IMU gyro cannot
     // give a stable absolute heading.  Track-width kinematics are the correct
     // heading source between GPS fixes.
-    float omega = (v_right - v_left) / mower_config_track_width_m();
+    // Sign: heading is CW-from-North (clockwise positive). A physical RIGHT (CW)
+    // turn is v_left > v_right, so omega = (v_left - v_right)/track gives the
+    // correct +CW rate. (The old gyro term was negated to CW+ in imu_bmi270;
+    // when it was replaced by odometry that negation was dropped, leaving the
+    // odometry heading rate reversed — it fought the GPS heading update, which
+    // showed up as a heading that lagged until a long straight drive let GPS win.)
+    // Track width = the GPS-calibrated kinematic track (odo_calib), which drifts
+    // from the physical chassis width as the machine leans / rides a track edge.
+    float omega_odo = (v_left - v_right) / odo_cal_track_m();
+
+    // ── Heading-rate source selection: gyro during on-the-spot pivots ─────────
+    // The odometry omega is calibrated for forward arcs and is GPS-corrected
+    // whenever the machine translates. During a zero-radius pivot the tracks
+    // scrub, so the effective track is ~1.5× the arc value and odometry
+    // OVER-rotates — and with no translation GPS cannot catch it. Detect that
+    // regime with odometry (near-zero translation + a real yaw rate, both
+    // reliable as a *detector*) and take the rate from the gyro, which is
+    // accurate for a slow on-the-spot spin (low vibration, short integration).
+    // gyro_rate_cw is already bias-corrected and CW-positive (imu_bmi270).
+    bool in_place_turn = (fabsf(v) < GYRO_HEADING_MAX_V_MS) &&
+                         (fabsf(omega_odo) > GYRO_HEADING_MIN_OMEGA);
+    float omega = in_place_turn ? gyro_rate_cw : omega_odo;
 
     xSemaphoreTake(g_ekf_mutex, portMAX_DELAY);
 
@@ -248,6 +295,12 @@ void ekf_predict(float v_left, float v_right, float dt) {
     s_y     += v * cth * dt;
     s_theta  = wrapAngle(s_theta + omega * dt);
     s_v      = v;  // velocity is measured directly, not integrated
+
+    // Accumulate how much we've turned since the GPS heading reference. The GPS
+    // update only locks heading to the travel chord when this stays small (the
+    // segment was straight, so the chord IS the heading). A pivot/corner makes it
+    // grow, which tells the GPS update to discard the chord and restart.
+    s_hdg_turn_accum += fabsf(omega * dt);
 
     // ── Covariance update ─────────────────────────────────────────────────────
     // Position covariance is held at the GPS accuracy ceiling set by
@@ -349,34 +402,63 @@ void ekf_update_gps(float gps_east, float gps_north, int fix_type,
     s_P[1][3] = s_P[3][1] = 0.0f;
 
     // ── GPS heading update ───────────────────────────────────────────────────
-    // Only when fix is RTK quality and we have accumulated enough travel
-    // to reliably infer heading from consecutive positions.
+    // GPS travel direction is the ONLY absolute heading reference. Lock the EKF
+    // heading onto it whenever the mower has driven a STRAIGHT, measurable
+    // distance since the reference fix; otherwise let the IMU/odometry carry the
+    // heading (during pivots, and while too little distance has accumulated).
+    //
+    // "Straight" is judged from the turn accumulated since the reference
+    // (s_hdg_turn_accum, summed in ekf_predict): a pivot or corner makes it grow,
+    // which invalidates the chord. "Measurable" is a distance long enough that GPS
+    // position noise (sigma) gives an accurate chord heading.
     if (fix_type >= 4) {
         if (s_prev_hdg_valid) {
             float dE   = sc_east  - s_prev_hdg_east;
             float dN   = sc_north - s_prev_hdg_north;
             float dist = sqrtf(dE*dE + dN*dN);
+            float dist_thresh = fmaxf(HEADING_FROM_GPS_MIN_DIST_M,
+                                      HEADING_GPS_DIST_SIGMA_K * sigma);
+            bool turned = (s_hdg_turn_accum > HEADING_STRAIGHT_MAX_TURN_RAD);
 
-            if (dist > HEADING_FROM_GPS_MIN_DIST_M) {
-                // atan2(east, north): 0=North, π/2=East — matches CW-from-North convention
-                float z_hdg = atan2f(dE, dN);
-                // Guard against NaN (atan2f(0,0) is implementation-defined). (MED-3 fix)
-                if (isfinite(z_hdg)) {
-                    float R_hdg = (fix_type == 4) ? 0.1f : 0.5f;  // fixed vs float R
-                    float K_hdg = s_P[2][2] / (s_P[2][2] + R_hdg);
-                    s_theta = wrapAngle(s_theta + K_hdg * wrapAngle(z_hdg - s_theta));
-                    s_P[2][2] *= (1.0f - K_hdg);
-                }
-                // Update reference point for next heading measurement regardless
+            if (turned) {
+                // The mower turned since the reference (pivot/corner) — the chord
+                // is not a heading. Restart the straight-segment accumulation from
+                // here; heading meanwhile is carried by the IMU/odometry.
                 s_prev_hdg_east  = sc_east;
                 s_prev_hdg_north = sc_north;
+                s_hdg_turn_accum = 0.0f;
+            } else if (dist > dist_thresh) {
+                // Straight + far enough → the chord is an accurate heading. LOCK.
+                float z_hdg = atan2f(dE, dN);   // travel dir, 0=N, CW+
+                if (isfinite(z_hdg)) {
+                    // Reverse correction: GPS gives travel direction; the chassis
+                    // FRONT points 180° opposite when reversing (s_v < 0).
+                    if (s_v < -0.03f) z_hdg = wrapAngle(z_hdg + (float)M_PI);
+
+                    float K = HEADING_GPS_LOCK_GAIN;   // strong lock toward GPS truth
+                    s_theta   = wrapAngle(s_theta + K * wrapAngle(z_hdg - s_theta));
+                    s_P[2][2] = fmaxf((1.0f - K) * s_P[2][2], 0.0005f);
+                    s_heading_established = true;
+
+                    // Publish the FRONT-facing heading event for odo_calib.
+                    s_gps_hdg_seq++;
+                    s_gps_hdg_theta = z_hdg;
+                    s_gps_hdg_east  = sc_east;
+                    s_gps_hdg_north = sc_north;
+                }
+                // Reference resets to here; start a fresh straight segment.
+                s_prev_hdg_east  = sc_east;
+                s_prev_hdg_north = sc_north;
+                s_hdg_turn_accum = 0.0f;
             }
-            // dist <= threshold: accumulate more travel before measuring heading
+            // else: straight but too short — hold the reference and keep
+            // accumulating travel (the slow-creep buffering case).
         } else {
-            // First RTK fix: store reference; heading update deferred to next fix
+            // First RTK fix: store reference; heading lock deferred to next fix.
             s_prev_hdg_east  = sc_east;
             s_prev_hdg_north = sc_north;
             s_prev_hdg_valid = true;
+            s_hdg_turn_accum = 0.0f;
         }
     }
 
@@ -419,9 +501,37 @@ float ekf_get_position_uncertainty() {
     return sqrtf(p_ceil > 0.0f ? p_ceil : 1.0f);
 }
 
+bool ekf_heading_is_established() {
+    return s_heading_established;  // single bool — atomic read, no mutex needed
+}
+
+bool ekf_get_gps_heading_event(uint32_t *seq, float *theta,
+                               float *east, float *north) {
+    if (g_ekf_mutex == nullptr) return false;
+    xSemaphoreTake(g_ekf_mutex, portMAX_DELAY);
+    uint32_t s = s_gps_hdg_seq;
+    if (seq)   *seq   = s;
+    if (theta) *theta = s_gps_hdg_theta;
+    if (east)  *east  = s_gps_hdg_east;
+    if (north) *north = s_gps_hdg_north;
+    xSemaphoreGive(g_ekf_mutex);
+    return (s > 0);  // false until the first heading event has been published
+}
+
+float ekf_get_heading_uncertainty() {
+    xSemaphoreTake(g_ekf_mutex, portMAX_DELAY);
+    float p = s_P[2][2];
+    xSemaphoreGive(g_ekf_mutex);
+    return sqrtf(p > 0.0f ? p : 0.0f);
+}
+
 void ekf_reset_covariance() {
     xSemaphoreTake(g_ekf_mutex, portMAX_DELAY);
     reset_covariance_locked();
+    // Force a fresh GPS heading establishment after an external reposition
+    // (RESETEKF): drop the established flag and the stale heading reference.
+    s_heading_established = false;
+    s_prev_hdg_valid      = false;
     xSemaphoreGive(g_ekf_mutex);
 }
 

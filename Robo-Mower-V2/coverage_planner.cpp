@@ -1,19 +1,37 @@
 // ══════════════════════════════════════════════════════════════════════════════
-//  coverage_planner.cpp — RoboMower complete mowing path planner
+//  coverage_planner.cpp — RoboMower complete mowing path planner (SPIRAL)
 //
-//  Implements the five-step path generation algorithm:
-//    Step 1  Headland passes    (outermost → inward, CW traversal)
-//    Step 2  Optimal mow angle  (convex hull edge enumeration)
-//    Step 3  Strip generation   (scan-line intersection in rotated frame)
-//    Step 4  Boustrophedon seq  (alternating direction, concave-safe)
-//    Step 5  Transitions        (guided 2-point turn for arc configs)
+//  2026-06-13: REPLACED the boustrophedon strip planner with a concentric
+//  inward spiral. The strip planner (scan-line strips + headland passes +
+//  region-outline passes + spur reverses + U-turn transitions) repeatedly
+//  produced corrupt plans — fans of lines converging to a couple of points,
+//  paths leaving the perimeter — and never planned a sparse perimeter cleanly.
 //
-//  Arc-sweep credit (Steps 6/7) is disabled for STEER_CENTRE_TO_CUT_CENTRE_M <= 0.
+//  The spiral is dramatically simpler and is *native to a sparse perimeter*
+//  (the perimeter is ~10 turn-point nodes joined by straight edges):
+//
+//    ring 0 = nav boundary (steering centre rides the legal boundary)
+//    ring i = ring (i-1) inset inward by one strip step
+//    … until the polygon collapses to nothing at the centre.
+//
+//  Each ring is emitted as a closed loop of waypoints at the polygon vertices;
+//  the node follower drives straight between nodes and pivots at corners. The
+//  next ring starts at the vertex nearest the previous ring's start, so the
+//  inward steps stack on one side and the whole path reads as a spiral.
+//
+//  insetPolygonMulti() handles concave gardens that pinch into multiple lobes
+//  as they shrink — each lobe is spiralled to its own centre (depth-first)
+//  before the next.
+//
+//  Why the NAV BOUNDARY and not the perimeter: waypoints are steering-centre
+//  positions, and the steering centre must stay inside the nav boundary
+//  (perimeter inset by the robot half-width) or the chassis crosses the edge
+//  and the safety watchdog flags a breach. The blade, mounted outboard/forward
+//  of the steering centre, still cuts close to the recorded edge.
 //
 //  Source references:
-//    Spec: Robo_Mower_claudecode_prompt_v3.md §Coverage Planner
-//    Assumptions: ASSUMPTIONS.md A09, A19
-//    Handoff: HANDOFFS/15_coverage_planner/HANDOFF.md
+//    geometry.h  insetPolygonMulti() / insetPolygon()
+//    config.h    strip step (CUT_WIDTH_M − STRIP_OVERLAP_M), MIN_ZONE_AREA_M2
 // ══════════════════════════════════════════════════════════════════════════════
 
 #include "coverage_planner.h"
@@ -21,11 +39,10 @@
 #include "mower_config.h"
 #include "obstacle_map.h"
 #include "geometry.h"
+#include "clipper_offset.h"
 
 #include <Arduino.h>
 #include <vector>
-#include <algorithm>
-#include <climits>
 #include <cmath>
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -37,11 +54,21 @@ static constexpr float OBSTACLE_SKIP_RADIUS_M = 0.40f;
 // Maximum unreachable zones we store (static allocation).
 static constexpr int MAX_UNREACHABLE_ZONES = 32;
 
-// Arc-sweep credit is disabled for STEER_CENTRE_TO_CUT_CENTRE_M <= 0 (spec §Step 6).
-// Current value = 0.0f (front-drive config), so no arc-sweep credit is applied.
+// Safety caps on the spiral generation.
+//  MAX_PLAN_WP : leave headroom under the follower's 1000-waypoint buffer
+//                (state_machine.cpp s_wp_buf[1000]); a sparse garden uses far
+//                fewer (≈ rings × nodes_per_ring).
+//  MAX_RINGS   : backstop against a degenerate inset that never collapses.
+static constexpr int MAX_PLAN_WP = 960;
+static constexpr int MAX_RINGS   = 400;
 
-// Spacing between consecutive strips — computed at runtime from mower_config.
-// Use mower_config_strip_step_m() at each call site.
+// Minimum enclosed area for a spiral ring to be emitted. Much smaller than
+// MIN_ZONE_AREA_M2 (0.5 m²): the spiral must inset all the way to the centre, so
+// rings keep going until the region is barely larger than the blade can cover in
+// one pass. Stopping at 0.5 m² left a multi-cut-width void down the middle. At
+// ~0.04 m² (≈ 0.2 m across) the last ring's blade (≈ cut_width/2 reach) covers
+// the residual centre.
+static constexpr float SPIRAL_RING_MIN_AREA_M2 = 0.04f;
 
 
 // ── Module state ──────────────────────────────────────────────────────────────
@@ -52,15 +79,18 @@ static std::vector<Waypoint> g_waypoints;
 // Ranges from 0 (plan just generated) to g_total_wp_count (plan complete).
 static int g_wp_index           = 0;
 
-// g_headland_wp_end_idx: exclusive upper bound of headland waypoints.
-// Waypoints [0 .. g_headland_wp_end_idx-1] are headland passes.
-// Waypoints [g_headland_wp_end_idx .. g_total_wp_count-1] are strips + transitions.
+// g_headland_wp_end_idx: exclusive upper bound of "headland" waypoints. For the
+// spiral every ring is an edge-following pass, so the whole plan is headland —
+// this is set equal to g_total_wp_count. (Kept for the progress getters and so
+// the uncertainty strip-truncation in state_machine.cpp, which is exempt for
+// headland waypoints, leaves the spiral intact near the boundary.)
 static int g_headland_wp_end_idx = 0;
 
 // g_total_wp_count: total waypoints in the plan (== g_waypoints.size()).
 static int g_total_wp_count      = 0;
 
-// Unreachable zone log (working-area sub-regions with no valid strip segments).
+// Unreachable zone log — retained for API/diagnostic compatibility. The spiral
+// covers everything an inset can reach, so this is left empty.
 struct UnreachableZone {
     float cx;      ///< Centre ENU east  (m)
     float cy;      ///< Centre ENU north (m)
@@ -70,263 +100,64 @@ static UnreachableZone g_unreachable[MAX_UNREACHABLE_ZONES];
 static int             g_unreachable_count = 0;
 
 
-// ── Internal geometry helpers ─────────────────────────────────────────────────
+// ── Ring helper ────────────────────────────────────────────────────────────────
 
-/** Rotate point (x,y) by angle radians CCW around the origin. */
-static Point rotatePoint(float x, float y, float angle) {
-    float ca = cosf(angle);
-    float sa = sinf(angle);
-    return { x * ca - y * sa,
-             x * sa + y * ca };
-}
-
-/**
- * Intersect horizontal line y = yl with the polygon defined by pts.
- *
- * Uses the even-odd scan-line rule:  an edge (y0→y1) contributes when
- * exactly one endpoint is strictly below yl.  This avoids double-counting
- * at shared vertices and is consistent with the standard polygon fill rule.
- *
- * @return Sorted vector of x-intercepts. Length is always even for a
- *         well-formed polygon, forming (x_enter, x_exit) pairs.
- */
-static std::vector<float> hLineIntersect(
-        const std::vector<Point> &pts, float yl) {
-    std::vector<float> xs;
-    int n = (int)pts.size();
+/** Area-weighted centroid of a polygon (falls back to vertex 0 if degenerate). */
+static Point polygonCentroid(const Polygon &p) {
+    int n = (int)p.pts.size();
+    if (n == 0) return Point(0.0f, 0.0f);
+    double cx = 0.0, cy = 0.0, a2 = 0.0;
     for (int i = 0; i < n; i++) {
-        float x0 = pts[i].x,          y0 = pts[i].y;
-        float x1 = pts[(i + 1) % n].x, y1 = pts[(i + 1) % n].y;
-        // Edge contributes when yl lies strictly between y0 and y1.
-        if ((y0 < yl && y1 >= yl) || (y1 < yl && y0 >= yl)) {
-            float t = (yl - y0) / (y1 - y0);
-            xs.push_back(x0 + t * (x1 - x0));
-        }
+        int j = (i + 1) % n;
+        double cr = (double)p.pts[i].x * p.pts[j].y - (double)p.pts[j].x * p.pts[i].y;
+        a2 += cr;
+        cx += (p.pts[i].x + p.pts[j].x) * cr;
+        cy += (p.pts[i].y + p.pts[j].y) * cr;
     }
-    std::sort(xs.begin(), xs.end());
-    return xs;
+    if (fabs(a2) < 1e-6) return p.pts[0];
+    return Point((float)(cx / (3.0 * a2)), (float)(cy / (3.0 * a2)));
 }
 
-
 /**
- * Intersect vertical line x = xl with the polygon defined by pts.
+ * Append a full closed-loop traversal of `ring` (assumed CCW) to g_waypoints.
  *
- * Same even-odd rule as hLineIntersect, transposed: an edge (x0→x1) contributes
- * when exactly one endpoint is strictly left of xl.
+ * Traversal starts at the vertex nearest `seed`, so consecutive spiral rings
+ * join with a short inward step instead of a chord across the garden. Emits
+ * n+1 waypoints (returns to the start vertex) so the final edge is driven.
  *
- * @return Sorted vector of y-intercepts. Length is always even for a
- *         well-formed polygon, forming (y_enter, y_exit) pairs.
+ * @return the start vertex of this ring — pass it as the seed for the next ring.
  */
-static std::vector<float> vLineIntersect(
-        const std::vector<Point> &pts, float xl) {
-    std::vector<float> ys;
-    int n = (int)pts.size();
+static Point addRingWaypoints(const Polygon &ring, Point seed,
+                              bool mowing, bool headland) {
+    int n = (int)ring.pts.size();
+    if (n < 2) return seed;
+
+    // Start at the vertex nearest the seed (squared distance — no sqrt needed).
+    int   start = 0;
+    float best  = 1e30f;
     for (int i = 0; i < n; i++) {
-        float x0 = pts[i].x,          y0 = pts[i].y;
-        float x1 = pts[(i + 1) % n].x, y1 = pts[(i + 1) % n].y;
-        if ((x0 < xl && x1 >= xl) || (x1 < xl && x0 >= xl)) {
-            float t = (xl - x0) / (x1 - x0);
-            ys.push_back(y0 + t * (y1 - y0));
-        }
+        float dx = ring.pts[i].x - seed.x;
+        float dy = ring.pts[i].y - seed.y;
+        float d  = dx * dx + dy * dy;
+        if (d < best) { best = d; start = i; }
     }
-    std::sort(ys.begin(), ys.end());
-    return ys;
-}
 
-
-// ── Headland pass helpers ─────────────────────────────────────────────────────
-
-/**
- * Append waypoints for a clockwise traversal of poly to g_waypoints.
- *
- * poly is assumed CCW (as returned by insetPolygon).  Reversing gives CW.
- * Adds n+1 waypoints: n vertices (CW order) plus a closing waypoint that
- * returns to vertex 0, ensuring the final edge is fully traversed.
- *
- * No corner smoothing is applied at the planning level.  Sharp corners are
- * emitted as-is; the path controller handles actual cornering by slowing
- * down (OpenMower-style).  This ensures the planned path never crosses the
- * perimeter — it follows inset polygon vertices exactly.
- */
-static void addPolygonWaypoints(const Polygon &poly, bool mowing, bool headland) {
-    int n = (int)poly.pts.size();
-    if (n < 2) return;
-
-    // CW index helper: maps sequential i to original CCW array index (reversed).
-    auto cwIdx = [n](int i) -> int { return (n - 1) - (((i % n) + n) % n); };
-
-    for (int i = 0; i <= n; i++) {
-        int ci = cwIdx(i);
-        int ni = cwIdx(i + 1);
-
-        float dx = poly.pts[ni].x - poly.pts[ci].x;
-        float dy = poly.pts[ni].y - poly.pts[ci].y;
+    for (int k = 0; k <= n; k++) {
+        int ci = (start + k)     % n;
+        int ni = (start + k + 1) % n;
+        float dx = ring.pts[ni].x - ring.pts[ci].x;
+        float dy = ring.pts[ni].y - ring.pts[ci].y;
 
         Waypoint wp = {};
-        wp.x       = poly.pts[ci].x;
-        wp.y       = poly.pts[ci].y;
-        wp.heading = atan2f(dy, dx);
-        wp.mowing  = mowing;
+        wp.x        = ring.pts[ci].x;
+        wp.y        = ring.pts[ci].y;
+        wp.heading  = atan2f(dy, dx);
+        wp.mowing   = mowing;
         wp.headland = headland;
-        wp.reverse = false;
+        wp.reverse  = false;
         g_waypoints.push_back(wp);
     }
-}
-
-
-// ── Transition helpers ────────────────────────────────────────────────────────
-
-/**
- * Append transit waypoints between the end of one strip and the start of the next.
- *
- * Two cases:
- *  (a) Same-direction transit (segment gap within a concave strip level):
- *      heading_diff < 0.5 rad — the robot continues in the same direction;
- *      a single direct transit waypoint to P_start is sufficient.
- *
- *  (b) U-turn (consecutive strip levels, heading reverses by ≈ π):
- *      The robot drives forward into the headland to a pivot/arc midpoint,
- *      then navigates to P_start.  The midpoint is placed at the geometric
- *      centre between P_end and P_start, projected forward (into the headland)
- *      by half the available headland depth.
- *
- *      Rear-swing constraint: rear_clearance = sqrt(R² + mower_config_get().robot_rear_m²) - R.
- *      The midpoint is capped so the steering centre does not advance further
- *      than (mower_config_headland_m() - rear_clearance) from the strip end.
- *
- *      NARROW_SPACE: when mower_config_min_turn_radius_m() > mower_config_headland_m(), the
- *      standard single-arc U-turn cannot fit.  A three-waypoint sequence is
- *      used to guide the path follower through a wider Ω-turn.
- *
- * All transit waypoints have mowing = false.
- */
-static void addTransition(const Waypoint &P_end, const Waypoint &P_start) {
-    float heading_diff = fabsf(wrapAngle(P_start.heading - P_end.heading));
-
-    // ── Case (a): same-direction short transit ────────────────────────────────
-    if (heading_diff < 0.5f) {
-        Waypoint wp  = P_start;
-        wp.mowing    = false;
-        wp.headland  = false;
-        wp.reverse   = false;
-        g_waypoints.push_back(wp);
-        return;
-    }
-
-    // ── Case (b): U-turn transition ───────────────────────────────────────────
-    float R = mower_config_min_turn_radius_m();
-
-    // Rear swing radius during the arc turn.
-    float R_rear = (R > 1e-3f)
-                   ? sqrtf(R * R + mower_config_get().robot_rear_m * mower_config_get().robot_rear_m)
-                   : mower_config_get().robot_rear_m;
-    float rear_clearance = R_rear - R;  // additional lateral excursion of rear
-
-    // Maximum safe forward advance into the headland before starting the turn.
-    float max_fwd = mower_config_headland_m() - rear_clearance;
-    if (max_fwd < 0.05f) max_fwd = 0.05f;
-
-    // Geometric midpoint between the two strip ends (world frame).
-    float mid_world_x = (P_end.x + P_start.x) * 0.5f;
-    float mid_world_y = (P_end.y + P_start.y) * 0.5f;
-
-    // Project midpoint forward (in P_end heading direction) by half headland.
-    float fwd_frac = fminf(mower_config_headland_m() * 0.5f, max_fwd);
-    float fwd_cos  = cosf(P_end.heading);
-    float fwd_sin  = sinf(P_end.heading);
-
-    float turn_x = mid_world_x + fwd_cos * fwd_frac;
-    float turn_y = mid_world_y + fwd_sin * fwd_frac;
-
-    // Heading at the turn midpoint: aim toward P_start.
-    float dx_to_start = P_start.x - turn_x;
-    float dy_to_start = P_start.y - turn_y;
-    float len_to_start = sqrtf(dx_to_start * dx_to_start + dy_to_start * dy_to_start);
-    float mid_heading = (len_to_start > 0.01f)
-                        ? atan2f(dy_to_start, dx_to_start)
-                        : P_start.heading;
-
-    if (R <= 1e-3f) {
-        // Pivot turn: single transit waypoint directly at P_start.
-        Waypoint wp  = P_start;
-        wp.mowing    = false;
-        wp.headland  = false;
-        wp.reverse   = false;
-        g_waypoints.push_back(wp);
-        return;
-    }
-
-    if (R_rear <= mower_config_headland_m()) {
-        // Standard arc turn fits in the headland: one midpoint + P_start.
-        Waypoint wp_mid = {};
-        wp_mid.x        = turn_x;
-        wp_mid.y        = turn_y;
-        wp_mid.heading  = mid_heading;
-        wp_mid.mowing   = false;
-        wp_mid.headland = false;
-        g_waypoints.push_back(wp_mid);
-    } else if (max_fwd < R * 0.5f) {
-        // VERY NARROW: headland too tight for any forward arc.
-        // K-turn: drive forward, reverse back, drive forward to next strip.
-
-        // wp1 — forward as far as safe.
-        Waypoint wp1 = {};
-        wp1.x        = P_end.x + fwd_cos * max_fwd;
-        wp1.y        = P_end.y + fwd_sin * max_fwd;
-        wp1.heading  = P_end.heading;
-        wp1.mowing   = false;
-        wp1.headland = false;
-        wp1.reverse  = false;
-        g_waypoints.push_back(wp1);
-
-        // wp2 — reverse back past P_end.
-        Waypoint wp_rev = {};
-        wp_rev.x       = P_end.x - fwd_cos * max_fwd;
-        wp_rev.y       = P_end.y - fwd_sin * max_fwd;
-        wp_rev.heading = P_end.heading + (float)M_PI;
-        wp_rev.mowing  = false;
-        wp_rev.headland = false;
-        wp_rev.reverse = true;
-        g_waypoints.push_back(wp_rev);
-
-        // wp3 — forward to P_start.
-        Waypoint wp_fwd = P_start;
-        wp_fwd.mowing  = false;
-        wp_fwd.headland = false;
-        wp_fwd.reverse = false;
-        g_waypoints.push_back(wp_fwd);
-        return;
-    } else {
-        // NARROW_SPACE: arc turn does not fit cleanly.
-        // Use a 3-waypoint Ω-turn sequence to guide the path follower:
-        //   wp1: drive forward toward nav boundary (stay within headland)
-        //   wp2: lateral midpoint at headland depth, aimed toward next strip
-        //   wp3: P_start
-
-        // wp1 — forward approach to near the nav boundary.
-        Waypoint wp1 = {};
-        wp1.x        = P_end.x + fwd_cos * max_fwd;
-        wp1.y        = P_end.y + fwd_sin * max_fwd;
-        wp1.heading  = P_end.heading;
-        wp1.mowing   = false;
-        wp1.headland = false;
-        g_waypoints.push_back(wp1);
-
-        // wp2 — lateral midpoint in the headland zone.
-        Waypoint wp2 = {};
-        wp2.x        = turn_x;
-        wp2.y        = turn_y;
-        wp2.heading  = mid_heading;
-        wp2.mowing   = false;
-        wp2.headland = false;
-        g_waypoints.push_back(wp2);
-    }
-
-    // Final transition waypoint: P_start itself (mowing=false).
-    Waypoint wp_s  = P_start;
-    wp_s.mowing    = false;
-    wp_s.reverse   = false;
-    g_waypoints.push_back(wp_s);
+    return ring.pts[start];
 }
 
 
@@ -346,441 +177,138 @@ void coverage_planner_init() {
 bool coverage_planner_plan(const Polygon &perimeter,
                            const Polygon &navBoundary,
                            const Polygon &workingArea) {
-    // ── Validate inputs ───────────────────────────────────────────────────────
-    if (perimeter.pts.size() < 3 || workingArea.pts.empty()) {
-        DBG_PRINTLN("[CP] plan: invalid polygon (< 3 pts or empty workingArea)");
+    (void)navBoundary;   // spiral & breach derive directly from the perimeter now
+    (void)workingArea;   // working area / headland split is no longer used
+
+    // ── Validate ────────────────────────────────────────────────────────────
+    if (perimeter.pts.size() < 3) {
+        DBG_PRINTLN("[CP] plan: perimeter < 3 pts");
         return false;
     }
-    if (fabsf(workingArea.area()) < MIN_ZONE_AREA_M2) {
-        DBG_PRINTLN("[CP] plan: workingArea too small");
+    if (fabsf(perimeter.area()) < MIN_ZONE_AREA_M2) {
+        DBG_PRINTLN("[CP] plan: perimeter too small");
         return false;
     }
 
     // ── Reset state ───────────────────────────────────────────────────────────
     g_waypoints.clear();
-    g_waypoints.reserve(512);  // typical garden: 200–600 waypoints
+    g_waypoints.reserve(256);
     g_wp_index            = 0;
     g_headland_wp_end_idx = 0;
     g_total_wp_count      = 0;
     g_unreachable_count   = 0;
 
-    // ──────────────────────────────────────────────────────────────────────────
-    //  Step 1 — Headland passes (EXECUTED FIRST)
-    //
-    //  The perimeter was recorded by driving the mower around the garden edge,
-    //  so the perimeter polygon IS where the cut centre was.  The first headland
-    //  pass (i=0) is placed directly on the perimeter (offset = 0).  Each
-    //  subsequent pass steps inward by strip_step_m.
-    // ──────────────────────────────────────────────────────────────────────────
-    int n_headland_passes = (int)ceilf(mower_config_headland_m() / mower_config_strip_step_m());
-    if (n_headland_passes < 1) n_headland_passes = 1;
+    const float step = mower_config_strip_step_m();   // CUT_WIDTH_M - STRIP_OVERLAP_M
 
-    for (int i = 0; i < n_headland_passes; i++) {
-        Polygon pass_poly;
-        if (i == 0) {
-            // Pass 0: use the raw perimeter (insetPolygon with offset=0 drops
-            // concave corner vertices because the zero-radius arc is empty).
-            pass_poly = perimeter;
-            pass_poly.ensureCCW();
-        } else {
-            float offset = i * mower_config_strip_step_m();
-            pass_poly = insetPolygon(perimeter, offset);
-        }
-        if (pass_poly.pts.empty()) {
+    // -- Concentric inward spiral (Clipper2 offsetting) -----------------------
+    // The recorded PERIMETER is the path of the robot's STEERING CENTRE driven to
+    // its maximum extent (body against the physical boundary). The physical fence
+    // is already ~one robot diagonal-radius OUTSIDE the perimeter, so that margin
+    // is baked into the recording: the steering centre may drive right up to the
+    // perimeter. Therefore:
+    //   * ring 0 IS the perimeter (NO nav-inset subtracted -- subtracting it would
+    //     double-count the robot size and leave an oversized outer border),
+    //   * ring k>0 = the perimeter inset by k*step (CUT_WIDTH - OVERLAP),
+    // giving uniform ring spacing from the edge inward.
+    //
+    // Offsets keep ALL sub-regions, so a garden that pinches into separate areas
+    // (e.g. a neck to a side arm) is fully covered -- each area gets its own
+    // concentric spiral. Clipper2 is robust where the hand-rolled insetPolygon was
+    // not: concave notches round off (no inward spike), an over-shrink collapses
+    // to EMPTY (loop ends), and a pinch returns multiple regions. Rings continue
+    // down to SPIRAL_RING_MIN_AREA_M2, then plunges to the centre.
+    //
+    // DEPTH-FIRST so the path is a continuous spiral: each ring is the previous
+    // ring inset by one step (Clipper offset of the previous ring, not of the
+    // original), followed inward without lifting. Consecutive rings are joined by
+    // a short radial BRIDGE (the ~step gap between a ring's start and the next
+    // ring's start is just driven, drawn connected). Only a LONG jump — to a
+    // different area when the garden pinches into lobes — gets a mowing=false
+    // break so the PWA doesn't draw a line across the garden. A stack holds
+    // not-yet-spiralled child regions, so each lobe is completed before the next.
+    const float BRIDGE_MAX = 3.0f * step;   // hops longer than this break instead of bridge
+
+    std::vector<Polygon> stack;
+    Polygon outer = perimeter;
+    outer.ensureCCW();
+    stack.push_back(outer);
+
+    Point seed     = outer.pts.empty() ? Point(0.0f, 0.0f) : outer.pts[0];
+    Point prevEnd  = seed;
+    bool  havePrev = false;
+    int   rings    = 0;
+    bool  capped   = false;
+
+    while (!stack.empty()) {
+        if ((int)g_waypoints.size() >= MAX_PLAN_WP || rings >= MAX_RINGS) {
+            capped = true;
             break;
         }
-        // Insert a segment break (mowing=false) between headland passes
-        // so the mow_path polyline doesn't draw a straight line between loops.
-        if (i > 0 && !g_waypoints.empty()) {
-            Waypoint brk = g_waypoints.back();
-            brk.mowing = false;
-            g_waypoints.push_back(brk);
+
+        Polygon ring = stack.back();
+        stack.pop_back();
+        if (ring.pts.size() < 3 || fabsf(ring.area()) < SPIRAL_RING_MIN_AREA_M2) continue;
+
+        // Where this ring's loop will start (vertex nearest the running seed).
+        int   n = (int)ring.pts.size(), startIdx = 0;
+        float best = 1e30f;
+        for (int i = 0; i < n; i++) {
+            float dx = ring.pts[i].x - seed.x, dy = ring.pts[i].y - seed.y;
+            float d  = dx * dx + dy * dy;
+            if (d < best) { best = d; startIdx = i; }
         }
-        addPolygonWaypoints(pass_poly, /*mowing=*/true, /*headland=*/true);
-    }
-    // Segment break after headland block (before strip regions)
-    if (!g_waypoints.empty()) {
-        Waypoint brk = g_waypoints.back();
-        brk.mowing = false;
-        g_waypoints.push_back(brk);
-    }
-    g_headland_wp_end_idx = (int)g_waypoints.size();
+        Point startPt = ring.pts[startIdx];
 
-    // ──────────────────────────────────────────────────────────────────────────
-    //  Compute working-area sub-regions.
-    //  The strip region starts where the headland passes end: inset from the
-    //  perimeter by n_headland_passes * strip_step.  For concave shapes (L, T, U)
-    //  this inset may split into multiple disconnected regions.
-    // ──────────────────────────────────────────────────────────────────────────
-    float headland_total = n_headland_passes * mower_config_strip_step_m();
-    std::vector<Polygon> regions = insetPolygonMulti(perimeter, headland_total);
-    if (regions.empty()) {
-        // Fallback: use the passed single workingArea (may miss disconnected regions)
-        if (workingArea.pts.size() >= 3 && fabsf(workingArea.area()) >= MIN_ZONE_AREA_M2) {
-            regions.push_back(workingArea);
-        }
-    }
-    if (regions.empty()) {
-        DBG_PRINTLN("[CP] plan: no valid working-area regions");
-        g_total_wp_count = (int)g_waypoints.size();
-        return true;  // headland-only plan
-    }
-
-    DBG_PRINTF("[CP] %d working-area region(s)\n", (int)regions.size());
-
-    // ──────────────────────────────────────────────────────────────────────────
-    //  Steps 2–5 — Per-region: optimal angle, strip generation, sequencing
-    //
-    //  Each region computes its own optimal mow angle from its convex hull.
-    //  This ensures narrow peninsulas mow along their length (perpendicular
-    //  to the shortest edge) rather than using a global angle that produces
-    //  unusable short strips.  Between regions, nav-boundary-following transit
-    //  waypoints keep the mower within bounds.
-    // ──────────────────────────────────────────────────────────────────────────
-    for (int ri = 0; ri < (int)regions.size(); ri++) {
-        const Polygon &region = regions[ri];
-
-        // ── Transit from previous region via perimeter ─────────────────────
-        // Uses the perimeter (not nav boundary) because the nav boundary may
-        // collapse at narrow necks, forcing the transit the wrong way around.
-        // The perimeter was recorded by driving, so the mower can follow it.
-        if (ri > 0 && !g_waypoints.empty()) {
-            const Waypoint &last_wp = g_waypoints.back();
-            int n_perim = (int)perimeter.pts.size();
-
-            // Nearest perimeter vertex to last waypoint
-            float best_s = 1e9f;
-            int idx_s = 0;
-            for (int i = 0; i < n_perim; i++) {
-                float dx = perimeter.pts[i].x - last_wp.x;
-                float dy = perimeter.pts[i].y - last_wp.y;
-                float d = dx*dx + dy*dy;
-                if (d < best_s) { best_s = d; idx_s = i; }
-            }
-
-            // Nearest perimeter vertex to centroid of next region
-            float rcx = 0.0f, rcy = 0.0f;
-            for (auto &p : region.pts) { rcx += p.x; rcy += p.y; }
-            rcx /= (float)region.pts.size();
-            rcy /= (float)region.pts.size();
-
-            float best_e = 1e9f;
-            int idx_e = 0;
-            for (int i = 0; i < n_perim; i++) {
-                float dx = perimeter.pts[i].x - rcx;
-                float dy = perimeter.pts[i].y - rcy;
-                float d = dx*dx + dy*dy;
-                if (d < best_e) { best_e = d; idx_e = i; }
-            }
-
-            if (idx_s != idx_e) {
-                int cw_steps  = (idx_e - idx_s + n_perim) % n_perim;
-                int ccw_steps = (idx_s - idx_e + n_perim) % n_perim;
-                bool walk_cw  = (cw_steps <= ccw_steps);
-                int steps = walk_cw ? cw_steps : ccw_steps;
-                int dir   = walk_cw ? 1 : -1;
-
-                for (int s = 0; s <= steps; s++) {
-                    int ci = (idx_s + s * dir + n_perim) % n_perim;
-                    int ni = (s < steps)
-                             ? (idx_s + (s + 1) * dir + n_perim) % n_perim
-                             : ci;
-                    float dx = perimeter.pts[ni].x - perimeter.pts[ci].x;
-                    float dy = perimeter.pts[ni].y - perimeter.pts[ci].y;
-
-                    Waypoint wp = {};
-                    wp.x       = perimeter.pts[ci].x;
-                    wp.y       = perimeter.pts[ci].y;
-                    wp.heading = atan2f(dy, dx);
-                    wp.mowing  = false;
-                    wp.headland = false;
-                    wp.reverse = false;
-                    g_waypoints.push_back(wp);
-                }
-                DBG_PRINTF("[CP] transit: region %d → %d (%d perim vertices)\n",
-                              ri - 1, ri, steps + 1);
-            }
-        }
-
-        // ── Region outline pass (Slic3r-style innermost perimeter) ──────────
-        //  Strips are parallel lines spaced strip_step apart: wherever the
-        //  region boundary is NOT parallel to the strips, the last strip can
-        //  sit up to a full step from the edge, leaving an unmowed wedge
-        //  (clearly visible on boundary edges at a shallow angle to the mow
-        //  direction).  Tracing the region outline first seals every such
-        //  wedge — with strip_step ≤ cut width, no interior point is further
-        //  than half a cut width from either a strip or this outline pass,
-        //  exactly like slicer infill meeting the innermost perimeter loop.
-        {
-            if (!g_waypoints.empty()) {
+        // Bridge (short, continuous) vs break (long jump to another lobe).
+        if (havePrev) {
+            float dx = startPt.x - prevEnd.x, dy = startPt.y - prevEnd.y;
+            if (sqrtf(dx * dx + dy * dy) > BRIDGE_MAX) {
                 Waypoint brk = g_waypoints.back();
                 brk.mowing = false;
                 g_waypoints.push_back(brk);
             }
-            addPolygonWaypoints(region, /*mowing=*/true, /*headland=*/false);
-            // Segment break before the strips begin
-            Waypoint brk2 = g_waypoints.back();
-            brk2.mowing = false;
-            g_waypoints.push_back(brk2);
         }
 
-        // ── Step 2 — Per-region optimal mow angle ──────────────────────────
-        //  Convex hull edge scan: choose the edge direction that minimises
-        //  the number of strips for THIS region.  Narrow peninsulas will
-        //  naturally get strips along their length.
-        float mow_angle = 0.0f;
-        {
-            Polygon hull = convexHull(region);
-            int   n_hull     = (int)hull.pts.size();
-            int   min_strips = INT_MAX;
+        // Whole spiral flagged headland=true: edge-following passes that are
+        // exempt from the uncertainty strip-truncation in state_machine.cpp.
+        seed     = addRingWaypoints(ring, seed, /*mowing=*/true, /*headland=*/true);
+        prevEnd  = startPt;   // closed loop ends where it started
+        havePrev = true;
+        rings++;
 
-            for (int e = 0; e < n_hull; e++) {
-                float ax = hull.pts[(e + 1) % n_hull].x - hull.pts[e].x;
-                float ay = hull.pts[(e + 1) % n_hull].y - hull.pts[e].y;
-                if (fabsf(ax) < 1e-6f && fabsf(ay) < 1e-6f) continue;
-
-                float angle = atan2f(ay, ax);
-
-                float y_min_h =  1e9f;
-                float y_max_h = -1e9f;
-                for (auto &p : hull.pts) {
-                    float ry = -p.x * sinf(angle) + p.y * cosf(angle);
-                    if (ry < y_min_h) y_min_h = ry;
-                    if (ry > y_max_h) y_max_h = ry;
-                }
-
-                float range      = y_max_h - y_min_h;
-                int   n_strips_e = (int)ceilf(range / mower_config_strip_step_m());
-
-                if (n_strips_e < min_strips) {
-                    min_strips = n_strips_e;
-                    mow_angle  = angle;
-                }
+        // Inset this ring by one step → child ring(s) further in.
+        std::vector<Polygon> kids = offsetPolygonClipper(ring, step);
+        int pushed = 0;
+        for (auto &c : kids) {
+            if (c.pts.size() >= 3 && fabsf(c.area()) >= SPIRAL_RING_MIN_AREA_M2) {
+                stack.push_back(c);
+                pushed++;
             }
         }
-
-        // Nav boundary rotated into this region's mow frame (for spur detection).
-        std::vector<Point> rot_nav_pts;
-        rot_nav_pts.reserve(navBoundary.pts.size());
-        for (auto &p : navBoundary.pts) {
-            rot_nav_pts.push_back(rotatePoint(p.x, p.y, -mow_angle));
-        }
-
-        auto isSpurTip = [&](float xc) -> bool {
-            std::vector<float> ys = vLineIntersect(rot_nav_pts, xc);
-            if (ys.size() < 2) return false;
-            float span = ys.back() - ys.front();
-            return span < mower_config_spur_min_turn_width_m();
-        };
-
-        // ── Step 3 — Rotate region vertices, scan-line intersect ─────────────
-        std::vector<Point> rot_pts;
-        rot_pts.reserve(region.pts.size());
-        for (auto &p : region.pts) {
-            rot_pts.push_back(rotatePoint(p.x, p.y, -mow_angle));
-        }
-
-        float y_min_r =  1e9f;
-        float y_max_r = -1e9f;
-        for (auto &p : rot_pts) {
-            if (p.y < y_min_r) y_min_r = p.y;
-            if (p.y > y_max_r) y_max_r = p.y;
-        }
-
-        float y_start = y_min_r + mower_config_get().cut_disc_radius_m;
-        float y_stop  = y_max_r - mower_config_get().cut_disc_radius_m;
-
-        if (y_stop < y_start) {
-            DBG_PRINTF("[CP] region %d: too narrow for strips\n", ri);
-            if (g_unreachable_count < MAX_UNREACHABLE_ZONES) {
-                float rcx = 0.0f, rcy = 0.0f;
-                for (auto &p : region.pts) { rcx += p.x; rcy += p.y; }
-                rcx /= (float)region.pts.size();
-                rcy /= (float)region.pts.size();
-                g_unreachable[g_unreachable_count++] = {
-                    rcx, rcy, fabsf(region.area())
-                };
-            }
-            continue;
-        }
-
-        // Collect strip segments for this region
-        struct StripSeg {
-            float y_rot;
-            float x_left;
-            float x_right;
-        };
-        std::vector<StripSeg> segments;
-        segments.reserve(64);
-
-        for (float ys = y_start; ys <= y_stop + 1e-4f; ys += mower_config_strip_step_m()) {
-            std::vector<float> xs = hLineIntersect(rot_pts, ys);
-
-            if (xs.size() % 2 != 0) {
-                if (g_unreachable_count < MAX_UNREACHABLE_ZONES) {
-                    float x_mid = 0.0f;
-                    for (float x : xs) x_mid += x;
-                    if (!xs.empty()) x_mid /= (float)xs.size();
-                    auto wc = rotatePoint(x_mid, ys, mow_angle);
-                    g_unreachable[g_unreachable_count++] = { wc.x, wc.y, 0.0f };
-                }
-                continue;
-            }
-
-            for (int k = 0; k + 1 < (int)xs.size(); k += 2) {
-                float xl = xs[k];
-                float xr = xs[k + 1];
-                if (xr - xl < mower_config_get().cut_disc_radius_m * 2.0f) {
-                    if (g_unreachable_count < MAX_UNREACHABLE_ZONES) {
-                        auto wc = rotatePoint((xl + xr) * 0.5f, ys, mow_angle);
-                        float area = (xr - xl) * mower_config_strip_step_m();
-                        g_unreachable[g_unreachable_count++] = { wc.x, wc.y, area };
-                    }
-                    continue;
-                }
-                segments.push_back({ ys, xl, xr });
-            }
-        }
-
-        if (segments.empty()) {
-            DBG_PRINTF("[CP] region %d: no valid strip segments\n", ri);
-            continue;
-        }
-
-        // ── Step 4 — Boustrophedon sequencing for this region ────────────────
-        struct StripWP {
-            Waypoint start;
-            Waypoint end;
-            bool     start_spur;
-            bool     end_spur;
-        };
-        std::vector<StripWP> strip_wps;
-        strip_wps.reserve(segments.size());
-
-        for (int s = 0; s < (int)segments.size(); s++) {
-            const StripSeg &seg = segments[s];
-            bool ltr = (s % 2 == 0);
-
-            float rot_xs_x = ltr ? seg.x_left  : seg.x_right;
-            float rot_xe_x = ltr ? seg.x_right : seg.x_left;
-            float heading  = ltr ? mow_angle
-                                 : wrapAngle(mow_angle + (float)M_PI);
-
-            auto ws = rotatePoint(rot_xs_x, seg.y_rot, mow_angle);
-            auto we = rotatePoint(rot_xe_x, seg.y_rot, mow_angle);
-
-            Waypoint wp_s = {};
-            wp_s.x        = ws.x;
-            wp_s.y        = ws.y;
-            wp_s.heading  = heading;
-            wp_s.mowing   = true;
-            wp_s.headland = false;
-
-            Waypoint wp_e = {};
-            wp_e.x        = we.x;
-            wp_e.y        = we.y;
-            wp_e.heading  = heading;
-            wp_e.mowing   = true;
-            wp_e.headland = false;
-
-            bool start_spur = isSpurTip(rot_xs_x);
-            bool end_spur   = isSpurTip(rot_xe_x);
-
-            strip_wps.push_back({ wp_s, wp_e, start_spur, end_spur });
-        }
-
-        // ── Step 5 — Append strip waypoints and transitions ─────────────────
-        for (int s = 0; s < (int)strip_wps.size(); s++) {
-            const StripWP &sw = strip_wps[s];
-
-            if (sw.start_spur && sw.end_spur) {
-                if (g_unreachable_count < MAX_UNREACHABLE_ZONES) {
-                    float scx = (sw.start.x + sw.end.x) * 0.5f;
-                    float scy = (sw.start.y + sw.end.y) * 0.5f;
-                    float dx = sw.end.x - sw.start.x;
-                    float dy = sw.end.y - sw.start.y;
-                    g_unreachable[g_unreachable_count++] = {
-                        scx, scy, sqrtf(dx*dx + dy*dy) * mower_config_strip_step_m()
-                    };
-                }
-                continue;
-            }
-
-            Waypoint fwd_s  = sw.start;  fwd_s.reverse = false;
-            Waypoint fwd_e  = sw.end;    fwd_e.reverse = false;
-            g_waypoints.push_back(fwd_s);
-            g_waypoints.push_back(fwd_e);
-
-            if (sw.end_spur) {
-                Waypoint rev    = sw.start;
-                rev.mowing      = true;
-                rev.reverse     = true;
-                g_waypoints.push_back(rev);
-                DBG_PRINTF("[CP] spur reverse wp at (%.2f, %.2f)\n",
-                              rev.x, rev.y);
-
-                if (s + 1 < (int)strip_wps.size()) {
-                    Waypoint exit_wp  = sw.start;
-                    exit_wp.mowing    = false;
-                    exit_wp.reverse   = false;
-                    addTransition(exit_wp, strip_wps[s + 1].start);
-                }
-            } else {
-                if (s + 1 < (int)strip_wps.size()) {
-                    addTransition(sw.end, strip_wps[s + 1].start);
-                }
-            }
-        }
-
-        DBG_PRINTF("[CP] region %d: %d strips\n", ri, (int)segments.size());
-    }  // end region loop
-
-    // ── Safety clamp: move any out-of-bounds waypoint to the nearest nav boundary point ──
-    // Catches waypoints that escaped due to concave-corner inset overshoot or
-    // any other geometry edge case.  O(waypoints × boundary_edges) — fast enough.
-    {
-        const int nb = (int)navBoundary.pts.size();
-        if (nb >= 3) {
-            int clamped = 0;
-            for (auto &wp : g_waypoints) {
-                if (!isInsidePolygon(navBoundary, wp.x, wp.y)) {
-                    float best_d2 = 1e30f;
-                    float best_x  = wp.x, best_y = wp.y;
-                    for (int ei = 0; ei < nb; ei++) {
-                        int ej = (ei + 1) % nb;
-                        float ax = navBoundary.pts[ei].x, ay = navBoundary.pts[ei].y;
-                        float bx = navBoundary.pts[ej].x, by = navBoundary.pts[ej].y;
-                        float dx = bx - ax, dy = by - ay;
-                        float lenSq = dx*dx + dy*dy;
-                        float t = (lenSq > 1e-6f)
-                                  ? clampf(((wp.x-ax)*dx + (wp.y-ay)*dy) / lenSq, 0.0f, 1.0f)
-                                  : 0.0f;
-                        float px = ax + t*dx, py = ay + t*dy;
-                        float ex = wp.x - px, ey = wp.y - py;
-                        float d2 = ex*ex + ey*ey;
-                        if (d2 < best_d2) { best_d2 = d2; best_x = px; best_y = py; }
-                    }
-                    wp.x = best_x;
-                    wp.y = best_y;
-                    clamped++;
-                }
-            }
-            if (clamped > 0) {
-                DBG_PRINTF("[CP] clamped %d waypoints to nav boundary\n", clamped);
-            }
+        if (pushed == 0) {
+            // Innermost ring of this area: plunge to its centre so the residual
+            // middle (inside the last ring, beyond the blade's reach) is cut.
+            Point c = polygonCentroid(ring);
+            Waypoint wp = {};
+            wp.x = c.x; wp.y = c.y; wp.heading = 0.0f;
+            wp.mowing = true; wp.headland = true; wp.reverse = false;
+            g_waypoints.push_back(wp);
+            prevEnd = c;
         }
     }
 
     // ── Finalise ──────────────────────────────────────────────────────────────
-    g_total_wp_count = (int)g_waypoints.size();
+    g_headland_wp_end_idx = (int)g_waypoints.size();   // entire plan is edge-following
+    g_total_wp_count      = (int)g_waypoints.size();
 
-    DBG_PRINTF("[CP] plan complete: %d headland, %d strip/transit, %d regions, %d unreachable\n",
-                  g_headland_wp_end_idx,
-                  g_total_wp_count - g_headland_wp_end_idx,
-                  (int)regions.size(),
-                  g_unreachable_count);
+    if (capped) {
+        DBG_PRINTF("[CP] spiral CAPPED at %d rings / %d wp (garden larger than buffer)\n",
+                      rings, g_total_wp_count);
+    }
+    DBG_PRINTF("[CP] spiral plan: %d rings, %d waypoints, step=%.2f m\n",
+                  rings, g_total_wp_count, step);
 
-    return true;
+    return g_total_wp_count > 0;
 }
 
 
@@ -818,11 +346,18 @@ void coverage_planner_report_obstacle(float x, float y, float approach_heading) 
 void coverage_planner_reset_to_nearest(float x, float y) {
     if (g_total_wp_count == 0) return;
 
+    // Search the ENTIRE waypoint list for the nearest point. g_wp_index is NOT a
+    // reliable "progress" cursor here: load_waypoints_from_planner() drains the planner
+    // via get_next(), leaving g_wp_index == g_total_wp_count. Searching only from
+    // g_wp_index (the old behaviour) scanned an empty range, left the index at the end,
+    // and made the caller's subsequent reload return 0 waypoints — silently ending
+    // AUTO. The state machine's own s_wp_index is the authoritative progress tracker,
+    // so resuming at the globally-nearest waypoint and re-handing the tail
+    // [nearest .. end] is the correct recovery.
     float best_dist = 1e9f;
-    int   best_idx  = g_wp_index;  // default: stay at current index
+    int   best_idx  = 0;
 
-    // Search only unvisited waypoints (from current index onward).
-    for (int i = g_wp_index; i < g_total_wp_count; i++) {
+    for (int i = 0; i < g_total_wp_count; i++) {
         float dx = g_waypoints[i].x - x;
         float dy = g_waypoints[i].y - y;
         float d  = sqrtf(dx * dx + dy * dy);

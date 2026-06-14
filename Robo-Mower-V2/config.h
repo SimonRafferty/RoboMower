@@ -120,22 +120,22 @@
 //  All dimensions in metres unless stated.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ── Robot footprint from steering centre ─────────────────────────────────────
-// These define the exclusion zone — no part of the robot may cross the perimeter.
-// During strip-end turns, the REAR swings outward — ROBOT_REAR_M dominates headland.
-#define ROBOT_FRONT_M             0.50f  // steering centre → front chassis edge [m]
-#define ROBOT_REAR_M              0.20f  // steering centre → rear chassis edge [m]
-#define ROBOT_LEFT_M              0.30f  // steering centre → left chassis edge [m]
-#define ROBOT_RIGHT_M             0.30f  // steering centre → right chassis edge [m]
+// ── Robot footprint — OVERALL bounding box (outer extents) ───────────────────
+// These are the outer dimensions of the robot's footprint and define the
+// boundary-clearance exclusion zone. The nav inset is HALF THE DIAGONAL of this
+// box (the radius the footprint corners sweep when the robot pivots on the spot)
+// — see mower_config_nav_inset_m(). Measure the true outer extents, including
+// any blade/guard overhang. (Steering centre assumed ~central in the box.)
+#define FOOTPRINT_WIDTH_M         0.60f  // overall width, outer edge to outer edge [m]
+#define FOOTPRINT_LENGTH_M        0.70f  // overall length, front-most to rear-most [m]
 
-// ── Chassis reference dimensions ─────────────────────────────────────────────
-#define CHASSIS_LENGTH_M          0.60f  // front to rear wheel centres [m]
-#define CHASSIS_WIDTH_M           0.50f  // left to right wheel centres (axle width) [m]
-
-// Track width for differential steering: use CHASSIS_WIDTH_M for front-drive config.
-// For diagonal drive: set to sqrtf(CHASSIS_LENGTH_M^2 + CHASSIS_WIDTH_M^2).
-// The equation dHeading = (dRight-dLeft)/TRACK_WIDTH_M is correct for both configs.
-#define TRACK_WIDTH_M             CHASSIS_WIDTH_M              // [m] — rear-differential config
+// ── Steering track (drivetrain) ──────────────────────────────────────────────
+// Distance between the two track/wheel CENTRELINES — NOT the overall width.
+// This is the kinematic track for differential steering odometry:
+//   dHeading = (dRight − dLeft) / TRACK_WIDTH_M.
+// For tracks of width w, this is (overall width − w): the steer reference runs
+// up the middle of each track. Seeds odo_calib, which then GPS-calibrates it.
+#define TRACK_WIDTH_M             0.50f  // track centre to centre [m]
 #define WHEEL_HALF_TRACK_M        (TRACK_WIDTH_M / 2.0f)       // [m] — half of track width
 
 // ── RTK antenna offset from steering centre ───────────────────────────────────
@@ -223,6 +223,13 @@
 // Runtime value is loaded from NVS; this is the compile-time default / fallback.
 #define BLADE_MAX_EXPECTED_CURRENT_A_DEFAULT   12.0f  // [A] — default before auto-calibration
 
+// Blade motor current LIMIT — must match the "Motor Current Max" set in VESC Tool.
+// This is the fixed 100%-load reference for the blade-load display and thresholds
+// (2026-06-13). Replaces the auto-calibrated reference, which was capturing the
+// idle current (~7 A) as 100% and so reading ~105% at idle. With this fixed 15 A
+// reference, idle (~7.5 A) reads ~50% and the HIGH (0.75) threshold sits at 11.25 A.
+#define BLADE_CURRENT_LIMIT_A      15.0f   // [A] — VESC blade motor current limit
+
 // Auto-calibration parameters (P90 of blade current during warmup phase)
 #define BLADE_CAL_WARMUP_MS        8000    // [ms] — warmup duration before P90 is computed
 #define BLADE_CAL_MIN_VALID_A      2.0f    // [A] — minimum current for a valid calibration sample
@@ -266,9 +273,68 @@
 #define PURE_PURSUIT_LOOKAHEAD_K   0.80f   // [s] — lookahead gain: total = base + K * speed
 #define PERIMETER_CLOSE_WINDOW    15    // points searched at each end of track for closest-endpoint close
 
+// Pivot-on-the-spot (tank turn). This is a tracked vehicle (MIN_TURNING_RADIUS_M=0):
+// when the heading error to the lookahead target is too large for a forward arc,
+// the AUTO follower spins in place (one track forward, one reverse) until roughly
+// aligned, then resumes forward pursuit. Lets it reach tight corner nodes that a
+// forward arc would overshoot. Hysteresis (enter > exit) prevents chatter.
+#define PIVOT_ENTER_DEG            55.0f  // [deg] — start pivoting when |heading error| exceeds this
+#define PIVOT_EXIT_DEG            12.0f  // [deg] — stop pivoting once |heading error| drops below this
+#define PIVOT_WHEEL_MS            0.18f  // [m/s] — per-track tangential speed during a pivot
+
+// Gyro-assisted heading during pivots (EKF heading-rate source selection).
+// Wheel odometry is the heading source for forward driving and gentle arcs and
+// is continuously corrected by GPS while the machine translates. But a zero-
+// radius pivot SCRUBS the tracks, so the effective track is far larger than the
+// GPS-arc-calibrated value and the odometry heading OVER-rotates (measured ~1.5×
+// on this machine); worse, GPS cannot correct it because there is no translation.
+// In that one regime — near-zero translation AND a real yaw rate — the EKF takes
+// its heading rate from the BMI270 gyro Z instead. The gyro is unreliable while
+// driving over bumpy ground at speed (why it is NOT used for general heading),
+// but a slow on-the-spot spin produces little vibration and the 1–2 s pivot is
+// too short to accumulate meaningful drift. Detect with odometry; measure with gyro.
+#define GYRO_HEADING_MAX_V_MS      0.12f  // [m/s] — use gyro for heading below this translation speed
+#define GYRO_HEADING_MIN_OMEGA     0.30f  // [rad/s] — ...and above this odometry yaw rate (~17°/s)
+
+// Node follower (drive branch): P-controller turns yaw rate from heading error.
+#define NODE_HEADING_KP           1.5f   // [1/s] — yaw rate = KP × heading error (rad)
+#define NODE_YAW_RATE_MAX         1.2f   // [rad/s] — cap on drive-branch yaw rate
+
+// AUTO-start heading bootstrap: establish a GPS heading before following nodes.
+#define AUTO_BOOTSTRAP_PERIM_MIN_M  2.0f   // [m] — PAUSE if perimeter nearer than this at AUTO start (heading unknown)
+#define AUTO_BOOTSTRAP_SPEED_MS     0.20f  // [m/s] — straight creep speed while establishing heading
+#define AUTO_BOOTSTRAP_MAX_MS       8000   // [ms] — give up establishing heading → PAUSE
+
 // RTK requirements
 #define RTK_MIN_FIX_FOR_LEARNING      4    // [fix_type] — 4=RTK fixed required during perimeter learning
-#define HEADING_FROM_GPS_MIN_DIST_M  0.30f // [m] — minimum travel between GPS fixes to use for heading
+#define HEADING_FROM_GPS_MIN_DIST_M  0.30f // [m] — minimum (floor) travel between GPS fixes to use for heading
+
+// ── GPS heading lock (2026-06-13) ─────────────────────────────────────────────
+// GPS travel direction is the only absolute heading truth, so when the mower has
+// driven a STRAIGHT, measurable distance the EKF heading is LOCKED onto it (strong
+// gain) rather than weakly blended. Between locks — and while turning on the spot
+// or before enough distance accumulates — heading is carried by the IMU/odometry.
+//   LOCK_GAIN     : fraction of the GPS-vs-EKF heading error applied per qualifying
+//                   fix (1.0 = full snap). High = decisive correction.
+//   STRAIGHT_MAX_TURN_RAD : if |heading change| since the reference exceeds this,
+//                   the segment wasn't straight → discard the chord, restart.
+//   DIST_SIGMA_K  : required travel = max(MIN_DIST, K × GPS sigma) so the chord is
+//                   long enough that GPS position noise gives an accurate heading
+//                   (e.g. 1 cm fixed → 0.3 m; 15 cm float → ~3 m).
+#define HEADING_GPS_LOCK_GAIN         0.80f
+#define HEADING_STRAIGHT_MAX_TURN_RAD 0.20f   // ~11 deg
+#define HEADING_GPS_DIST_SIGMA_K      20.0f
+
+// ── AUTO fault responses — TEMPORARILY DISABLED (2026-06-13) ──────────────────
+// The cutting-overload, wheel-stall ("crash"), wheel-slip and obstacle-suspected
+// detectors are unreliable (e.g. blade load reads 105% constantly → false
+// overload), so they spuriously toggle the blade and bounce AUTO into the
+// recovery sub-states (RETRACE/BOG_RECOVERY/OBSTACLE_AVOID) — one of which was
+// driving away at full speed on blade-start. While 0, AUTO just follows the
+// planned path and the BLADE IS CONTROLLED SOLELY BY THE OPERATOR (RC arm
+// switch), exactly like MANUAL. Tilt → PAUSE and perimeter/VESC safety stay
+// active. Set back to 1 once the detectors are fixed and recalibrated.
+#define AUTO_FAULT_RESPONSES_ENABLED  0
 
 // Obstacle avoidance
 #define OBSTACLE_BACKUP_DIST_M        0.40f   // [m] — reverse distance after collision (default; direction-adjusted)
@@ -439,27 +505,32 @@
 //  All formulas taken directly from spec (Physical Dimensions section).
 //
 //  Computed values for review (at default physical constants):
-//    NAV_EXCLUSION_INSET_M = max(max(0.30, 0.30), 0.25) + 0.05 = 0.35 m
+//    NAV_EXCLUSION_INSET_M = 0.5·√(0.60² + 0.70²) + 0.05      = 0.51 m
 //    BLADE_FORWARD_REACH_M = max(0.0, 0.0 + 0.21)              = 0.21 m
-//    HEADLAND_WIDTH_M      = max(max(0.57, 0.22), 0.23)         = 0.57 m
+//    HEADLAND_WIDTH_M      = max(max(0.57, 0.37), 0.23)        = 0.57 m
+//
+//  NOTE: these compile-time macros are not used by the firmware (the runtime
+//  mower_config_*() helpers are the live source). They are kept as documentation
+//  of the formulas and updated to match the overall-footprint model.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Inset 1: navigation exclusion boundary (most conservative chassis half-width + GPS margin)
-// The steering centre must remain inside (perimeter inset by this amount).
+// Inset 1: navigation exclusion boundary = HALF THE FOOTPRINT DIAGONAL + GPS margin.
+// The steering centre must stay this far inside the perimeter so that no footprint
+// corner sweeps past it when the robot pivots on the spot (see mower_config_nav_inset_m()).
 #define NAV_EXCLUSION_INSET_M \
-    (max(max(ROBOT_LEFT_M, ROBOT_RIGHT_M), WHEEL_HALF_TRACK_M) + 0.05f)
+    (0.5f * sqrtf(FOOTPRINT_WIDTH_M*FOOTPRINT_WIDTH_M + \
+                  FOOTPRINT_LENGTH_M*FOOTPRINT_LENGTH_M) + 0.05f)
 
 // Blade forward reach: distance the cut disc extends ahead of steering centre.
 // Zero or positive only — a rearward blade does not project forward into the headland.
 #define BLADE_FORWARD_REACH_M \
     (max(0.0f, STEER_CENTRE_TO_CUT_CENTRE_M + CUT_DISC_RADIUS_M))
 
-// Headland width: inset from nav boundary to working area boundary.
-// Dominant term for front-drive config is ROBOT_REAR_M (rear swing during turns).
-// Must accommodate: (a) minimum 1.5 strips, (b) rear chassis swing, (c) blade arc.
+// Headland width: inset from nav boundary to working area boundary (working area
+// is vestigial under the spiral planner but still derived/displayed).
 #define HEADLAND_WIDTH_M \
     (max(max(CUT_WIDTH_M * 1.5f, \
-             ROBOT_REAR_M + STRIP_OVERLAP_M), \
+             FOOTPRINT_LENGTH_M * 0.5f + STRIP_OVERLAP_M), \
          BLADE_FORWARD_REACH_M + STRIP_OVERLAP_M))
 
 // Blade target ERPM sent to blade VESC via CAN_PACKET_SET_RPM
