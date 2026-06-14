@@ -191,14 +191,13 @@ float ekf_get_position_uncertainty();
 void ekf_reset_covariance();
 
 /**
- * @brief True once a GPS heading correction has been applied at least once
- *        since boot (or RESETEKF).
+ * @brief True once a GPS heading-offset trim has been applied at least once
+ *        since boot (or RESETEKF) — i.e. the BNO heading has been GPS-referenced.
  *
- * After this, the heading is trustworthy and is carried by wheel odometry
- * through on-the-spot pivots. The AUTO-start bootstrap waits for this before
- * following nodes (otherwise it would steer on a stale/unknown heading).
- *
- * Thread-safe: single bool — atomic read.
+ * Heading itself comes from the BNO055 absolute fusion + GPS-trimmed offset; this
+ * flag only records that the offset has been GPS-trimmed at least once. Currently
+ * unused by callers (the old AUTO bootstrap that consumed it was removed) — kept
+ * for diagnostics. Thread-safe: single bool — atomic read.
  */
 bool ekf_heading_is_established();
 

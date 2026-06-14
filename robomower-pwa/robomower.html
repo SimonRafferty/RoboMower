@@ -1429,7 +1429,7 @@ function buildDashboard(telem) {
     return `<span class="mod-chip ${cls}" title="${tip}">${label}</span>`;
   }
   const modHtml = `
-    ${chip('IMU',     bleConnected ? m.imu !== 0 : null, 'BMI270 inertial measurement unit — provides heading, collision detection, and tilt safety')}
+    ${chip('IMU',     bleConnected ? m.imu !== 0 : null, 'BNO055 9-axis IMU — on-chip fusion provides absolute heading, collision detection, and tilt safety')}
     ${chipTristate(gpsLabel, gpsClass, 'u-blox RTK GPS receiver. RTK Fixed = cm-level accuracy. No Fix or Autonomous = not accurate enough for mowing')}
     ${chip('RC',      bleConnected ? m.rc  !== 0 : null, 'ELRS RC receiver (CRSF protocol). Provides manual control, arm switch (CH6), and pause (CH7)')}
     ${chip('CAN Bus', bleConnected ? m.can !== 0 : null, 'TWAI/CAN bus connecting the ESP32 to the three VESC motor controllers')}
@@ -1555,15 +1555,15 @@ function buildDiagnostics(d) {
   const fixNames = {0:'None',1:'GPS',2:'DGPS',4:'RTK Fixed',5:'RTK Float'};
 
   return `
-    <div class="diag-card" title="BMI270 inertial measurement unit — heading, gyro rate, and bias calibration">
-      <div class="card-title">IMU (BMI270)</div>
+    <div class="diag-card" title="BNO055 9-axis IMU — absolute heading, gyro rate, and sensor-fusion calibration (sys/gyro/accel/mag)">
+      <div class="card-title">IMU (BNO055)</div>
       ${tbl(
         row('Status', d.imu?.ok ? 'OK' : 'FAULT', d.imu?.ok ? 'diag-ok' : 'diag-stale') +
         row('Pitch', (d.imu?.pitch?.toFixed(1) ?? '?') + '\u00b0') +
         row('Roll', (d.imu?.roll?.toFixed(1) ?? '?') + '\u00b0') +
         row('Yaw (heading)', hdgDeg + '\u00b0') +
         row('Gyro Z rate', gzDegS + '\u00b0/s') +
-        row('Gyro bias', (d.imu?.bias?.toFixed(5) ?? '?') + ' rad/s') +
+        row('Calib s/g/a/m', (d.imu?.cal != null ? `${(d.imu.cal>>6)&3}/${(d.imu.cal>>4)&3}/${(d.imu.cal>>2)&3}/${d.imu.cal&3}` : '?')) +
         row('Surge (fwd)', (d.imu?.surge?.toFixed(3) ?? '?') + ' g') +
         row('Sway (right)', (d.imu?.sway?.toFixed(3) ?? '?') + ' g') +
         row('Heave (up)', (d.imu?.heave?.toFixed(3) ?? '?') + ' g')

@@ -298,8 +298,12 @@ void ekf_predict(float v_left, float v_right, float dt) {
         s_prev_bno_hdg   = bno;
         s_prev_bno_valid = true;
         s_theta = heading_compose(bno, s_hdg_offset);
+    } else {
+        // BNO faulted — hold s_theta, do not accrue turn (AUTO pauses). Drop the
+        // previous-sample reference so turn-accum restarts cleanly on recovery
+        // (avoids a spurious lump measured across the fault gap).
+        s_prev_bno_valid = false;
     }
-    // else: BNO faulted — hold s_theta, do not accrue turn (AUTO pauses).
 
     // ── Position dead-reckoning ──────────────────────────────────────────────
     float theta = s_theta;
