@@ -43,6 +43,10 @@ static volatile float   s_accel_x       = 0.0f;   // g, surge fwd+
 static volatile float   s_accel_y       = 0.0f;   // g, sway right+
 static volatile float   s_accel_z       = 0.0f;   // g, heave up+
 static volatile uint8_t s_calib         = 0;      // packed sys/gyro/accel/mag
+// The status flags below are a deliberately lock-free cross-core handshake: each
+// is a single aligned byte/word (atomic on this target), so `volatile` visibility
+// is sufficient and a spinlock would only add cost. Core 1 sets s_force_recal /
+// s_profile_saved (imu_recalibrate); Core 0 (imu_task) clears / reads them.
 static volatile bool    s_imu_fault     = false;
 static volatile bool    s_initialized   = false;
 static volatile bool    s_force_recal   = false;  // imu_recalibrate() request
@@ -175,6 +179,9 @@ static void imu_task(void* pv) {
         vTaskDelayUntil(&wake, period);
 
         // Handle a recalibration request: re-init NDOF (drops the live profile).
+        // The 25 ms mode-switch briefly stalls publishing — acceptable for this
+        // operator-triggered one-shot (s_last_valid_ms is refreshed on the next
+        // good sample, so it does not trip the fault timer).
         if (s_force_recal) {
             s_force_recal = false;
             s_bno.setMode(OPERATION_MODE_CONFIG);

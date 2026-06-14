@@ -388,7 +388,7 @@
 #define TILT_LIMIT_NORMAL_DEG        30.0f   // [deg] max tilt in normal operation
 #define TILT_LIMIT_CAREFUL_DEG       15.0f   // [deg] max tilt when margin is low
 #define COLLISION_MULT_CAREFUL        3.0f   // collision multiplier when margin is low
-#define TILT_EMA_ALPHA               0.016f  // EMA filter for tilt (~0.3s at 200Hz)
+#define TILT_EMA_ALPHA               0.016f  // EMA filter for tilt/pitch/roll (~0.6s at the 100Hz IMU task)
 
 // ── Heading stabilisation ────────────────────────────────────────────────────
 // Gains in [(m/s)/rad] and [(m/s)/(rad/s)].
