@@ -8,7 +8,7 @@
 -- ║    Requires EdgeTX 2.7 or later                                      ║
 -- ║                                                                      ║
 -- ║  CRSF TELEMETRY                                                      ║
--- ║    0x80  MOWER_STATUS — 13-byte custom payload (see spec)            ║
+-- ║    0x80  MOWER_STATUS — 20-byte custom payload (see spec)            ║
 -- ║    GPS / Battery / Attitude / FlightMode are consumed by EdgeTX      ║
 -- ║    internally and do NOT arrive via crossfireTelemetryPop().         ║
 -- ║    Heading and speed are read via getValue() (EdgeTX native sensors).║
@@ -496,6 +496,8 @@ local function create(zone, opts)
         flags      = 0,
         prev_flags = 0,   -- used to detect rising edge on beep bits 7:6
         direct_decode = false,  -- true once extended 0x80 payload (>=19 B) seen
+        calib         = 0,      -- packed BNO calibration byte (0x80 offset 19)
+        have_calib    = false,  -- true once a >=20 B payload has been seen
         state_str  = "INIT",
         ekf_mm     = 9999,  -- EKF position uncertainty mm, from MOWER_STATUS offsets 9-10
         voltage    = 0.0,
@@ -560,6 +562,12 @@ local function parse_telemetry(widget)
                 widget.voltage = bit32.bor(bit32.lshift(data[16] or 0, 8), data[17] or 0) / 100
                 widget.heading = bit32.bor(bit32.lshift(data[18] or 0, 8), data[19] or 0) / 10
                 widget.direct_decode = true
+            end
+            -- Calibration byte (firmware >= 2026-06-14): BNO sys/gyro/accel/mag.
+            -- data[20] = offset 19: bits 7:6 sys, 5:4 gyro, 3:2 accel, 1:0 mag.
+            if #data >= 20 then
+                widget.calib      = data[20] or 0
+                widget.have_calib = true
             end
         end
         cmd, data = crossfireTelemetryPop()
@@ -631,6 +639,23 @@ local function refresh(widget, event, touchState)
     draw_right_panel(widget.state_str)
     draw_vesc_bar(widget.state_str, blade_on, is_bog)
     draw_dividers()
+
+    -- Magnetometer-calibration prompt: when the BNO heading is not yet
+    -- trustworthy (sys < 2 or mag < 2), flash a banner telling the operator to
+    -- drive slow loops in MANUAL. One-time after first setup (profile persists).
+    if widget.have_calib then
+        local cal     = widget.calib or 0
+        local cal_sys = bit32.band(bit32.rshift(cal, 6), 0x03)
+        local cal_mag = bit32.band(cal, 0x03)
+        if not (cal_sys >= 2 and cal_mag >= 2) then
+            if math.floor(getTime() / 50) % 2 == 0 then
+                lcd.drawFilledRectangle(0, HDR_H + 1, SCR_W, 22, C_AMBER)
+                lcd.drawText(SCR_W / 2, HDR_H + 3,
+                    string.format("MAG CAL %d/3  -  DRIVE SLOW LOOPS (MANUAL)", cal_mag),
+                    FXS + FCENT + lcd.RGB(0, 0, 0))
+            end
+        end
+    end
 
     -- Battery warning banner (MOWER_STATUS flags bit 0x20): the firmware
     -- raises this on BATTERY WARNING/LOW. Flash ~1 Hz over the bottom strip.
