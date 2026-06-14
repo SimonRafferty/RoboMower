@@ -112,23 +112,18 @@ Mat2 mat2_inverse(const Mat2 &mat);
 void ekf_init();
 
 /**
- * @brief EKF prediction step — differential wheel odometry. Call at 10 Hz from Core 1.
+ * @brief EKF prediction step. Call at 10 Hz from Core 1.
  *
- * Propagates state forward using differential drive kinematics:
- *   dx = v·sin(θ)·dt,  dy = v·cos(θ)·dt,  dθ = (v_left-v_right)/track·dt
- * Heading normally comes from the wheel differential (no magnetometer; wheel
- * odometry is self-correcting via GPS while translating). EXCEPTION: during an
- * on-the-spot pivot (near-zero translation + real yaw) the odometry over-rotates
- * from track scrub and GPS cannot correct it, so the heading rate is taken from
- * the gyro instead. See GYRO_HEADING_* in config.h.
+ * Heading is taken directly from the BNO055 absolute fusion plus the
+ * GPS-trimmed offset (imu_get_heading_fused() + offset) — no integration. If the
+ * BNO has faulted (imu_is_fault()), heading is held (AUTO pauses elsewhere).
+ * Position dead-reckons: dx = v·sinθ·dt, dy = v·cosθ·dt.
  *
- * @param v_left      Left wheel surface velocity (m/s).
- * @param v_right     Right wheel surface velocity (m/s).
- * @param gyro_rate_cw Gyro Z yaw rate, bias-corrected, CW-positive (rad/s) —
- *                     used for heading ONLY during pivots (see above).
- * @param dt          Time step (seconds).
+ * @param v_left   Left wheel surface velocity (m/s).
+ * @param v_right  Right wheel surface velocity (m/s).
+ * @param dt       Time step (seconds).
  */
-void ekf_predict(float v_left, float v_right, float gyro_rate_cw, float dt);
+void ekf_predict(float v_left, float v_right, float dt);
 
 /**
  * @brief EKF GPS position (and optional heading) update. Call at 1 Hz from Core 0.
@@ -228,6 +223,13 @@ bool ekf_get_gps_heading_event(uint32_t *seq, float *theta,
  * @brief Heading 1-sigma uncertainty (rad) = sqrt(P[2][2]). Thread-safe.
  */
 float ekf_get_heading_uncertainty();
+
+/** Current GPS-trimmed heading offset (rad) = heading − BNO_fused. Thread-safe. */
+float ekf_get_heading_offset();
+
+/** Persist the heading offset to NVS if it has changed enough and the throttle
+ *  interval has elapsed. Call from the 10 Hz hook (Core 1). */
+void ekf_save_heading_offset_if_due();
 
 /**
  * @brief Returns true once the EKF has received its first valid GPS fix.
