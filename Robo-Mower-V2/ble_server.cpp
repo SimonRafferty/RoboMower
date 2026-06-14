@@ -250,6 +250,10 @@ static String build_telemetry_json() {
     // Module health (1 = ok, 0 = fault/offline/timeout)
     uint32_t now_ms = millis();
     int mod_imu  = (imu_is_present() && !imu_is_fault())                        ? 1 : 0;
+    uint8_t imu_cal  = imu_get_calib_status();
+    int     cal_sys  = (imu_cal >> 6) & 0x03;
+    int     cal_mag  =  imu_cal       & 0x03;
+    bool    hdg_conf = imu_heading_is_confident();
     int mod_gps  = rtk_gps_is_timeout()                                         ? 0 : 1;
     int mod_rc   = crsf_is_failsafe()                                           ? 0 : 1;
     int mod_can  = vesc_can_bus_ok()                                            ? 1 : 0;
@@ -260,7 +264,7 @@ static String build_telemetry_json() {
     // the state machine has been running long enough that a real absence is meaningful.
     if (now_ms < 5000) { mod_vl = mod_vr = mod_vb = 1; }
 
-    char buf[700];
+    char buf[768];   // headroom for IMU calibration fields
     int len = snprintf(buf, sizeof(buf),
         "{\"t\":%lu,\"state\":\"%s\","
         "\"x\":%.3f,\"y\":%.3f,\"hdg\":%.3f,"
@@ -278,6 +282,7 @@ static String build_telemetry_json() {
         "\"blePause\":%s,\"bleArm\":%s,"
         "\"bladeCmd\":%s,\"bladeLock\":%s,"
         "\"ch6Us\":%d,"
+        "\"imuCalSys\":%d,\"imuCalMag\":%d,\"headingConfident\":%s,"
         "\"mod\":{\"imu\":%d,\"gps\":%d,\"rc\":%d,\"can\":%d,\"vL\":%d,\"vR\":%d,\"vB\":%d}}",
         (unsigned long)millis(), sname,
         pose.x, pose.y, pose.heading,
@@ -301,6 +306,7 @@ static String build_telemetry_json() {
         state_machine_is_blade_commanded()    ? "true" : "false",
         state_machine_is_blade_lockout()      ? "true" : "false",
         (int)state_machine_get_ch6_us(),
+        cal_sys, cal_mag, hdg_conf ? "true" : "false",
         mod_imu, mod_gps, mod_rc, mod_can, mod_vl, mod_vr, mod_vb);
 
     if (len > 0 && len < (int)sizeof(buf)) return String(buf);
