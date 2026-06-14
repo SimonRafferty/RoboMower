@@ -215,11 +215,11 @@ magnetometer** calibration are good (e.g. both ≥ 2).
 - The **≥2 m perimeter-clearance** requirement and the **straight-creep** are
   both **removed**.
 - AUTO starts immediately when `imu_heading_is_confident()`.
-- Otherwise PAUSE with an operator message: *drive slow loops in MANUAL to
-  calibrate the magnetometer*.
+- Otherwise PAUSE with an operator message pointing to the recalibration flow
+  (§8.1): *drive slow loops in MANUAL to calibrate the magnetometer*.
 
 **During AUTO:** the same condition is monitored continuously; if it goes false
-(§5.6), AUTO pauses and prompts recalibration rather than degrading.
+(§5.6), AUTO pauses and prompts recalibration (§8.1) rather than degrading.
 
 ## 8. Magnetometer calibration UX
 
@@ -236,6 +236,36 @@ re-converges almost immediately on later boots.
 - **TX16S Lua widget:** when `imu_heading_is_confident()` is false, display e.g.
   `MAG CAL n/3 — drive slow loops (MANUAL)`; clear once confident. Same condition
   that gates AUTO start.
+
+### 8.1 Operator-triggered recalibration
+
+When heading is not confident (`!imu_heading_is_confident()`) — at first setup,
+or after a confidence loss that paused AUTO (§5.6) — both UIs raise a warning and
+offer a guided recalibration the operator can kick off and complete by driving.
+
+- **Warning surfacing (both UIs):**
+  - *TX16S Lua widget:* flashing `MAG CAL n/3 — drive slow loops (MANUAL)` banner
+    (the §8 condition).
+  - *PWA:* a warning banner/toast (same pattern as the battery warning) plus a
+    **"Recalibrate compass"** button.
+- **Kick-off:** the PWA button sends a new BLE command **`RECAL_IMU`** (handled
+  in `handle_ble_command()`), which clears the stored `bnocal` profile so the BNO
+  relearns from scratch and starts a calibration session.
+  - *RC-side constraint:* CH1–CH8 are fully assigned, so the TX16S shows the
+    warning + live progress but has no spare control to trigger recal. This is
+    acceptable because **driving loops in MANUAL drives calibration regardless**
+    of an explicit trigger; the PWA button is the explicit affordance (and exists
+    mainly to force a *fresh* learn by clearing the old profile). A future
+    switch/combo could trigger it if a channel frees up.
+- **The drive:** operator drives slow loops/circles in **MANUAL**; mag
+  calibration rises as varied headings are seen. Both UIs show live `sys`/`mag`
+  0–3 progress.
+- **Completion:** when calibration reaches good and `imu_heading_is_confident()`
+  is true, the new 22-byte profile is **saved to NVS** (`bnocal`), the warning
+  clears, the PWA shows success, and AUTO can be (re)started.
+- **Telemetry for the PWA:** the STATUS/TELEM JSON gains `imuCalSys`,
+  `imuCalMag` (0–3) and a `headingConfident` bool to drive the banner, the live
+  progress, and the button's enabled/spinner state.
 
 ## 9. Collision framework rewrite (left disabled)
 
