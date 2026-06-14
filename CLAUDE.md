@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ESP32-S3 firmware for an autonomous RTK GPS lawnmower robot. VESC motor controllers over CAN bus, a BMI270 IMU (**being replaced by a BNO055** — see *Planned: BNO055 IMU swap*), CRSF radio (RadioMaster TX16S + ER8 receiver), and a **concentric inward spiral** coverage planner (replaced boustrophedon strips 2026-06-13) built on the vendored Clipper2 polygon-offset library.
+ESP32-S3 firmware for an autonomous RTK GPS lawnmower robot. VESC motor controllers over CAN bus, a Bosch **BNO055** 9-axis IMU (on-chip NDOF fusion → tilt-compensated absolute heading), CRSF radio (RadioMaster TX16S + ER8 receiver), and a **concentric inward spiral** coverage planner (replaced boustrophedon strips 2026-06-13) built on the vendored Clipper2 polygon-offset library.
 
 > **Read first:** *Known Issues & TODO* below — much changed on 2026-06-13/14, be wary of stale assumptions.
 
@@ -25,7 +25,7 @@ Open `Robo-Mower-V2/Robo-Mower-V2.ino`. Required board settings:
 | PSRAM | OPI PSRAM |
 | USB Mode | Hardware CDC and JTAG |
 
-Required libraries (Library Manager): `SparkFun BMI270 Arduino Library` (IMU — until the BNO055 swap, then e.g. `Adafruit_BNO055`) and `FastLED`.
+Required libraries (Library Manager): `Adafruit BNO055` (+ `Adafruit Unified Sensor`) (IMU) and `FastLED`.
 
 **Clipper2 is vendored in-tree** at `Robo-Mower-V2/src/clipper2/` (Boost license) — Arduino compiles the sketch's `src/` subtree automatically; no install needed.
 
@@ -84,14 +84,11 @@ $cl = "../Robo-Mower-V2/src/clipper2"
 
 **Coverage planning (spiral): working.** Covers concave gardens, pinched side-arms, uniform spacing perimeter-inward, ring bridges, centre plunge. Residual: a tiny uncut patch at each area's centre (single centroid plunge) — could upgrade to a short cross if needed.
 
-**Heading: the main open problem (reason for the BNO055 swap).**
-- AUTO heading was wrong (often ~90° off) and didn't self-correct at creep speed; manual was fine. Addressed 2026-06-13 by the **GPS heading LOCK** (lock to GPS travel direction on straight+measurable segments, IMU between — see EKF section). Should help a lot but is **unverified on hardware**.
-- **Gyro-during-pivot can hunt** (turns one way then reverses) — the BMI270 gyro path is the weak link; the BNO055 swap is meant to replace this whole area with a fused absolute heading + GPS-trimmed offset.
-- Residual risk: a badly-wrong heading after a pivot can make the node-follower curve to chase the node and never travel straight enough to re-lock (circling). The AUTO bootstrap (straight creep at entry) establishes heading cleanly to start.
+**Heading: BNO055 absolute fusion + GPS-trimmed offset.** Heading comes from the BNO055 (NDOF, tilt-compensated) plus an offset slowly trimmed from the GPS travel chord on straight RTK runs and persisted to NVS. No wheel-odometry heading, no gyro-pivot hack, no GPS-lock blend, no AUTO bootstrap creep. AUTO requires `imu_heading_is_confident()` (BNO sys+mag calibration) and pauses if confidence is lost — there is **no** fallback to a lesser heading source (recalibrate or fix the mounting instead). **Unverified on hardware** until the BNO is wired (see the implementation plans under `docs/superpowers/plans/`).
 
 **Disabled / vestigial:**
 - **AUTO fault responses OFF** (`AUTO_FAULT_RESPONSES_ENABLED 0`): overload→RETRACE, stall→BOG_RECOVERY, obstacle→OBSTACLE_AVOID, follower-stall/slip all gated off. Blade is **RC-only** in AUTO. Only **tilt** and **collision** remain (plus always-on perimeter-breach / VESC-silence). Re-enable when detectors are trustworthy.
-- **Collision detection does NOT work** — needs a full re-tune (to be redone with the BNO055 accelerometer, so no loss).
+- **Collision detection is DISABLED** — re-seated on the BNO055 linear accelerometer (fresh NVS baseline `baseline_v2`, capture logging via `COLL base=… jolt=…`) but left off pending a real normal-driving baseline; re-enable when a trustworthy threshold is known.
 - **Blade load %** is display-only (fixed `BLADE_CURRENT_LIMIT_A` reference); auto-cal still writes NVS `blade_cal` but its value is unused.
 - **Nav boundary / working area** still derived/stored/displayed but **unused for navigation** (the perimeter is the centre-limit; spiral & breach use it directly).
 - **Battery auto-return** removed (operator decision; revisit when the mower can self-charge).
@@ -101,20 +98,7 @@ $cl = "../Robo-Mower-V2/src/clipper2"
 - After the `mow_cfg` v10→v11 bump, **saved MowerConfig reset to defaults** — operator must re-enter footprint W×L, track width, and tuning (perimeter & odocal survive in their own keys).
 - `BLADE_CURRENT_LIMIT_A` (config.h) must match the VESC Tool "Motor Current Max".
 
-**Pivot/turn tuning** (`PIVOT_*`, `GYRO_HEADING_*`, `NODE_*` in config.h) is still rough — revisit after the BNO055 gives a trustworthy heading.
-
-## Planned: BNO055 IMU swap (replaces the BMI270)
-
-**Decision (2026-06-14):** swap the 6-axis BMI270 for a 9-axis **BNO055** (on-chip fusion) for a continuous tilt-compensated **absolute heading** at standstill / during pivots / under patchy tree cover — the gap GPS-travel-heading can't fill. (Dual-antenna RTK heading was rejected: too costly, little benefit under tree cover.) Replaces the BMI270 outright — no PCB space for both.
-
-When the part arrives:
-- **Same I²C bus dropped to 100 kHz** (BNO055 clock-stretch quirk). Confirm comms, then set the BNO **axis-remap register** to the robot frame (surge fwd+, sway right+, heave up+, heading CW-from-North+) before anything else.
-- **Keep the `imu_*()` API** — rewrite driver internals (new `imu_bno055.cpp`, or repurpose `imu_bmi270.*`) so `collision_detect` / `safety` (tilt) / `node_follower` / `state_machine` consumers don't change; add one getter for the fused heading.
-- **Role mapping:** tilt → BNO Euler pitch/roll (better than raw-accel atan2); gyro Z → BNO gyro; accel → BNO accel (m/s², so **re-tune collision** — consider BNO *linear* accel for jolts); heading → BNO fused.
-- **Heading simplifies to** `heading = BNO_heading + offset`, offset slowly trimmed from GPS travel-direction on straight RTK runs (reuse the `s_hdg_turn_accum` straight detector + distance gate). Deletes the gyro-pivot hack and most GPS-lock gymnastics; the EKF stops integrating heading (still does position); robust to GPS outages (offset holds); heading known instantly at AUTO start (no bootstrap creep).
-- **Mag-distortion test first:** log BNO heading vs GPS travel-heading while varying drive + blade load. If it swings, fall back to **IMUPLUS** (gyro+accel, no mag). Mounting is ~150 mm from the motors; 304 stainless does NOT shield — distance is what helps.
-- **NVS:** store the BNO 22-byte calibration profile (repurpose the `gyrobias` key, namespace `imu`) so the mag isn't re-learned each boot; the 2.5 s boot gyro-cal (`imu_collect_bias`) goes away.
-- **Order:** I²C + axis map → mag-distortion test → wire heading + GPS offset into the EKF → re-tune collision.
+**Pivot/turn tuning** (`PIVOT_*`, `NODE_*` in config.h) is still rough — revisit on hardware now that the BNO055 supplies a trustworthy heading.
 
 ## Architecture
 
@@ -124,6 +108,7 @@ When the part arrives:
 config.h            — All #define constants: pins, physical dims, tuning, derived values; DEBUG_SERIAL=0 by default
 mower_config.h/.cpp — Runtime-configurable MowerConfig struct; BLE SET_CONFIG updates this
 geometry.h/.cpp     — 2D polygon maths (hull, intersect, point-in-poly); hand-rolled inset kept for unit tests only
+heading_fusion.h/.cpp — pure (host-testable) helpers: GPS straight-segment gate, wrap-safe offset EMA, heading compose
 clipper_offset.h/.cpp — robust polygon inset via vendored Clipper2 (src/clipper2/); spiral rings + nav/working-area insets
 src/clipper2/       — vendored Clipper2 library (Boost license; the offset engine libslic3r/OpenMower use)
 nvs_storage.h/.cpp  — All NVS persistence (Preferences + blob API); CRC32 on every blob
@@ -131,11 +116,11 @@ crsf_input.h/.cpp   — CRSF RC frame parse (420 kbaud, Serial2); FreeRTOS task 
 crsf_telemetry.h/.cpp — 5-frame telemetry rotation to TX16S (FlightMode, GPS, Battery, MOWER_STATUS 0x80, Attitude)
 vesc_can.h/.cpp     — TWAI/CAN driver; SET_DUTY / SET_CURRENT / SET_RPM; STATUS_1–5 reception
 rtk_gps.h/.cpp      — DFRobot RTK LoRa GPS via DFRobot_RTK_LoRa library (request/response, Serial1); ENU origin management; Core 0 task
-imu_bmi270.h/.cpp   — BMI270 I2C @200 Hz; gyro bias; feeds EKF + collision + tilt. **Being replaced by a BNO055 — see Planned swap; imu_*() API kept.**
+imu.h / imu_bno055.cpp — BNO055 I2C @100 Hz (NDOF fusion); tilt-compensated absolute heading + tilt/pitch/roll + linear accel; feeds EKF + collision + tilt. Calibration profile + heading offset persisted to NVS.
 collision_detect.h/.cpp — Adaptive-baseline jolt detector; direction (fwd/side/rear) classification
 servo_output.h/.cpp — Cut-height servo; LEDC PWM; fixed 1000–2000 µs calibration (#defines, no NVS cal)
 obstacle_map.h/.cpp — Grid of detected obstacle positions; routes around them
-ekf_localiser.h/.cpp — 4-state EKF [x, y, θ, v]; GPS + differential-wheel-odometry fusion (gyro NOT used for heading); reverse-aware GPS heading; publishes heading events for odo_calib; ENU frame
+ekf_localiser.h/.cpp — 4-state EKF [x, y, θ, v]; position from GPS + wheel-odometry dead-reckoning; heading = BNO055 absolute fusion + GPS-trimmed offset; publishes heading events for odo_calib; ENU frame
 perimeter.h/.cpp    — Polygon record/save/load; derives nav boundary and working area
 cutting_monitor.h/.cpp — Blade current monitoring; load fractions; CUTTING_STALLED / OVERLOADED / OBSTACLE_SUSPECTED
 coverage_planner.h/.cpp — Concentric inward spiral planner (replaced boustrophedon 2026-06-13); insets the perimeter ring-by-ring to the centre
@@ -185,10 +170,9 @@ The legacy **Nav boundary** (perimeter inset by `NAV_EXCLUSION_INSET_M`) and **W
 ### EKF localiser
 
 4-state `[x(m), y(m), θ(rad), v(m/s)]` in local ENU (origin set by perimeter upload, else auto-seeded at the first RTK-fixed fix; persisted in NVS).
-- **`ekf_predict(v_left, v_right, gyro_rate_cw, dt)`** @10 Hz — heading from **differential wheel odometry** `(vL−vR)/track`. **The gyro is deliberately NOT used for general heading** (bumpy ground + near-zero wheel slip → odometry is the better source); requires live drive-VESC eRPM frames. **Pivot exception (2026-06-13):** during an on-the-spot pivot (`|v|<GYRO_HEADING_MAX_V_MS=0.12` and `|omega_odo|>GYRO_HEADING_MIN_OMEGA=0.30`), the heading rate comes from gyro Z (`imu_get_gz_rads()`, bias-corrected, CW+) — a zero-radius tank pivot scrubs the tracks so odometry over-rotates ~1.5× (a 90° pivot read 135°) and GPS can't correct with no translation. Forward driving/arcs are unchanged. **Status: pivot can hunt; tuning is a follow-up.**
-- **`ekf_update_gps()`** @~1 Hz — position **snaps** to GPS. Innovation gate `max(5σ, 5 m)`; bypassed for the first fix (cold-start seed).
-- **Heading LOCK to GPS (2026-06-13).** GPS travel direction is the only absolute heading truth, so heading is **locked** to it (strong gain `HEADING_GPS_LOCK_GAIN=0.8`, not a weak blend) whenever the segment since the last reference was **straight + measurable**; otherwise IMU/odometry carries it. Gates: (1) RTK `fix_type>=4`; (2) **straight** — `s_hdg_turn_accum` (Σ|ω·dt| since the reference, summed in `ekf_predict`) `< HEADING_STRAIGHT_MAX_TURN_RAD` (0.20 rad ≈11°), else the chord is discarded and the segment restarts; (3) **measurable** — travel `> max(HEADING_FROM_GPS_MIN_DIST_M=0.30, HEADING_GPS_DIST_SIGMA_K×σ)` (≈0.3 m RTK-fixed, ~3 m float). At creep the reference is held and travel accumulates across fixes (fixed the "no correction at creep" bug). Reverse-corrected (front-facing) when `s_v<-0.03`. Replaced the old weak `K=P/(P+R)` blend that left heading 90° off over 10 m at creep.
-- Reported uncertainty = last GPS σ.
+- **`ekf_predict(v_left, v_right, dt)`** @10 Hz — heading is set directly from the **BNO055 absolute fusion + a GPS-trimmed offset** (`imu_get_heading_fused() + s_hdg_offset`); no integration. Position dead-reckons (`dx=v·sinθ·dt`, `dy=v·cosθ·dt`) between GPS fixes. If the BNO faults (`imu_is_fault()`), heading is **held** (AUTO pauses elsewhere) — there is no odometry/gyro heading fallback.
+- **`ekf_update_gps()`** @~1 Hz — position **snaps** to GPS (innovation gate `max(5σ, 5 m)`, cold-start bypass). On a **straight, measurable** RTK segment (`s_hdg_turn_accum < HEADING_STRAIGHT_MAX_TURN_RAD` AND travel `> max(HEADING_FROM_GPS_MIN_DIST_M, HEADING_GPS_DIST_SIGMA_K·σ)`) the GPS travel chord trims the **heading offset** by a slow EMA (`HEADING_OFFSET_TRIM_GAIN`), reverse-corrected when reversing. The offset is persisted to NVS (`imu`/`hdgoff`), so absolute heading is correct at boot and robust to GPS outages. The offset-trim math is the pure `heading_fusion` module (host-tested).
+- Reported uncertainty = last GPS σ; heading variance is fixed small (`EKF_HDG_VAR_BNO`) while the BNO is healthy.
 
 ### VESC motor control
 
@@ -240,16 +224,15 @@ All in `config.h` (~lines 57–100). Key pins: CAN TX/RX GPIO2/1 · servo GPIO5 
 `crsf_telemetry.cpp:292` `sendMowerStatus()` — **19-byte** payload: state, progress, cut height, blade load, fix type, flags (+beep bits 7:6), obstacle count, EKF uncertainty, mowed area, **battery V×100 and heading deg×10 (offsets 15–18, added 2026-06-10 so the Lua widget doesn't depend on EdgeTX `RxBt`/`Yaw` sensor discovery)**. The Lua accepts both 15- and 19-byte payloads.
 
 ### EKF localiser (detail in *Architecture › EKF localiser*)
-- Prediction (differential wheel-odometry @10 Hz): `ekf_localiser.cpp` `ekf_predict()` — `omega_odo = (vL−vR)/odo_cal_track_m()`; fed SCALED wheel velocities. Pivot exception: gyro Z (`gyro_rate_cw` arg) when `|v|<GYRO_HEADING_MAX_V_MS` and `|omega_odo|>GYRO_HEADING_MIN_OMEGA`.
-- GPS update + innovation gate (max(5σ, 5 m), cold-start bypass): `ekf_update_gps()`.
-- **GPS heading LOCK:** locked (gain `HEADING_GPS_LOCK_GAIN`) to the GPS travel chord when the segment was **straight** (`s_hdg_turn_accum < HEADING_STRAIGHT_MAX_TURN_RAD`) AND **far enough** (`> max(HEADING_FROM_GPS_MIN_DIST_M, HEADING_GPS_DIST_SIGMA_K×σ)`); else IMU/odometry carries it. Creep travel buffers across fixes.
-- **Reverse-aware heading:** when reversing (`s_v<0`) the fused `z_hdg` is flipped by π so heading stays FRONT-facing.
-- **Heading establishment + events:** first GPS heading correction sets `ekf_heading_is_established()`; each clean straight-RTK fix publishes a front-facing event (`ekf_get_gps_heading_event()`) consumed by odo_calib. Reset on RESETEKF.
+- Prediction (`ekf_predict()`): heading = `imu_get_heading_fused() + s_hdg_offset` each tick (no integration); position dead-reckons. BNO fault → heading held (no fallback).
+- GPS update (`ekf_update_gps()`): position snap + innovation gate; on a straight, measurable RTK segment the travel chord trims `s_hdg_offset` (slow EMA, reverse-corrected), persisted to NVS (`imu`/`hdgoff`).
+- **Heading confidence:** `imu_heading_is_confident()` (BNO sys+mag calib) gates AUTO start and is monitored continuously; loss → PAUSE.
+- **Heading events:** each clean straight-RTK trim publishes a front-facing event (`ekf_get_gps_heading_event()`) consumed by odo_calib. Reset on RESETEKF.
 - ENU origin lock: `rtk_gps.cpp` `rtk_gps_set_origin()` — at the first RTK-fixed fix and on perimeter upload via BLE.
 
-### Odometry self-calibration (`odo_calib.cpp`) + AUTO heading bootstrap
+### Odometry self-calibration (`odo_calib.cpp`)
 - `odo_calib_update()` ticks from the 10 Hz EKF hook in ALL states. Distance `scale` from straight RTK runs (GPS chord / odometry); kinematic `track_m` from turns (Σ(vL−vR)·dt / Δθ_gps). EMA, ≤2 %/update, RTK-only. Stored in its **own NVS ns "odocal"** (keys `scale`, `track`); a `CAL …` line is logged to the PWA. Applied via `vesc_erpm_to_velocity_scaled()` and `odo_cal_track_m()`.
-- **AUTO-start bootstrap** (`state_machine.cpp` STATE_AUTO_MOWING): every FRESH start requires **≥2 m perimeter clearance** (`AUTO_BOOTSTRAP_PERIM_MIN_M`, nearest edge any direction) → else PAUSE; **skipped on resume from PAUSED**. Then, if heading isn't established, creep straight (`AUTO_BOOTSTRAP_SPEED_MS`) to establish it; no RTK / not established within `AUTO_BOOTSTRAP_MAX_MS` (8 s) → PAUSE. Operator clears a start-gate PAUSE by selecting MANUAL.
+- **AUTO start (heading-confidence gate):** AUTO starts immediately when `imu_heading_is_confident()` (BNO sys+mag calibration). The old ≥2 m perimeter-clearance gate and the straight-creep heading bootstrap are **removed**. If not confident, AUTO PAUSEs and the operator drives slow loops in MANUAL to calibrate the magnetometer (prompted on the TX16S widget and the PWA "Recalibrate compass" button → `RECAL_IMU`). The confidence check is also re-evaluated every tick during AUTO.
 
 ### Motor commands
 - Drive duty: `vesc_can.cpp` `vesc_set_duty(id, duty)` → PKT_SET_DUTY; stop via `vesc_set_current(id, 0)`.
@@ -323,8 +306,8 @@ Namespace `"mower"` (these are the literal NVS key strings):
 - `blade_cal` — float; auto-calibrated blade reference current (A)
 - `mow_cfg_v11` — MowerConfig blob. **Bumped v10→v11 on 2026-06-13** (footprint W×L box + `track_width_m`, removed `robot_*`/`chassis_length_m`); the `sizeof` guard rejects the old blob, so saved MowerConfig resets to defaults — operator re-enters dimensions/tuning.
 
-Namespace `"imu"`: `gyrobias` — float; Z-axis gyro offset (rad/s).
-Namespace `"collision"`: `baseline` — float; adaptive collision baseline (g).
+Namespace `"imu"`: `bnocal` — 22-byte BNO055 calibration profile blob (auto-saved when fully calibrated); `hdgoff` — float; GPS-trimmed heading offset (rad), `heading = BNO_fused + hdgoff`.
+Namespace `"collision"`: `baseline_v2` — float; adaptive collision baseline (g) for the BNO linear-accel feed (the old `baseline` key from the previous IMU is abandoned).
 
 Namespace `"odocal"` (kept apart from `mow_cfg` so manual config is untouched):
 - `scale` — float; GPS-calibrated distance multiplier on wheel odometry (default 1.0)
