@@ -80,7 +80,7 @@
 //       See HANDOFFS/01_architecture/HANDOFF.md for rationale.
 #define LED_EXTERNAL_PIN             7   // WS2812/SK6812 data line (FastLED)
 
-// ── IMU I2C (BMI270) ─────────────────────────────────────────────────────────
+// ── IMU I2C (BNO055) ─────────────────────────────────────────────────────────
 #define IMU_SDA_PIN                  8   // Wire I2C SDA — ESP32-S3 Arduino default
 #define IMU_SCL_PIN                  9   // Wire I2C SCL — ESP32-S3 Arduino default, 400kHz
 
