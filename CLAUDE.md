@@ -234,7 +234,7 @@ All in `config.h` (~lines 57–100). Key pins: CAN TX/RX GPIO2/1 · servo GPIO5 
 - The (gated) fault responses are additionally armed only after `OBSTACLE_DETECT_STARTUP_MS` from AUTO entry (`obs_armed`) — blade spin-up looks like a stall.
 
 ### RC channel mapping
-`crsf_input.h:24–32` — CH1=steer, CH2=throttle, CH3=cut height, CH4=mode (manual/auto/return), CH5=learn perimeter, CH6=arm/blade, CH7=pause (`CRSF_CH_PAUSE` in `config.h:241`), CH8=momentary record point. Switch decode with hysteresis: `state_machine.cpp:1410–1417`. `ch[]` values are in **microseconds** (1000–2000), not raw CRSF units.
+`crsf_input.h:24–32` — CH1=steer, CH2=throttle, CH3=cut height, CH4=mode (manual/auto/return), CH5=learn perimeter, CH6=arm/blade, CH7=pause (`CRSF_CH_PAUSE` in `config.h:254`), CH8=momentary record point. Switch decode with hysteresis: `state_machine.cpp:1410–1417`. `ch[]` values are in **microseconds** (1000–2000), not raw CRSF units.
 
 ### Custom MOWER_STATUS telemetry (CRSF 0x80)
 `crsf_telemetry.cpp:292` `sendMowerStatus()` — **19-byte** payload: state, progress, cut height, blade load, fix type, flags (+beep bits 7:6), obstacle count, EKF uncertainty, mowed area, **battery V×100 and heading deg×10 (offsets 15–18, added 2026-06-10 so the Lua widget doesn't depend on EdgeTX `RxBt`/`Yaw` sensor discovery)**. The Lua accepts both 15- and 19-byte payloads.
