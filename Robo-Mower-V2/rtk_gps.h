@@ -4,9 +4,10 @@
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  rtk_gps.h — RoboMower RTK GPS Module
-//  Quectel LC29H receiver via UART Serial1 (GPS_RX_PIN, 115200 baud).
-//  Parses $GNGGA NMEA sentences, converts to local ENU coordinates, and
-//  reports RTK fix quality.
+//  DFRobot RTK LoRa GPS module via the DFRobot_RTK_LoRa library (request/response,
+//  not an NMEA stream) over UART Serial1 (GPS_RX_PIN, 115200 baud). Polls position
+//  (getLat()/getLon()) and quality (getQuality()), converts to local ENU
+//  coordinates, and reports RTK fix quality.
 //
 //  ENU origin = first perimeter vertex (set by SEND_PERIMETER command).
 //  No origin is established from GPS fixes — a perimeter must be uploaded
@@ -16,9 +17,9 @@
 //  Thread-safe: all public functions are protected by an internal mutex.
 //
 //  Dependencies:
-//    config.h        — GPS_RX_PIN, GPS_BAUD_RATE, GPS_UPDATE_TIMEOUT_MS,
-//                      ANTENNA_OFFSET_FORWARD_M, ANTENNA_OFFSET_RIGHT_M
-//    ekf_localiser   — ekf_get_heading() (forward-declared in .cpp)
+//    config.h        — GPS_RX_PIN, GPS_BAUD_RATE, GPS_UPDATE_TIMEOUT_MS
+//    MowerConfig     — antenna_fwd_m, antenna_right_m (runtime antenna offsets)
+//    ekf_localiser   — ekf_get_pose() (forward-declared in .cpp)
 //    NVS             — ESP-IDF nvs.h, namespace "gps", key "gpsorigin"
 // ══════════════════════════════════════════════════════════════════════════════
 

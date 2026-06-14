@@ -1,7 +1,7 @@
 // ══════════════════════════════════════════════════════════════════════════════
 //  state_machine.cpp — RoboMower Top-Level State Machine
 //
-//  Implements all 10 robot states, LED patterns (FastLED), serial commands,
+//  Implements all 11 robot states, LED patterns (FastLED), serial commands,
 //  2 Hz JSON telemetry, and manual RC drive mapping.
 //
 //  Call state_machine_init() from setup(), then call state_machine_update()
@@ -108,7 +108,7 @@ static uint32_t s_cross_track_exceed_ms = 0;  // millis() when |XTE| first > 0.5
 static bool     s_blade_commanded = false;
 static float    s_blade_ramp_erpm  = 0.0f;    // target eRPM sent to blade VESC (0 or full target)
 // (blade battery lockout removed 2026-06-12 — VESC firmware handles low-voltage
-//  power reduction internally; firmware only triggers auto-return on LOW)
+//  power reduction internally; battery LOW is notification-only)
 static uint32_t s_session_start_ms = 0;       // millis() when AUTO_MOWING was entered
 
 // ── BLE drive overlay (RC failsafe only) ─────────────────────────────────────
@@ -172,7 +172,7 @@ static bool pauseSwitchActive() {
     return s_debounced;
 }
 
-// Waypoint list storage for pure pursuit (coverage planner owns master list;
+// Waypoint list storage for node follower (coverage planner owns master list;
 // we keep a local pointer and count per the existing planner API)
 static Waypoint   s_wp_buf[1000];   // large static buffer — coverage planner fills via get_next
 static int        s_wp_count = 0;
@@ -417,7 +417,7 @@ static void applyBatteryWarningOverlay() {
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  Waypoint buffer helpers for pure pursuit
+//  Waypoint buffer helpers for node follower
 // ══════════════════════════════════════════════════════════════════════════════
 
 /** Drain the coverage planner into s_wp_buf[]. Returns number of waypoints. */
@@ -2148,7 +2148,7 @@ void state_machine_update() {
                 node_follower_reset_session_distance();
             }
 
-            // Load all waypoints into local buffer for pure pursuit
+            // Load all waypoints into local buffer for node follower
             s_wp_count = load_waypoints_from_planner();
             s_wp_index = 0;
             DBG_PRINTF("[AUTO] Plan ready: %d waypoints (resuming=%d).\r\n",
@@ -2224,7 +2224,7 @@ void state_machine_update() {
         showLedsWithGps(COL_RED);
 
         // Update cutting monitor — use ramp ERPM as target so BLADE_FAULT
-        // detection is accurate during the 3-second spin-up window.
+        // detection is accurate during blade spin-up (VESC-internal ~2 s RPM ramp).
         {
             VescStatus blade = vesc_get_status(VESC_ID_BLADE);
             cutting_monitor_update(speed,
@@ -2482,14 +2482,14 @@ void state_machine_update() {
                 cmd.left_ms  = clampf(cmd.left_ms,  -max_v, max_v);
                 cmd.right_ms = clampf(cmd.right_ms, -max_v, max_v);
             }
-            // Duty-cycle ramp toward desired wheel velocities (forward-only; ramp is reset on AUTO entry)
+            // Duty-cycle ramp toward desired wheel velocities (ramp is reset on AUTO entry)
             node_follower_to_vesc_duty(cmd);
 
             // ── Robust waypoint advancement (reached OR passed) ───────────────
             // Advancing only on a tight physical-arrival window (waypoint_arrive_dist_m,
             // default 0.15 m) is fragile: the steering centre overshoots corners and
             // GPS/EKF noise means the window is essentially never hit, so the index
-            // sticks and the pure-pursuit lookahead stays anchored to one waypoint —
+            // sticks and the node-follower lookahead stays anchored to one waypoint —
             // producing the ~180° U-turn weave. Also clear a waypoint once the mower has
             // driven PAST it (projection onto the incoming segment t >= 1), keeping
             // progress monotonic. Reverse spurs back toward their point (inverted

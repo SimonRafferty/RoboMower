@@ -38,11 +38,11 @@
 //
 //  ── PIN CONNECTIONS ────────────────────────────────────────────────────────
 //
-//  GPIO  1   TWAI TX   →  SN65HVD230 TXD pin
-//              CAN transceiver shared by all 3 VESCs (500 kbit/s)
+//  GPIO  1   TWAI RX   ←  SN65HVD230 RXD pin
+//              CAN transceiver shared by all 3 VESCs (250 kbit/s, CAN_BAUD_RATE)
 //              Twisted-pair CANH/CANL, 120Ω termination at each end of bus
 //
-//  GPIO  2   TWAI RX   ←  SN65HVD230 RXD pin
+//  GPIO  2   TWAI TX   →  SN65HVD230 TXD pin
 //
 //  GPIO  4   (unused)  —  formerly battery ADC voltage divider
 //              Battery voltage now read from VESC CAN STATUS_5 (no hardware needed)
@@ -101,8 +101,10 @@
 //  CAN ID 2  Right drive VESC   Differential drive, right wheel
 //  CAN ID 3  Blade VESC         Gtech CLM021 cutting deck (800W / 48V)
 //
-//  The left drive VESC (ID 1) must have STATUS_5 (CAN packet ID 27) enabled
-//  in VESC Tool — this is the source of battery voltage telemetry.
+//  The blade VESC (ID 3) must have STATUS_5 (CAN packet ID 27) enabled
+//  in VESC Tool — this is the source of battery voltage telemetry
+//  (changed 2026-06-07 from the left drive VESC, which on HW v4 may not
+//  broadcast STATUS_5).
 //  See README.md §VESC Tool Configuration for required settings.
 //
 //  ── POWER RAILS ────────────────────────────────────────────────────────────

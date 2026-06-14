@@ -112,7 +112,7 @@ Mat2 mat2_inverse(const Mat2 &mat);
 void ekf_init();
 
 /**
- * @brief EKF prediction step — differential wheel odometry. Call at 10 Hz from Core 0.
+ * @brief EKF prediction step — differential wheel odometry. Call at 10 Hz from Core 1.
  *
  * Propagates state forward using differential drive kinematics:
  *   dx = v·sin(θ)·dt,  dy = v·cos(θ)·dt,  dθ = (v_left-v_right)/track·dt
@@ -134,7 +134,7 @@ void ekf_predict(float v_left, float v_right, float gyro_rate_cw, float dt);
  * @brief EKF GPS position (and optional heading) update. Call at 1 Hz from Core 0.
  *
  * Computes GPS measurement noise sigma continuously from fix_type, HDOP, and
- * correction age (dif_age_s). Innovation gate is dynamic (5×sigma, min 0.3 m) so
+ * correction age (dif_age_s). Innovation gate is dynamic (5×sigma, min 5 m) so
  * the filter follows GPS closely at high accuracy and relaxes on degraded fixes.
  *
  * @param gps_east    GPS antenna ENU east (m) — antenna position, not steering centre.

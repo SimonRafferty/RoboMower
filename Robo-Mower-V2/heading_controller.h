@@ -4,15 +4,15 @@
 //
 //  PD controller with Automatic Gain Control.  Two usage modes:
 //
-//    Manual mode (heading hold):
+//    Manual heading hold (the only current caller, in state_machine.cpp):
 //      Pass heading_error = wrapAngle(desired - actual)  and
 //      yaw_rate_error = desired_yaw_rate - actual_yaw_rate.
 //      Uses both Kp and Kd for full PD heading hold.
 //
-//    Pure pursuit mode (yaw rate damping):
+//    Yaw-damp-only mode:
 //      Pass heading_error = 0  and
 //      yaw_rate_error = commanded_yaw_rate - actual_yaw_rate.
-//      Uses Kd only — pure pursuit handles heading through geometry.
+//      Uses Kd only — heading is handled elsewhere (e.g. by path geometry).
 //
 //  AGC: monitors heading error zero-crossings (oscillation) and mean
 //  magnitude (persistent error).  Slowly adjusts an internal gain

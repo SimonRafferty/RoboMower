@@ -10,9 +10,9 @@
 //    CMD     — WRITE with response; JSON commands from phone → ESP32
 //    STATUS  — READ + NOTIFY; status JSON on request
 //
-//  All large payloads are fragmented using:
-//    {"f":<index>,"n":<total>,"d":"<chunk>"}
-//  The CMD characteristic uses the same scheme for large SEND_PERIMETER commands.
+//  Large CMD payloads (e.g. SEND_PERIMETER) use a BINARY fragment protocol:
+//    [0x01][frag_index][frag_total][data...]  (raw payload, no JSON escaping)
+//  Fragments are reassembled before dispatch.
 //
 //  Lifecycle:
 //    ble_server_init()   — call once from setup() after state_machine_init()

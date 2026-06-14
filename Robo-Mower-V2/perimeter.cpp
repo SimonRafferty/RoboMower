@@ -51,6 +51,9 @@ static constexpr int   MAX_UNREACHABLE_PTS = 300;
  * at which perimeter_can_close() returns true. Chosen to match the span
  * of the PERIMETER_CLOSE_WINDOW search (15 points × 0.2 m = 3 m), ensuring
  * perimeter_close_track() will always find a good join when the flag is set.
+ * NOTE: the perimeter is now SPARSE (one node per corner, no 0.2 m
+ * densification), so "15 points × 0.2 m" is a legacy dense-spacing rationale;
+ * the 3 m constant is retained.
  */
 static constexpr float PERIMETER_CLOSE_DIST_M = 3.0f;
 

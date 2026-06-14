@@ -14,9 +14,12 @@
 //                      remain inside; used by safety and path controller)
 //    WORKING_AREA    — nav boundary inset by HEADLAND_WIDTH_M (strip targets)
 //
-//  Recording requires RTK fixed quality (fix_type >= RTK_MIN_FIX_FOR_LEARNING)
-//  and samples a new waypoint every 0.2 m of travel. A maximum of
-//  MAX_PERIMETER_POINTS waypoints may be recorded.
+//  Recording is SPARSE and independent of fix quality (fix_type is ignored):
+//  in LEARN mode the operator presses the record button at each corner and a
+//  single node is committed on that press (force=true, which bypasses the
+//  0.2 m distance gate — that gate applies only to non-forced calls, which
+//  LEARN does not use). A maximum of MAX_PERIMETER_POINTS waypoints may be
+//  recorded.
 //
 //  On successful perimeter_finish_recording() all three polygons are saved to
 //  NVS. On boot, perimeter_init() re-loads them and reports unreachable zones.
@@ -71,15 +74,15 @@ bool perimeter_record_point(float x, float y, int fix_type, bool force = false);
  * @brief Finish recording: close, validate, derive polygons, save to NVS.
  *
  * Validation checks (in order):
- *   1. point_count >= 6
+ *   1. point_count >= 3
  *   2. Polygon area >= 5.0 m² (shoelace formula via Polygon::area())
  *   3. Polygon is not self-intersecting (isSelfIntersecting())
  *   4. After NAV_EXCLUSION_INSET_M inset, a valid (non-empty) polygon remains
  *
  * On success:
  *   - Polygon wound CCW (ensureCCW())
- *   - nav_boundary = insetPolygon(perimeter, NAV_EXCLUSION_INSET_M)
- *   - working_area = insetPolygon(nav_boundary, HEADLAND_WIDTH_M)
+ *   - nav_boundary = insetPolygonClipper(perimeter, mower_config_nav_inset_m())
+ *   - working_area = insetPolygonClipper(nav_boundary, mower_config_headland_m())
  *   - All three saved to NVS via nvs_save_perimeter / _nav_boundary / _working_area
  *   - Internal valid flag set; recording state cleared
  *
@@ -163,9 +166,9 @@ Polygon perimeter_get_nav_boundary();
 /**
  * @brief Return the working area polygon.
  *
- * Inset from the nav boundary by HEADLAND_WIDTH_M. Boustrophedon strips are
- * planned entirely within this polygon. Returns an empty Polygon if
- * !perimeter_is_valid().
+ * Inset from the nav boundary by HEADLAND_WIDTH_M. Vestigial under the spiral
+ * planner — still derived/displayed but not used for navigation. Returns an
+ * empty Polygon if !perimeter_is_valid().
  *
  * @return Working area polygon (CCW winding), or empty if !perimeter_is_valid().
  */

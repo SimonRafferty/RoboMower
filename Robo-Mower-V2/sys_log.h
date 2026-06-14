@@ -8,7 +8,8 @@
 //  module faults) for retrieval via BLE STATUS JSON.
 //  Also echoes every message to Serial.
 //
-//  Not thread-safe — call only from Core 1 (setup / state machine).
+//  Thread-safe — a portMUX spinlock guards the ring buffer, so it may be
+//  called from any task or core (including Core-0 BLE callbacks).
 // ══════════════════════════════════════════════════════════════════════════════
 
 #define SYS_LOG_MAX_ENTRIES  50

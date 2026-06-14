@@ -63,7 +63,7 @@ struct TelemetryData {
     char    flight_mode[17];   ///< Null-terminated state name, max 16 chars. Examples:
                                ///<   "MANUAL", "AUTO-OK", "LEARN", "ESTOP", "RECOVERY"
 
-    // ── Mower status (frame 0x80, custom 15-byte payload) ───────────────────
+    // ── Mower status (frame 0x80, custom 19-byte payload) ───────────────────
     uint8_t  state;            ///< RobotState enum value (0–10), see state_machine.h
     uint8_t  hprog;            ///< Headland progress 0–100 %
     uint8_t  sprog;            ///< Strip progress 0–100 %
@@ -122,7 +122,7 @@ void crsf_telemetry_update(const TelemetryData &data);
  *   0x80 (MOWER_STATUS) → 0x14 (ATTITUDE) → repeat
  *
  * The entire frame is written to Serial2 before returning. At 420000 baud,
- * the longest frame (GPS, ~19 bytes) takes ≈ 360 µs, well within the
+ * the longest frame (MOWER_STATUS, 19-byte payload) takes ≈ 360 µs, well within the
  * ~8 ms inter-packet gap available at 100 Hz CRSF frame rate.
  */
 void crsf_telemetry_service();

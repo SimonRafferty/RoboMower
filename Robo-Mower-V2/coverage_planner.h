@@ -11,12 +11,12 @@
 //
 //  Strategy (2026-06-13): CONCENTRIC INWARD SPIRAL. The boustrophedon strip
 //  planner was removed — it never planned a sparse perimeter cleanly and
-//  produced corrupt fan-shaped paths. The spiral starts on the nav boundary
+//  produced corrupt fan-shaped paths. The spiral starts on the perimeter
 //  and insets inward by one strip step per ring until the polygon collapses
 //  at the centre; concave shapes that pinch into separate lobes are each
 //  spiralled to their own centre. See coverage_planner.cpp for the rationale.
 //
-//  Waypoints are steering-centre positions and never leave the nav boundary.
+//  Waypoints are steering-centre positions and never leave the perimeter.
 //
 //  Call sequence:
 //    coverage_planner_init()
@@ -47,14 +47,14 @@ void coverage_planner_init();
 
 /** Generate the complete mowing plan. Call once on entering AUTO_MOWING.
  *
- *  Builds a concentric inward spiral: ring 0 = nav boundary, ring i = ring i-1
+ *  Builds a concentric inward spiral: ring 0 = perimeter, ring i = ring i-1
  *  inset by mower_config_strip_step_m(), until the polygon collapses. Each ring
  *  is a closed loop of waypoints at the polygon vertices; the next ring starts
  *  at the vertex nearest the previous ring's start. All waypoints are flagged
  *  mowing=true, headland=true (edge-following, exempt from strip truncation).
  *
- *  @param perimeter    Recorded perimeter polygon (unused; spiral derives from nav)
- *  @param navBoundary  Navigation boundary (inset of perimeter) — the outer ring
+ *  @param perimeter    Recorded perimeter polygon — the outer ring (ring 0)
+ *  @param navBoundary  Navigation boundary (inset of perimeter) — unused
  *  @param workingArea  Unused (kept for call-site compatibility)
  *  @return true on success; false if the nav boundary is invalid or too small
  */

@@ -4,7 +4,7 @@
 // ══════════════════════════════════════════════════════════════════════════════
 //  collision_detect.h — RoboMower IMU-Based Collision Detection
 //
-//  Replaces the physical bumper sensor (GPIO 6, now removed).
+//  Replaces the physical bumper sensor (removed; GPIO6 is now the pause switch).
 //  Uses BMI270 accelerometer data (fed at 200Hz from Core 0 IMU task) to detect
 //  short-duration acceleration spikes that indicate obstacle contact.
 //
@@ -66,7 +66,7 @@ void collisionDetectUpdate(float ax, float ay, float az);
 
 /**
  * @brief Allow baseline adaptation during straight driving.
- *        Call from pure_pursuit_compute() when mowing conditions are valid:
+ *        Call from the node-follower / AUTO mowing path when mowing conditions are valid:
  *          - speed > MIN_CREEP_SPEED_MS
  *          - |yaw_rate| < 0.2 rad/s (not turning)
  *          - session distance > BASELINE_SETTLE_M

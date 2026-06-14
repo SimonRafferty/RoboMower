@@ -5,7 +5,7 @@
 //  battery_monitor.h — RoboMower 48V LiPo battery voltage monitor
 //
 //  Reads battery voltage from VESC CAN STATUS_5 (CAN_PACKET_STATUS_5, ID=27)
-//  broadcast by VESC_ID_LEFT (CAN ID 1). Applies an IIR low-pass filter to
+//  broadcast by VESC_ID_BLADE (CAN ID 3). Applies an IIR low-pass filter to
 //  reject motor-start voltage sags, and classifies into one of three states.
 //
 //  No ADC or calibration offset required — the VESC measures v_in directly
@@ -28,11 +28,14 @@
  *   OK → WARNING  when filtered voltage falls below BATTERY_WARN_V
  *   WARNING → LOW when filtered voltage falls below BATTERY_LOW_V
  *   LOW → (any)   only after power-cycle; state is latched once LOW is reached
+ *
+ * Battery LOW is notification-only: this module latches the state but does NOT
+ * stop the motors (auto-return / blade lockout were removed — operator decision).
  */
 enum BatteryState {
     BATTERY_OK,       ///< Voltage ≥ BATTERY_WARN_V — normal operation
     BATTERY_WARNING,  ///< BATTERY_LOW_V ≤ voltage < BATTERY_WARN_V — warn operator
-    BATTERY_LOW,      ///< Voltage < BATTERY_LOW_V — stop motors, charge required
+    BATTERY_LOW,      ///< Voltage < BATTERY_LOW_V — notify operator, charge required (no motor stop)
 };
 
 

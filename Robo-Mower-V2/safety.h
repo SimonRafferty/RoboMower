@@ -11,7 +11,7 @@
 //  per ARCHITECTURE.md §2). The task fires every 50 ms and checks:
 //    1. VESC CAN silence  — PILZ fired or battery disconnected → MOTORS_OFFLINE
 //    2. IMU fault         — log warning; EKF continues GPS-only
-//    3. Perimeter breach  — robot outside nav boundary → requests STATE_PAUSED
+//    3. Perimeter breach  — robot outside the PERIMETER → requests STATE_PAUSED
 //    4. Battery state     — sets LED-overlay warning flag
 //    5. GPS timeout       — log warning only
 //

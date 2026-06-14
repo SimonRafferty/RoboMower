@@ -10,7 +10,7 @@
 //  The spiral is dramatically simpler and is *native to a sparse perimeter*
 //  (the perimeter is ~10 turn-point nodes joined by straight edges):
 //
-//    ring 0 = nav boundary (steering centre rides the legal boundary)
+//    ring 0 = the perimeter itself (steering-centre limit; no nav-inset subtracted)
 //    ring i = ring (i-1) inset inward by one strip step
 //    … until the polygon collapses to nothing at the centre.
 //
@@ -19,19 +19,21 @@
 //  next ring starts at the vertex nearest the previous ring's start, so the
 //  inward steps stack on one side and the whole path reads as a spiral.
 //
-//  insetPolygonMulti() handles concave gardens that pinch into multiple lobes
-//  as they shrink — each lobe is spiralled to its own centre (depth-first)
-//  before the next.
+//  offsetPolygonClipper() (Clipper2) handles concave gardens that pinch into
+//  multiple lobes as they shrink — each lobe is spiralled to its own centre
+//  (depth-first) before the next.
 //
-//  Why the NAV BOUNDARY and not the perimeter: waypoints are steering-centre
-//  positions, and the steering centre must stay inside the nav boundary
-//  (perimeter inset by the robot half-width) or the chassis crosses the edge
-//  and the safety watchdog flags a breach. The blade, mounted outboard/forward
-//  of the steering centre, still cuts close to the recorded edge.
+//  Why ring 0 IS the perimeter (and not an inset of it): the recorded perimeter
+//  is the steering-centre LIMIT — the path of the steering centre driven to its
+//  maximum extent (body against the physical boundary), so the robot's
+//  diagonal-radius margin is already baked into the recording. The steering
+//  centre may drive right up to the perimeter, so no nav-inset is subtracted
+//  (subtracting one would double-count the robot size and leave an oversized
+//  outer border).
 //
 //  Source references:
-//    geometry.h  insetPolygonMulti() / insetPolygon()
-//    config.h    strip step (CUT_WIDTH_M − STRIP_OVERLAP_M), MIN_ZONE_AREA_M2
+//    clipper_offset.h  offsetPolygonClipper()
+//    config.h    strip step (CUT_WIDTH_M − STRIP_OVERLAP_M), SPIRAL_RING_MIN_AREA_M2
 // ══════════════════════════════════════════════════════════════════════════════
 
 #include "coverage_planner.h"

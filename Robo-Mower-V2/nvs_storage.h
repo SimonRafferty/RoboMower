@@ -50,7 +50,7 @@ static_assert(sizeof(EStopEvent) == 44, "EStopEvent must be 44 bytes");
 // ── GPS origin ────────────────────────────────────────────────────────────────
 
 /**
- * @brief GPS origin blob stored in NVS (20 bytes total).
+ * @brief GPS origin blob stored in NVS (24 bytes total).
  *
  * Records the WGS84 position of the perimeter origin (first vertex).
  * On boot: if absent or CRC fails, the ENU origin is unset — a perimeter
@@ -172,8 +172,10 @@ void nvs_clear_perimeter();
 /**
  * @brief Store a float value under the given key in the "mower" namespace.
  *
- * Used by: imu_bmi270.cpp ("gyro_bias"), cutting_monitor.cpp ("blade_cal"),
- *          battery_monitor.cpp ("bat_cal_v").
+ * Used by: cutting_monitor.cpp ("blade_cal"), state_machine.cpp ("home_x"/"home_y").
+ * (imu_bmi270.cpp stores its gyro bias via its OWN "imu" Preferences namespace,
+ *  key "gyrobias" — NOT this function. There is no battery cal key: battery
+ *  voltage comes from the VESC STATUS_5 packet, no stored float.)
  *
  * @param key    NVS key (≤ 15 chars).
  * @param value  Value to store.
@@ -192,7 +194,9 @@ float nvs_get_float(const char *key, float default_val);
 /**
  * @brief Store a uint16_t value under the given key in the "mower" namespace.
  *
- * Used by: servo_output.cpp ("servo_min", "servo_max").
+ * Not currently used by any module (the servo cut-height calibration that
+ * formerly stored "servo_min"/"servo_max" now uses fixed #define values in
+ * servo_output.cpp). Retained as a generic helper.
  *
  * @param key    NVS key (≤ 15 chars).
  * @param value  Value to store.
@@ -261,7 +265,7 @@ void nvs_clear_estop_log();
  * @brief Persist the ENU coordinate origin to NVS.
  *
  * Computes CRC32 over the 16 bytes of (lat_deg, lon_deg) and stores the
- * full GpsOriginNvs struct (20 bytes) as a blob under key "gpsorigin".
+ * full GpsOriginNvs struct (24 bytes) as a blob under key "gpsorigin".
  * Updates the internal GPS origin validity flag on success.
  *
  * @param lat_deg  Origin latitude in degrees.

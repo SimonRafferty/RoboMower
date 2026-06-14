@@ -28,7 +28,7 @@
 //
 //  GPS origin format
 //  ─────────────────
-//  NVS key "gpsorigin": blob, sizeof(GpsOriginNvs) = 20 bytes.
+//  NVS key "gpsorigin": blob, sizeof(GpsOriginNvs) = 24 bytes.
 //  CRC32 embedded in struct, computed over first 16 bytes (lat + lon).
 //
 //  Namespace conflict note (see BLOCKERS.md B03)

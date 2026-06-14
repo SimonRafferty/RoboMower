@@ -3,13 +3,14 @@
 //
 //  State: [x(m), y(m), θ(rad), v(m/s)]  — ENU, heading CW from North, wrapped ±π
 //
-//  Three update paths:
-//    ekf_predict()         200 Hz  IMU yaw rate + wheel speed (Core 0)
-//    ekf_update_gps()        1 Hz  RTK GPS position ± heading (Core 0)
-//    ekf_update_odometry()  50 Hz  Wheel tachometer heading (Core 0)
+//  Two update paths:
+//    ekf_predict()          10 Hz  differential wheel odometry (gyro Z only during
+//                                  on-the-spot pivots) + wheel speed (Core 1)
+//    ekf_update_gps()      ~1 Hz   RTK GPS position ± heading (Core 0, GPS task)
 //
 //  All state access is protected by g_ekf_mutex (FreeRTOS mutex).
-//  Core 0 writes; Core 1 reads via ekf_get_pose() / ekf_get_speed().
+//  Written from BOTH cores (predict on Core 1, GPS update on Core 0); read via
+//  ekf_get_pose() / ekf_get_speed().
 //
 //  Matrix arithmetic uses the local Mat4 / Mat2 types — no Eigen.
 //  All arithmetic is float (ESP32-S3 hardware FPU for float).

@@ -39,7 +39,7 @@ void battery_monitor_init() {
 void battery_monitor_update() {
     // Log a one-shot warning if STATUS_5 has never been received after the
     // CAN bus is established. Most likely cause: STATUS_5 not enabled on the
-    // left drive VESC (CAN ID 1) in VESC Tool. Battery will show 0V on RC telemetry.
+    // blade VESC (CAN ID 3) in VESC Tool. Battery will show 0V on RC telemetry.
     {
         static bool s_status5_warned = false;
         if (!s_status5_warned && vesc_get_battery_voltage() == 0.0f
@@ -57,7 +57,7 @@ void battery_monitor_update() {
         if (vesc_get_battery_voltage() > 0.0f) s_status5_warned = true;
     }
 
-    // If VESC_ID_LEFT has stopped sending STATUS_5 (e.g. after PILZ fires while
+    // If the blade VESC (ID 3) has stopped sending STATUS_5 (e.g. after PILZ fires while
     // supercap keeps the ESP32 alive), keep the last known state rather than
     // feeding zeros into the filter. (BUG-3 fix — stale detection)
     if (vesc_battery_voltage_stale()) {
@@ -116,8 +116,9 @@ void battery_monitor_update() {
 
     // Classify state.
     // BATTERY_LOW is latched: once the battery is critically low the state
-    // cannot return to WARNING or OK without a power-cycle, because the motor
-    // stop triggered by BATTERY_LOW is irreversible in firmware (see A23).
+    // cannot return to WARNING or OK without a power-cycle. This is
+    // notification-only — latching the state does NOT stop the motors
+    // (auto-return / blade lockout were removed — operator decision).
     if (g_filtered_v < BATTERY_LOW_V) {
         g_state = BATTERY_LOW;
     } else if (g_state != BATTERY_LOW) {

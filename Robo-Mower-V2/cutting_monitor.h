@@ -37,10 +37,10 @@
  */
 enum CuttingStatus {
     CUTTING_NORMAL,       ///< Moving, blade load within bounds
-    CUTTING_OVERLOADED,   ///< Moving, blade load HIGH (triggers RETRACE)
-    CUTTING_STALLED,      ///< Not moving, blade load HIGH (triggers BOG_RECOVERY)
-    OBSTACLE_SUSPECTED,   ///< Not moving, blade load normal (triggers OBSTACLE_AVOID)
-    BLADE_FAULT,          ///< Blade current near zero when commanded (triggers E-STOP)
+    CUTTING_OVERLOADED,   ///< Moving, blade load HIGH (RETRACE — currently gated off by AUTO_FAULT_RESPONSES_ENABLED)
+    CUTTING_STALLED,      ///< Not moving, blade load HIGH (BOG_RECOVERY — currently gated off by AUTO_FAULT_RESPONSES_ENABLED)
+    OBSTACLE_SUSPECTED,   ///< Not moving, blade load normal (OBSTACLE_AVOID — currently gated off by AUTO_FAULT_RESPONSES_ENABLED)
+    BLADE_FAULT,          ///< Blade current near zero when commanded (no longer E-stops; blade is RC-only — warns and drives on)
 };
 
 
@@ -118,9 +118,10 @@ float cutting_monitor_get_avg_current();
 /**
  * @brief Get blade load fraction (0.0 – 1.0+).
  *
- * Computed as:  rolling_avg_compensated_current / g_blade_max_A
+ * Computed as:  rolling_avg_compensated_current / BLADE_CURRENT_LIMIT_A (fixed 15 A);
+ * g_blade_max_A is no longer used for the load fraction.
  *
- * Values above 1.0 are possible if current exceeds the calibrated maximum.
+ * Values above 1.0 are possible if current exceeds BLADE_CURRENT_LIMIT_A.
  * BLADE_LOAD_HIGH threshold (0.75) and BLADE_LOAD_MIN (0.05) are applied
  * against this fraction.
  *

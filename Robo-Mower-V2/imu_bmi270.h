@@ -22,7 +22,7 @@
 // ══════════════════════════════════════════════════════════════════════════════
 
 /**
- * @brief Initialise BMI270 via I2C Wire at address 0x68.
+ * @brief Initialise BMI270 via I2C Wire at address 0x69 (IMU_I2C_ADDRESS, SDO/SA0=VCC).
  *
  * Configures:
  *   - ODR = 200Hz  (BMI2_GYR_ODR_200HZ)

@@ -6,7 +6,7 @@
 //  vesc_can.h — RoboMower VESC CAN Bus Interface
 //
 //  Manages communication with three VESC motor controllers via the ESP32-S3
-//  TWAI peripheral (CAN 2.0B, 500 kbit/s, 29-bit extended frames).
+//  TWAI peripheral (CAN 2.0B, 250 kbit/s, 29-bit extended frames).
 //
 //  VESC IDs:  1 = Left drive,  2 = Right drive,  3 = Blade
 //  CAN frame: identifier = (packet_id << 8) | vesc_id  (29-bit extended)
@@ -59,14 +59,14 @@ struct VescStatus {
 
 /** Odometry state for a drive VESC.
  *  Updated at 50 Hz from CAN_PACKET_STATUS ERPM integration.
- *  vesc_poll_tachometer() sends a GET_VALUES request to keep the VESC
- *  alive; last_poll_ms records when that request was last sent. */
+ *  vesc_poll_tachometer() sends no CAN frame; it only records a poll
+ *  timestamp in last_poll_ms. */
 struct VescOdometry {
     int32_t  tach_raw;        ///< Virtual tachometer counter (accumulated from ERPM)
     int32_t  tach_prev;       ///< Tachometer value at previous sample (for delta)
     float    dist_m;          ///< Total distance travelled since init (m)
     float    velocity_ms;     ///< Current wheel-surface velocity (m/s)
-    uint32_t last_poll_ms;    ///< millis() of last GET_VALUES poll request sent
+    uint32_t last_poll_ms;    ///< millis() of last vesc_poll_tachometer() call (no CAN frame sent)
 };
 
 
@@ -79,13 +79,13 @@ struct VescOdometry {
  *  @param tx_gpio  TWAI TX pin (connect to CAN transceiver, e.g. SN65HVD230)
  *  @param rx_gpio  TWAI RX pin (from CAN transceiver)
  *
- *  TWAI config: 500 kbit/s, normal mode, accept-all filter. */
+ *  TWAI config: 250 kbit/s, normal mode, accept-all filter. */
 void vesc_can_init(int tx_gpio, int rx_gpio);
 
 
 // ── Command functions ─────────────────────────────────────────────────────────
 
-/** Send CAN_PACKET_SET_CURRENT (packet ID 5) to a drive VESC.
+/** Send CAN_PACKET_SET_CURRENT (packet ID 1) to a drive VESC.
  *  Enqueues to the TX queue; returns immediately.
  *
  *  @param vesc_id    VESC_ID_LEFT or VESC_ID_RIGHT
@@ -142,8 +142,9 @@ VescOdometry vesc_get_odometry(uint8_t vesc_id);
 
 // ── Polling ───────────────────────────────────────────────────────────────────
 
-/** Enqueue a CAN_PACKET_GET_VALUES (packet ID 4) request for the given drive
- *  VESC.  Called at 5 Hz from the state-machine or a dedicated timer.
+/** Record a tachometer poll timestamp for the given drive VESC.  Sends NO CAN
+ *  frame — the tachometer is derived from ERPM integration in the STATUS RX
+ *  path.  Called at 5 Hz from the state-machine or a dedicated timer.
  *  Updates last_poll_ms in the odometry struct.
  *
  *  @param vesc_id  VESC_ID_LEFT or VESC_ID_RIGHT */
@@ -194,7 +195,7 @@ bool vesc_any_went_offline();
 /**
  * @brief Get the most recently received battery input voltage from VESC STATUS_5.
  *
- * Updated whenever a CAN_PACKET_STATUS_5 frame arrives from VESC_ID_LEFT (CAN ID 1).
+ * Updated whenever a CAN_PACKET_STATUS_5 frame arrives from VESC_ID_BLADE (CAN ID 3).
  * Returns 0.0f until the first STATUS_5 frame is received.
  *
  * Thread-safe: protected by the internal status mutex.
@@ -207,7 +208,7 @@ float vesc_get_battery_voltage();
  * @brief Returns true if no STATUS_5 frame has been received for > 2 seconds
  *        after the first frame was seen.
  *
- * Use this to detect that VESC_ID_LEFT has gone offline (e.g. after a PILZ
+ * Use this to detect that VESC_ID_BLADE has gone offline (e.g. after a PILZ
  * E-stop with supercap power still present on ESP32).  Returns false during
  * startup grace period (before the first STATUS_5 frame).
  *

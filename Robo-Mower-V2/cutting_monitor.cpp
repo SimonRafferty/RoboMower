@@ -81,10 +81,12 @@ static void pushSample(float compensated_A) {
  *  which must react immediately without rolling-average delay).
  *  g_rolling_avg already holds voltage-compensated current. */
 /** millis() when blade_commanded last went false→true; 0 = not commanded.
- *  Used to suppress BLADE_FAULT during physical spin-up: the blade duty ramps
- *  0→100 % over BLADE_SPINUP_TIME_MS, so eRPM is legitimately near zero at
- *  first. Without this grace the fault fired on the very first commanded tick
- *  (eRPM 0 vs full target) and AUTO paused before the blade ever moved. */
+ *  Used to suppress BLADE_FAULT during physical spin-up: the blade is RPM-
+ *  controlled (SET_RPM) and the VESC's internal current-limited RPM PID does a
+ *  ~2 s spin-up, so eRPM is legitimately near zero at first. The fault is gated
+ *  on BLADE_FAULT_GRACE_MS after arm. Without this grace the fault fired on the
+ *  very first commanded tick (eRPM 0 vs full target) and AUTO paused before the
+ *  blade ever moved. */
 static uint32_t g_blade_cmd_since_ms = 0;
 
 static CuttingStatus assessCuttingCondition(
@@ -94,12 +96,13 @@ static CuttingStatus assessCuttingCondition(
         float blade_target_erpm,
         bool  blade_commanded)
 {
-    (void)blade_target_erpm;  // blade is duty-controlled; VESC caps RPM itself
+    (void)blade_target_erpm;  // blade is RPM-controlled (SET_RPM); VESC's RPM PID caps current
 
     // ── BLADE_FAULT: uses raw current (not rolling average) ────────────────
     // Fault = commanded, spin-up grace elapsed, and the motor is drawing no
-    // current AND not turning. The old target-eRPM comparison is gone: with
-    // duty control there is no firmware RPM target to compare against.
+    // current AND not turning. The old target-eRPM comparison is gone: the
+    // VESC's internal current-limited RPM PID handles the SET_RPM spin-up, so
+    // there is no firmware RPM target to compare against here.
     if (blade_commanded && g_blade_cmd_since_ms != 0
         && (millis() - g_blade_cmd_since_ms) > BLADE_FAULT_GRACE_MS) {
         if (blade_current_A < (BLADE_LOAD_MIN * BLADE_CURRENT_LIMIT_A)

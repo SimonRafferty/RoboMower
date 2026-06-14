@@ -7,8 +7,9 @@
 //    CMD     — write-with-response; commands forwarded to state machine queue
 //    STATUS  — status JSON on request
 //
-//  Large payloads use fragment protocol: {"f":<i>,"n":<total>,"d":"<chunk>"}
-//  Large commands from phone use the same scheme, reassembled before dispatch.
+//  Large commands from the phone use a BINARY fragment protocol:
+//    [0x01][frag_index][frag_total][data...]  (raw payload, no JSON escaping)
+//  Fragments are reassembled before dispatch.
 //
 //  References:
 //    ble_server.h — public API

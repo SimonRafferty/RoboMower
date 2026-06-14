@@ -11,9 +11,8 @@
 //
 //  2. Tachometer (VescOdometry.tach_raw) is accumulated from ERPM integration
 //     on every CAN_PACKET_STATUS frame (50 Hz), not from a GET_VALUES response.
-//     The GET_VALUES request IS still sent at 5 Hz (vesc_poll_tachometer) for
-//     VESC-side state maintenance; its multi-frame response is not decoded here
-//     because the byte layout was not specified.  See HANDOFF for details.
+//     vesc_poll_tachometer() sends NO CAN frame; it only records a poll
+//     timestamp. See HANDOFF for details.
 //
 //  3. E-stop (vesc_emergency_stop_all) uses xQueueSendToFront — it does NOT
 //     bypass the TX queue or write directly to TWAI hardware.  Per A17, the
@@ -58,7 +57,7 @@ static VescOdometry      s_odom[2];            // index = vesc_id - 1 (LEFT=0, R
 static float             s_tach_accum[2];      // float accumulator before int32 snap
 static uint32_t          s_last_status_ms[2];  // timestamp of last STATUS rx per drive
 
-static float             s_battery_voltage_v  = 0.0f;  ///< Input voltage from STATUS_5 (VESC_ID_LEFT)
+static float             s_battery_voltage_v  = 0.0f;  ///< Input voltage from STATUS_5 (VESC_ID_BLADE)
 static uint32_t          s_last_status5_ms    = 0;     ///< millis() of last STATUS_5 frame
 
 static bool              s_bus_live           = false; ///< true after first STATUS frame from any VESC

@@ -8,7 +8,7 @@
 //
 //  Orchestrates all subsystems on Core 1 at 10 Hz.
 //  Responsibilities:
-//    - All state transitions (10 states, per spec §"State Machine")
+//    - All state transitions (11 states, per spec §"State Machine")
 //    - LED control via FastLED (onboard GPIO48 + external GPIO7 strip)
 //    - Serial command processing (USB Serial0)
 //    - 2 Hz JSON telemetry on USB Serial0
@@ -35,7 +35,7 @@ enum RobotState {
     STATE_IDLE,           ///< Armed, stationary, awaiting operator command
     STATE_MANUAL,         ///< Operator driving via RC (CH1/CH2)
     STATE_LEARN_PERIMETER,///< Recording boundary polygon from RC-driven pass
-    STATE_AUTO_MOWING,    ///< Autonomous boustrophedon mowing via coverage planner
+    STATE_AUTO_MOWING,    ///< Autonomous spiral coverage mowing via coverage planner
     STATE_RETRACE,        ///< CUTTING_OVERLOADED recovery: retrace strip at max height
     STATE_BOG_RECOVERY,   ///< CUTTING_STALLED recovery: progressive height raise
     STATE_OBSTACLE_AVOID, ///< Obstacle detected: back up and re-plan
@@ -58,7 +58,7 @@ enum LedPattern {
     LED_SLOW_FLASH,      ///< 500 ms ON, 500 ms OFF (1 Hz equal mark/space)
     LED_SINGLE_BLINK,    ///< 100 ms ON, 900 ms OFF
     LED_DOUBLE_BLINK,    ///< 100 ms ON, 100 ms OFF, 100 ms ON, 700 ms OFF
-    LED_FAST_FLASH,      ///< 100 ms ON, 100 ms OFF
+    LED_FAST_FLASH,      ///< 250 ms ON, 250 ms OFF
     LED_ALTERNATING,     ///< Via showLedsAlternating(): primary 1000ms, secondary 500ms, off 500ms
     LED_THREE_FLASH,     ///< 3× 100 ms flash then off (one-shot; for perimeter saved)
 };
@@ -188,7 +188,8 @@ bool state_machine_is_ble_armed();
 /** Return true if the blade is currently commanded to spin. */
 bool state_machine_is_blade_commanded();
 
-/** Return true if the blade battery lockout is active (cleared only by power cycle). */
+/** Retained for compatibility; the blade battery lockout was removed 2026-06-12,
+ *  so this always returns false. */
 bool state_machine_is_blade_lockout();
 
 /** Return the raw CH6 arm-switch channel value in microseconds (1000–2000).

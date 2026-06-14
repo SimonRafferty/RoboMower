@@ -22,7 +22,7 @@
 
 
 /**
- * @brief Initialise LEDC peripheral and start at maximum deck height (2000 µs).
+ * @brief Initialise LEDC peripheral and start at maximum deck height (1000 µs).
  */
 void servo_output_init();
 

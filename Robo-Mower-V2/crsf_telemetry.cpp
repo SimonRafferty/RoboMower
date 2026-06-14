@@ -105,7 +105,7 @@ static inline void pack32be(uint8_t *buf, uint32_t val)
  *   len = payload_len + 2
  *
  * Maximum supported payload_len is 61 bytes (64-byte frame buffer minus the
- * 3-byte header). In practice the largest frame here is GPS at 15 bytes.
+ * 3-byte header). In practice the largest frame here is MOWER_STATUS (19-byte payload).
  *
  * @param type         CRSF frame type byte.
  * @param payload      Pointer to payload bytes.
@@ -267,7 +267,7 @@ static void sendAttitude(const TelemetryData &d)
 }
 
 /**
- * Build and send MOWER_STATUS frame (0x80) — custom frame, 15-byte payload.
+ * Build and send MOWER_STATUS frame (0x80) — custom frame, 19-byte payload.
  *
  * This is not an EdgeTX-standard frame type. It is readable by a Lua widget
  * on the TX16S via crossfireTelemetryPop().

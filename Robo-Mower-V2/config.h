@@ -110,7 +110,7 @@
 #define VESC_ID_RIGHT                2   // Right drive motor VESC
 #define VESC_ID_BLADE                3   // Blade motor VESC (Gtech CLM021)
 
-// IMU I2C address (BMI270 SA0=GND → 0x68)
+// IMU I2C address (BMI270 SA0=VCC → 0x69)
 #define IMU_I2C_ADDRESS           0x69   // SparkFun BMI270 I2C address (SDO/SA0=VCC)
 
 
@@ -343,7 +343,8 @@
 #define OBSTACLE_DETECT_STARTUP_MS   10000   // [ms] — startup gate: suppress cutting-monitor triggers for this long after AUTO entry
 
 // ── IMU Collision Detection ───────────────────────────────────────────────────
-// Replaces physical bumper sensor (GPIO 6 removed — see ASSUMPTIONS.md A34).
+// Replaces the physical bumper sensor (no dedicated bumper GPIO — GPIO 6 is now
+// the PAUSE switch, PAUSE_PIN; see ASSUMPTIONS.md A34).
 // Collision is detected when a short-duration acceleration spike exceeds
 // COLLISION_THRESHOLD_MULTIPLIER × the adaptive baseline jolt level.
 #define COLLISION_THRESHOLD_MULTIPLIER  5.0f   // spike must be n× baseline to trigger
@@ -468,7 +469,7 @@
 #define VESC_STARTUP_GRACE_MS       3000   // [ms] — after bus goes live, all VESCs must appear within this window
 
 // Perimeter safety
-#define PERIMETER_BREACH_DIST_M    0.80f   // [m] — steering centre outside nav boundary by this much → E-stop
+#define PERIMETER_BREACH_DIST_M    0.80f   // [m] — steering centre outside the PERIMETER by this much → E-stop
 
 // Stall / bog detection
 #define STALL_DETECT_TIME_MS        3000   // [ms] — time below stall threshold before bog recovery
