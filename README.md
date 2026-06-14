@@ -22,7 +22,7 @@ You teach it the garden by driving it around the edge with the RC transmitter (o
 
 The path planning works just like a 3D Printer slicer - which is where I stole the idea from.  It mows the perimeter first (like the walls of a print), then an outline around each striped region, then fills in with parallel stripes (the infill).  
 
-Position comes from a DFRobot RTK GPS (which was the most reasonably priced I could find) fused with wheel odometry.  I tried using the IMU gyro for heading, but the ground is just too bumpy - the readings were nonsense.  If you have a lawn like a bowling green, maybe the IMU would work for you.  Having caterpillar tracks, the machine barely slips on grass, so differential wheel odometry between GPS fixes works much better.
+Position comes from a DFRobot RTK GPS (which was the most reasonably priced I could find), dead-reckoned on wheel odometry between fixes.  Heading comes from a magnetometer-based 9-axis IMU (a Bosch BNO055): its on-chip fusion gives a tilt-compensated absolute compass heading, with a small offset continuously trimmed from the GPS travel direction on straight runs.
 
 In case you're interested, you can find small tracks on eBay & AliExpress, intended for ATV's.  I used a pair of Bafung geared e-bike front wheel motors with the freewheel clutch welded up so they will drive in reverse to drive the tracks.  They produce bags of torque at low current and are super robust!
 
