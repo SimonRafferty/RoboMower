@@ -20,7 +20,8 @@
 //
 //  ── REQUIRED LIBRARIES (install via Library Manager) ──────────────────────
 //
-//  SparkFun BMI270 Arduino Library   SparkFun Electronics   IMU (I2C, 200Hz)
+//  Adafruit BNO055                   Adafruit                IMU (I2C, 100Hz)
+//  Adafruit Unified Sensor           Adafruit                (BNO055 dependency)
 //  FastLED                           Daniel Garcia          WS2812 LED control
 //
 //  ── BUILT-IN (ESP32 Arduino core — do NOT install separately) ─────────────
@@ -61,14 +62,14 @@
 //              FastLED, SK6812/WS2812B, 8 LEDs (LED_EXTERNAL_COUNT)
 //              Power: 5V rail; data: 3.3V logic (direct connection OK for most strips)
 //
-//  GPIO  8   I2C SDA   ↔  SparkFun BMI270 (SEN-22398) SDI pin
-//              Wire.h, 400 kHz; 4.7kΩ pull-up to 3.3V on each line
+//  GPIO  8   I2C SDA   ↔  Adafruit BNO055 SDA pin
+//              Wire.h, 100 kHz (BNO055 clock-stretch quirk); 4.7kΩ pull-up to 3.3V on each line
 //
-//  GPIO  9   I2C SCL   →  SparkFun BMI270 (SEN-22398) SCK pin
+//  GPIO  9   I2C SCL   →  Adafruit BNO055 SCL pin
 //
-//              BMI270 wiring summary:
-//                ESP32 3.3V  →  VDD, VDDIO
-//                ESP32 GND   →  GND, SA0  (SA0=GND → I2C address 0x68)
+//              BNO055 wiring summary:
+//                ESP32 3.3V  →  VIN
+//                ESP32 GND   →  GND   (ADR low/unconnected → I2C address 0x28)
 //
 //  GPIO 10   Serial1 RX  ←  Quectel LC29H RTK GPS module TX pin
 //              115200 baud, NMEA 0183 ($GNGGA sentences)
@@ -112,7 +113,7 @@
 //  48V battery  →  PILZ safety relay  →  all three VESCs
 //  5V rail      →  ESP32-S3 DevKitC-1 (USB or 5V pin), ER8 receiver,
 //                  cut-height servo power
-//  3.3V (ESP32 internal LDO)  →  BMI270, SN65HVD230, LED data lines
+//  3.3V (ESP32 internal LDO)  →  BNO055, SN65HVD230, LED data lines
 //
 //  Supercapacitor backup (separate supply):
 //    Powers ESP32 + ER8 + RTK GPS for several minutes after PILZ fires.

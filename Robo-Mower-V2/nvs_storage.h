@@ -173,9 +173,10 @@ void nvs_clear_perimeter();
  * @brief Store a float value under the given key in the "mower" namespace.
  *
  * Used by: cutting_monitor.cpp ("blade_cal"), state_machine.cpp ("home_x"/"home_y").
- * (imu_bmi270.cpp stores its gyro bias via its OWN "imu" Preferences namespace,
- *  key "gyrobias" — NOT this function. There is no battery cal key: battery
- *  voltage comes from the VESC STATUS_5 packet, no stored float.)
+ * (imu_bno055.cpp / ekf_localiser.cpp store the BNO055 calibration profile ("bnocal")
+ *  and GPS-trimmed heading offset ("hdgoff") via their OWN "imu" Preferences namespace
+ *  — NOT this function. There is no battery cal key: battery voltage comes from the
+ *  VESC STATUS_5 packet, no stored float.)
  *
  * @param key    NVS key (≤ 15 chars).
  * @param value  Value to store.

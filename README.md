@@ -22,7 +22,7 @@ You teach it the garden by driving it around the edge with the RC transmitter (o
 
 The path planning works just like a 3D Printer slicer - which is where I pinched the idea from.  It follows the perimeter first (like the walls of a print), then spirals inward in concentric rings, each one a cut-width inside the last, until it reaches the middle.  It's the same idea as concentric infill in a slicer: because every ring follows the shape of the lawn, there are no uncut wedges left in the corners.  Gardens that pinch into separate areas (say a neck through to a side lawn) each get their own spiral, so nothing gets missed.
 
-Position comes from an RTK GPS (Quectel LC29H) fused with wheel odometry.  I tried using the IMU gyro for heading, but the ground is far too bumpy - the readings were nonsense.  The machine barely slips on grass, so differential wheel odometry between GPS fixes works much better.
+Position comes from an RTK GPS (Quectel LC29H); between fixes it dead-reckons on wheel odometry.  Heading comes from a 9-axis BNO055 (on-chip fusion) as a tilt-compensated absolute compass, with a small offset continuously trimmed from the GPS travel direction on straight runs.  I tried integrating a bare gyro for heading first, but the ground is far too bumpy - the readings drifted badly; the magnetometer-based absolute heading is far steadier.
 
 It has a few self-recovery tricks built in: raising the deck and trying again when it bogs down in long wet grass, finishing a pass high and re-tracing lower when the blade is working too hard, and logging an obstacle (spotted by the IMU - no bumpers) to route around next time.  These automatic responses are currently disabled while I re-tune the detectors, so in the present firmware the blade is armed manually from the transmitter even in Auto, and only the tilt and perimeter cut-outs are active.
 
@@ -30,7 +30,7 @@ It has a few self-recovery tricks built in: raising the deck and trying again wh
 
 * ESP32-S3 DevKitC-1, the **N16R8** version (16MB Flash / 8MB PSRAM).  Be careful here - if you flash this firmware onto a generic S3 board with different memory, you'll likely brick it and need the Espressif Flash Download Tool or JTAG to recover it.  Ask me how I know.
 * DFRobot GNSS-RTK board (Quectel LC29H) + NTRIP corrections.  Gives 1-2cm accuracy when it has an RTK Fixed solution.
-* SparkFun BMI270 IMU - used for tilt safety and collision detection (the latter currently being re-tuned).
+* Bosch BNO055 9-axis IMU - on-chip sensor fusion gives an absolute heading; also used for tilt safety and collision detection (the latter currently disabled pending re-tune).
 * 3x VESC motor controllers on CANBUS at 250 kbit/s.  Mine are a mixed bag: two older HW4.x for the wheels (ID 1 & 2) and a HW6 for the blade (ID 3).  The older ones work fine, but make sure "Send CAN Status" is enabled in VESC Tool on ALL of them - the firmware needs the eRPM feedback, and the old boards default to silent.
 * Blade motor is from a Gtech cordless mower (CLM021) - cheap, light and surprisingly tough.  The VESC limits it to 2800 RPM, so the firmware just asks for full speed and lets the VESC's current limit do the soft start.
 * 13S battery, RadioMaster TX16S + ER8 receiver (ELRS), a linear actuator for cut height, and a PILZ safety relay as a proper hardware E-stop in the 48V line.  The ESP32 runs on a supercap backup so it doesn't lose its position when the PILZ fires or you swap the battery.
@@ -59,7 +59,7 @@ The firmware now refuses to wind up the power without live feedback from the whe
 
 ## Setting it up
 
-1. Arduino IDE 2.x, board "ESP32S3 Dev Module", Partition Scheme "Huge APP (3MB No OTA)", PSRAM "OPI PSRAM".  Libraries: SparkFun BMI270 and FastLED.
+1. Arduino IDE 2.x, board "ESP32S3 Dev Module", Partition Scheme "Huge APP (3MB No OTA)", PSRAM "OPI PSRAM".  Libraries: Adafruit BNO055 (+ Adafruit Unified Sensor) and FastLED.
 2. In VESC Tool: set CAN IDs 1 (left), 2 (right), 3 (blade), baud 250 kbit/s, enable CAN status messages on all three.  The firmware drives the wheel motors by duty cycle and the blade by speed control with a 2800 RPM limit.
 3. Wiring, calibration and the full operating procedure are in manual.md.  The CRSF telemetry format (if you want to build your own display) is in telemetry.md.
 4. Drive the perimeter, press Auto, and watch it go.
