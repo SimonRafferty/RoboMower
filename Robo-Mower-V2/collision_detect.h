@@ -5,8 +5,10 @@
 //  collision_detect.h — RoboMower IMU-Based Collision Detection
 //
 //  Replaces the physical bumper sensor (removed; GPIO6 is now the pause switch).
-//  Uses BMI270 accelerometer data (fed at 200Hz from Core 0 IMU task) to detect
-//  short-duration acceleration spikes that indicate obstacle contact.
+//  Uses BNO055 gravity-removed linear acceleration (fed at 100Hz from the Core 0
+//  IMU task, in g) to detect short-duration acceleration spikes from obstacle
+//  contact. NOTE: detection is currently DISABLED via AUTO_FAULT_RESPONSES_ENABLED;
+//  this module captures a baseline for future re-tuning.
 //
 //  Detection method:
 //    1. Compute short-window RMS variation of compensated acceleration magnitude.
@@ -48,19 +50,19 @@ enum CollisionDirection {
 
 /**
  * @brief Initialise collision detection. Loads baseline from NVS (Preferences,
- *        namespace "collision", key "baseline"). Call once from setup() after
+ *        namespace "collision", key "baseline_v2"). Call once from setup() after
  *        the IMU is initialised.
  */
 void collisionDetectInit();
 
 /**
  * @brief Feed a new IMU sample into the collision detector.
- *        Call at 200Hz from the IMU sampling task (Core 0).
- *        Pass gravity-compensated accelerometer values in g (subtract 1g from Z).
+ *        Call at 100Hz from the IMU sampling task (Core 0).
+ *        Pass BNO055 linear acceleration in g (gravity already removed by fusion).
  *
- * @param ax  Chassis X (forward) acceleration in g, gravity-compensated
- * @param ay  Chassis Y (left) acceleration in g, gravity-compensated
- * @param az  Chassis Z (up) acceleration in g, gravity-compensated (1g removed)
+ * @param ax  Surge (forward) linear acceleration in g
+ * @param ay  Sway (right) linear acceleration in g
+ * @param az  Heave (up) linear acceleration in g
  */
 void collisionDetectUpdate(float ax, float ay, float az);
 
@@ -122,3 +124,9 @@ void collisionSaveBaselineForced();
  * @brief Returns the current adaptive baseline in g (for STATUS/CALDUMP output).
  */
 float collisionGetBaseline();
+
+/**
+ * @brief Returns the latest short-window jolt RMS in g — the live signal the
+ *        adaptive baseline tracks. Used for baseline-capture logging.
+ */
+float collisionGetJoltRms();

@@ -1,8 +1,10 @@
 // ══════════════════════════════════════════════════════════════════════════════
 //  collision_detect.cpp — RoboMower IMU-Based Collision Detection
 //
-//  Implements adaptive-baseline jolt detection using BMI270 accelerometer data.
-//  Core 0 calls collisionDetectUpdate() at 200Hz.
+//  Implements adaptive-baseline jolt detection using BNO055 linear acceleration
+//  (gravity already removed by fusion, in g). Core 0 calls collisionDetectUpdate()
+//  at 100Hz. NOTE: detection is currently DISABLED via AUTO_FAULT_RESPONSES_ENABLED;
+//  this module captures a baseline for future re-tuning.
 //  Core 1 (state machine) reads collisionDetected() / collisionGetDirection().
 //
 //  References:
@@ -21,18 +23,23 @@
 
 // ── NVS namespace and key ─────────────────────────────────────────────────────
 static const char* NVS_NS  = "collision";
-static const char* NVS_KEY = "baseline";
+// "baseline_v2": fresh key for the BNO055 (gravity-removed linear accel in g).
+// The old "baseline" value (raw-accel-minus-1g from the previous IMU) has different
+// noise characteristics and is intentionally abandoned so the detector re-learns
+// from BASELINE_DEFAULT_G.
+static const char* NVS_KEY = "baseline_v2";
 
 
 // ── Internal state ────────────────────────────────────────────────────────────
 
 // Spinlock protecting s_baseline and s_savedBaseline.
-// Core 0 (IMU task) writes s_baseline at 200 Hz; Core 1 reads it in
+// Core 0 (IMU task) writes s_baseline at 100 Hz; Core 1 reads it in
 // collisionGetBaseline() and collisionSaveBaselineIfDue(). (HIGH-3 fix)
 static portMUX_TYPE s_baseline_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static float    s_baseline       = BASELINE_DEFAULT_G;
 static float    s_savedBaseline  = BASELINE_DEFAULT_G;  // value at last NVS write
+static volatile float s_jolt_rms = 0.0f;  // latest short-window jolt RMS (g), for capture/diagnostics
 
 // Circular buffer for short-window RMS computation
 static float    s_rmsWindow[COLLISION_RMS_WINDOW_SAMPLES];
@@ -163,6 +170,7 @@ void collisionDetectUpdate(float ax, float ay, float az) {
     float variance  = mean_mag2 - mean_mag * mean_mag;
     if (variance < 0.0f) variance = 0.0f;  // guard floating point rounding
     float jolt_rms  = sqrtf(variance);
+    s_jolt_rms = jolt_rms;   // publish for baseline-capture logging (Core 1 reads)
 
     // ── 4. Baseline adaptation (only during straight mowing) ──────────────────
     if (s_baselineAllowed && jolt_rms < s_baseline * BASELINE_OUTLIER_GATE) {
@@ -301,4 +309,8 @@ float collisionGetBaseline() {
     float bl = s_baseline;
     taskEXIT_CRITICAL(&s_baseline_mux);
     return bl;
+}
+
+float collisionGetJoltRms() {
+    return s_jolt_rms;  // single volatile float — atomic-enough for diagnostics
 }
