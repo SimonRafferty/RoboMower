@@ -3124,6 +3124,7 @@ void state_machine_update() {
         td.cut_height_mm  = (uint8_t)state_machine_get_cut_height_mm();
         td.blade_load_pct = (uint8_t)(cutting_monitor_get_load_fraction()     * 100.0f);
         td.fix_type       = (uint8_t)gps.fix_type;
+        td.calib_status   = imu_get_calib_status();
         td.flags          = (s_last_armed && g_state != STATE_PAUSED
                              && g_state != STATE_MOTORS_OFFLINE ? 0x01 : 0)
                           // Bit 0x02 = blade actually commanded — NOT just

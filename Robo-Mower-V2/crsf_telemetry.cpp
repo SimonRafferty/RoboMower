@@ -293,10 +293,11 @@ static void sendAttitude(const TelemetryData &d)
  *   [17] (18) uint8_t  heading MSB     } uint16 big-endian heading deg ×10
  *   [18] (19) uint8_t  heading LSB     }   depend on EdgeTX sensor discovery —
  *                                          RxBt/Yaw sensors can silently vanish)
+ *   [19] (20) uint8_t  calib            sys<<6 | gyro<<4 | accel<<2 | mag (each 0–3)
  */
 static void sendMowerStatus(const TelemetryData &d)
 {
-    uint8_t payload[19];
+    uint8_t payload[20];
 
     payload[0] = d.state;
     payload[1] = d.hprog;
@@ -322,6 +323,7 @@ static void sendMowerStatus(const TelemetryData &d)
     while (hdg >= 360.0f) hdg -= 360.0f;
     pack16be(&payload[17], (uint16_t)(hdg * 10.0f));
 
+    payload[19] = d.calib_status;   // BNO055 calibration (sys/gyro/accel/mag)
     sendFrame(0x80, payload, sizeof(payload));
 }
 

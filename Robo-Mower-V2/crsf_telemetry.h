@@ -63,7 +63,7 @@ struct TelemetryData {
     char    flight_mode[17];   ///< Null-terminated state name, max 16 chars. Examples:
                                ///<   "MANUAL", "AUTO-OK", "LEARN", "ESTOP", "RECOVERY"
 
-    // ── Mower status (frame 0x80, custom 19-byte payload) ───────────────────
+    // ── Mower status (frame 0x80, custom 20-byte payload) ───────────────────
     uint8_t  state;            ///< RobotState enum value (0–10), see state_machine.h
     uint8_t  hprog;            ///< Headland progress 0–100 %
     uint8_t  sprog;            ///< Strip progress 0–100 %
@@ -80,6 +80,8 @@ struct TelemetryData {
     uint16_t obs_count;        ///< Total obstacles detected this session
     uint16_t ekf_unc_cm;       ///< EKF position uncertainty in cm (ekf_get_position_uncertainty() × 100)
     uint32_t session_mowed_dm2;///< Mowed area this session in dm² (coverage_planner)
+    uint8_t  calib_status;     ///< BNO055 calibration: bits 7:6 sys, 5:4 gyro,
+                               ///< 3:2 accel, 1:0 mag (each 0–3). 0x80 byte 19.
 
     // ── Beep request (one-shot, packed into flags bits 7:6) ──────────────────
     uint8_t  beep_request;     ///< 0=none 1=confirm 2=warning 3=fault
