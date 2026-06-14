@@ -1108,6 +1108,14 @@ static void handle_ble_command(const char *json) {
         return;
     }
 
+    // ── RECAL_IMU ─────────────────────────────────────────────────────────────
+    if (strcmp(cmd, "RECAL_IMU") == 0) {
+        imu_recalibrate();
+        sys_log_push("IMU: compass recalibration started (drive slow loops in Manual)");
+        request_beep(BEEP_CONFIRM);
+        return;
+    }
+
     // ── SEND_PERIMETER ────────────────────────────────────────────────────────
     if (strcmp(cmd, "SEND_PERIMETER") == 0) {
         handle_send_perimeter(json);
