@@ -652,9 +652,9 @@ void ble_server_send_status() {
 
 static String build_diag_json() {
     // IMU
-    float imu_hdg   = imu_get_heading();
+    float imu_hdg   = imu_get_heading_fused();
     float imu_gz    = imu_get_gz_rads();
-    float imu_bias  = imu_get_bias();
+    uint8_t imu_cal = imu_get_calib_status();   // packed sys/gyro/accel/mag
     float imu_pitch = imu_get_pitch_rad() * (180.0f / M_PI);
     float imu_roll  = imu_get_roll_rad()  * (180.0f / M_PI);
     float imu_ax, imu_ay, imu_az;
@@ -706,7 +706,7 @@ static String build_diag_json() {
     char buf[1280];
     snprintf(buf, sizeof(buf),
         "{\"type\":\"diag\","
-        "\"imu\":{\"ok\":%d,\"hdg\":%.4f,\"gz\":%.4f,\"bias\":%.5f,"
+        "\"imu\":{\"ok\":%d,\"hdg\":%.4f,\"gz\":%.4f,\"cal\":%d,"
         "\"pitch\":%.1f,\"roll\":%.1f,"
         "\"surge\":%.3f,\"sway\":%.3f,\"heave\":%.3f},"
         "\"gps\":{\"v\":%d,\"fix\":%d,\"sat\":%d,\"hdop\":%.2f,"
@@ -725,7 +725,7 @@ static String build_diag_json() {
         "\"margin\":%.2f,\"tilt\":%.1f,\"hdgGain\":%.2f,"
         "\"t\":%lu}",
         // IMU
-        imu_ok ? 1 : 0, imu_hdg, imu_gz, imu_bias, imu_pitch, imu_roll,
+        imu_ok ? 1 : 0, imu_hdg, imu_gz, (int)imu_cal, imu_pitch, imu_roll,
         imu_ax, imu_ay, imu_az,
         // GPS
         gps.valid ? 1 : 0, (int)gps.fix_type, (int)gps.sat_count, gps.hdop,
