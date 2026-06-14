@@ -3176,6 +3176,22 @@ void state_machine_update() {
         }
 
         crsf_telemetry_update(td);
+
+        // ── Collision baseline capture (detection DISABLED) ───────────────────
+        // Detection is gated off (AUTO_FAULT_RESPONSES_ENABLED 0). Log the
+        // adaptive baseline + live jolt RMS every 5 s while driving so a real
+        // normal-driving/mowing baseline can be observed before re-enabling it.
+        {
+            static uint32_t s_coll_log_ms = 0;
+            bool driving = (g_state == STATE_MANUAL || g_state == STATE_AUTO_MOWING);
+            if (driving && (millis() - s_coll_log_ms) > 5000) {
+                s_coll_log_ms = millis();
+                char cline[SYS_LOG_MAX_LEN];
+                snprintf(cline, sizeof(cline), "COLL base=%.3fg jolt=%.3fg",
+                         (double)collisionGetBaseline(), (double)collisionGetJoltRms());
+                sys_log_push(cline);
+            }
+        }
     }
 
     // ── Update previous-channel states ───────────────────────────────────────
