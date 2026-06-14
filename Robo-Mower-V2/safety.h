@@ -39,7 +39,7 @@
  * Creates the nav-boundary mutex and the FreeRTOS "safety_task" pinned to
  * Core 1 at priority 20 (ARCHITECTURE.md §2), 4096-byte stack, 50 ms period.
  * Must be called from setup() after vesc_can_init(), crsf_input_init(),
- * imu_bmi270_init(), and servo_output_init() have been called.
+ * imu_init(), and servo_output_init() have been called.
  */
 void safety_init();
 

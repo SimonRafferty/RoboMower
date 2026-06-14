@@ -148,7 +148,7 @@
 #include "crsf_telemetry.h"
 #include "vesc_can.h"
 #include "rtk_gps.h"
-#include "imu_bmi270.h"
+#include "imu.h"
 #include "collision_detect.h"
 #include "servo_output.h"
 #include "obstacle_map.h"
@@ -199,8 +199,8 @@ void setup() {
     pinMode(PAUSE_PIN, INPUT_PULLUP);   // physical pause switch, GPIO6, active LOW
     servo_output_init();
     vesc_can_init(CAN_TX_PIN, CAN_RX_PIN);  // from config.h
-    if (!imu_bmi270_init()) {
-        sys_log_push("IMU: BMI270 not detected — check I2C wiring");
+    if (!imu_init()) {
+        sys_log_push("IMU: BNO055 not detected — check I2C wiring");
     }
     collisionDetectInit();     // loads collision baseline from NVS
     rtk_gps_init();            // starts GPS parse task on Core 0

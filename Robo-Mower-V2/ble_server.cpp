@@ -33,7 +33,7 @@
 #include "config.h"
 #include "mower_config.h"
 #include "sys_log.h"
-#include "imu_bmi270.h"
+#include "imu.h"
 #include "crsf_input.h"
 #include "node_follower.h"
 #include "heading_controller.h"

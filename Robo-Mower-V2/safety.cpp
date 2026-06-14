@@ -15,7 +15,7 @@
 #include "config.h"
 #include "crsf_input.h"
 #include "vesc_can.h"
-#include "imu_bmi270.h"
+#include "imu.h"
 #include "ekf_localiser.h"
 #include "battery_monitor.h"
 #include "rtk_gps.h"

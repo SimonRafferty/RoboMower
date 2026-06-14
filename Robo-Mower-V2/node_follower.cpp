@@ -2,7 +2,7 @@
 #include "config.h"
 #include "mower_config.h"
 #include "geometry.h"
-#include "imu_bmi270.h"
+#include "imu.h"
 #include "collision_detect.h"
 #include "wheel_duty_ramp.h"
 #include "ekf_localiser.h"

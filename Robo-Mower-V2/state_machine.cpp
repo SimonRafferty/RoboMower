@@ -27,7 +27,7 @@
 #include "servo_output.h"
 #include "ekf_localiser.h"
 #include "rtk_gps.h"
-#include "imu_bmi270.h"
+#include "imu.h"
 #include "perimeter.h"
 #include "geometry.h"
 #include "coverage_planner.h"
@@ -669,7 +669,6 @@ void state_machine_handle_serial(const char *raw_cmd) {
         DBG_PRINTF("[CALDUMP] Blade cal=%.2fA  cal_done=%s\r\n",
             cutting_monitor_get_cal_current(),
             cutting_monitor_is_cal_complete() ? "YES" : "NO");
-        DBG_PRINTF("[CALDUMP] IMU bias=%.6f rad/s\r\n", imu_get_bias());
         DBG_PRINTF("[CALDUMP] Collision baseline=%.4f g\r\n", collisionGetBaseline());
         return;
     }
@@ -1755,10 +1754,7 @@ void state_machine_update() {
         bool ble_ready = ble_server_is_connected();
         bool gps_ready = rtk_gps_has_origin();  // informational only
 
-        // IMU bias: collect on entry (blocking ~2.5 s)
         if (g_state_entry) {
-            DBG_PRINTLN("[INIT] Collecting IMU gyro bias (keep robot stationary)...");
-            imu_collect_bias();
             ekf_init();
         }
 
