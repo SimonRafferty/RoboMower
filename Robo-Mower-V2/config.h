@@ -110,8 +110,25 @@
 #define VESC_ID_RIGHT                2   // Right drive motor VESC
 #define VESC_ID_BLADE                3   // Blade motor VESC (Gtech CLM021)
 
-// IMU I2C address (BMI270 SA0=VCC → 0x69)
-#define IMU_I2C_ADDRESS           0x69   // SparkFun BMI270 I2C address (SDO/SA0=VCC)
+// IMU I2C address (BNO055 ADR/COM3 low → 0x28; high → 0x29)
+#define IMU_I2C_ADDRESS           0x28   // Adafruit BNO055 default I2C address
+#define IMU_I2C_CLOCK_HZ          100000 // BNO055 clock-stretch quirk — 100 kHz
+
+// BNO055 sampling task (Core 0)
+#define IMU_TASK_HZ               100    // BNO fusion output rate
+#define IMU_TASK_PRIORITY         10
+#define IMU_TASK_STACK            4096
+
+// BNO055 axis remap to the robot frame (confirmed at bring-up).
+// Defaults = chip placement P1 (Adafruit default). surge fwd+, sway right+,
+// heave up+, heading CW-from-North+. Adjust REMAP/SIGN after the bring-up check.
+#define IMU_AXIS_REMAP_CONFIG     0x24   // Adafruit_BNO055::REMAP_CONFIG_P1
+#define IMU_AXIS_REMAP_SIGN       0x00   // Adafruit_BNO055::REMAP_SIGN_P1
+
+// Heading-confidence gate: BNO calibration levels (each 0..3) required for the
+// absolute heading to be trusted (NDOF: system + magnetometer).
+#define IMU_CALIB_SYS_MIN         2
+#define IMU_CALIB_MAG_MIN         2
 
 
 // ══════════════════════════════════════════════════════════════════════════════
