@@ -2374,21 +2374,9 @@ void state_machine_update() {
 
         // Execute node follower
         if (s_wp_index < s_wp_count) {
-            // ── Heading-confidence gate (replaces 2 m clearance + creep) ──────
-            // AUTO needs a trustworthy absolute heading. The BNO055 provides it
-            // at 100 Hz; we only require its magnetometer to be calibrated.
-            // Checked every tick: if confidence is lost mid-mow, PAUSE rather
-            // than degrade. The operator recalibrates by driving slow loops in
-            // MANUAL (prompted on the TX16S widget and PWA).
-            if (!imu_heading_is_confident()) {
-                vesc_set_current(VESC_ID_LEFT,  0);
-                vesc_set_current(VESC_ID_RIGHT, 0);
-                sys_log_push("AUTO: heading not confident (mag) -> PAUSE; drive loops in Manual");
-                request_beep(BEEP_WARNING);
-                transition_to(STATE_PAUSED);
-                break;
-            }
-
+            // Heading comes from the BNO055 (NDOF auto-calibrates continuously) +
+            // GPS-trimmed offset. AUTO does NOT gate on calibration status — the
+            // fused heading is usable from the start and GPS corrects any bias.
             WheelCmd cmd = node_follower_compute(pose, speed,
                                                  s_wp_buf, s_wp_count, s_wp_index,
                                                  s_desired_cut_height_mm, speed_scale);
