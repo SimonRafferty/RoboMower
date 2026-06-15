@@ -30,7 +30,9 @@
 #include <cstring>
 
 static const char* EKF_NVS_NS      = "imu";
-static const char* EKF_NVS_KEY_OFF = "hdgoff";
+// "hdgoff2": bumped 2026-06-15 to abandon a corrupted offset persisted by the old
+// s_v-based reverse-correction (started at 180° on boot). Starts clean at 0.
+static const char* EKF_NVS_KEY_OFF = "hdgoff2";
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  EKF state (protected by g_ekf_mutex)
@@ -436,9 +438,18 @@ void ekf_update_gps(float gps_east, float gps_north, int fix_type,
                            HEADING_GPS_DIST_SIGMA_K)) {
                 float z_hdg = atan2f(dE, dN);   // travel dir, 0=N, CW+
                 if (isfinite(z_hdg)) {
-                    // Reverse correction: chassis FRONT is 180° opposite when
-                    // reversing (s_v < 0).
-                    if (s_v < -0.03f) z_hdg = wrapAngle(z_hdg + (float)M_PI);
+                    // Forward vs reverse from the ABSOLUTE BNO heading, NOT s_v.
+                    // The wheel-velocity sign is unreliable on this drivetrain
+                    // (tracks driven "in reverse" by the motors), so the old
+                    // `s_v < 0` test fired during FORWARD driving and flipped the
+                    // chord, dragging the offset to 180° over ~a minute. If GPS
+                    // travel is >90° from where the chassis actually points, we are
+                    // reversing — flip the chord to chassis-front. Compared to the
+                    // RAW bno (not the composed heading) so a bad offset cannot feed
+                    // back and lock in a flip.
+                    if (fabsf(wrapAngle(z_hdg - bno_hdg)) > (float)M_PI * 0.5f) {
+                        z_hdg = wrapAngle(z_hdg + (float)M_PI);
+                    }
 
                     s_hdg_offset = heading_offset_ema(s_hdg_offset, z_hdg, bno_hdg,
                                                       HEADING_OFFSET_TRIM_GAIN);
