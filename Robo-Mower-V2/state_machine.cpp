@@ -3154,6 +3154,25 @@ void state_machine_update() {
                 sys_log_push(cline);
             }
         }
+
+        // ── Heading diagnostic (debugging the AUTO heading-flip) ───────────────
+        // bno = raw BNO055 fused heading; th = EKF heading (= bno + GPS offset);
+        // off = the GPS-trimmed offset (deg). If `th` flips while `bno` stays
+        // steady, the GPS offset-trim drifted; if `bno` itself flips, it's the
+        // magnetometer (motor/blade interference). Temporary — remove once solved.
+        {
+            static uint32_t s_hdg_log_ms = 0;
+            bool driving = (g_state == STATE_MANUAL || g_state == STATE_AUTO_MOWING);
+            if (driving && (millis() - s_hdg_log_ms) > 3000) {
+                s_hdg_log_ms = millis();
+                int bno_i = ((int)roundf(imu_get_heading_fused() * 57.29578f) % 360 + 360) % 360;
+                int th_i  = ((int)roundf(pose.heading           * 57.29578f) % 360 + 360) % 360;
+                int off_i = (int)roundf(ekf_get_heading_offset() * 57.29578f);
+                char hline[SYS_LOG_MAX_LEN];
+                snprintf(hline, sizeof(hline), "HDG bno=%d th=%d off=%d", bno_i, th_i, off_i);
+                sys_log_push(hline);
+            }
+        }
     }
 
     // ── Update previous-channel states ───────────────────────────────────────
