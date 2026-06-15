@@ -189,9 +189,6 @@ static bool s_learn_first_point = true;  // true until first CH8 press in learn 
 static float s_home_x = 0.0f;
 static float s_home_y = 0.0f;
 
-// ── MANUAL state locals ───────────────────────────────────────────────────────
-static uint32_t s_ch2_centred_since_ms = 0;  // when CH2 last went to centre
-
 // ── OBSTACLE_AVOID state locals ───────────────────────────────────────────────
 static float    s_obstacle_backup_dist_m  = OBSTACLE_BACKUP_DIST_M;  // direction-adjusted
 static uint32_t s_obstacle_enter_ms       = 0;      // millis() when OBSTACLE_AVOID was entered
@@ -1783,7 +1780,6 @@ void state_machine_update() {
             vesc_set_current(VESC_ID_LEFT,  0);
             vesc_set_current(VESC_ID_RIGHT, 0);
             vesc_set_current(VESC_ID_BLADE, 0);
-            servo_set_height_mm(mower_config_get().cut_height_max_mm);
             safety_set_auto_mode(false);
             s_blade_commanded = false;
             s_blade_ramp_erpm = 0.0f;
@@ -1902,7 +1898,6 @@ void state_machine_update() {
     // ── STATE_MANUAL ──────────────────────────────────────────────────────────
     case STATE_MANUAL: {
         if (g_state_entry) {
-            s_ch2_centred_since_ms = 0;
             s_heading_active = false;
             s_drive_duty_l = 0.0f;
             s_drive_duty_r = 0.0f;
@@ -2005,27 +2000,6 @@ void state_machine_update() {
             break;
         }
 
-        // CH4 == MANUAL AND CH2 centred for > 2 s → IDLE
-        // Skip this timeout when RC is in failsafe AND BLE is connected:
-        // the frozen CRSF channels would always look centred, incorrectly
-        // kicking the mower to IDLE and preventing WebUI from taking over.
-        float throttle = crsf_us_to_norm(rc.ch[CRSF_CH_THROTTLE]);
-        bool ch2_centred = (fabsf(throttle) < 0.05f);  // < 5% deflection = centred
-        if (!ch2_centred) {
-            s_ch2_centred_since_ms = 0;
-        } else if (s_ch2_centred_since_ms == 0) {
-            s_ch2_centred_since_ms = millis();
-        }
-        if (!rc.failsafe &&
-            ch4_is_manual(ch4) && ch2_centred &&
-            !s_blade_commanded &&
-            s_ch2_centred_since_ms != 0 &&
-            (millis() - s_ch2_centred_since_ms > 2000)) {
-            vesc_set_current(VESC_ID_LEFT,  0);
-            vesc_set_current(VESC_ID_RIGHT, 0);
-            transition_to(STATE_IDLE);
-            break;
-        }
         break;
     }
 
