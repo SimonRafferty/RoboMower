@@ -47,8 +47,9 @@ bool imu_is_fault();
  *  each 0..3. */
 uint8_t imu_get_calib_status();
 
-/** True when the absolute heading is trustworthy (NDOF: sys ≥ IMU_CALIB_SYS_MIN
- *  AND mag ≥ IMU_CALIB_MAG_MIN). */
+/** True when the absolute heading is trustworthy: BNO mag/gyro/accel each at or
+ *  above their IMU_CALIB_*_MIN thresholds. The unreliable `sys` aggregate is NOT
+ *  used (it often never reaches 3 even when the three sensors are fully calibrated). */
 bool imu_heading_is_confident();
 
 /** Force a fresh magnetometer recalibration: discard the stored NVS profile and

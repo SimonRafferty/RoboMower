@@ -125,10 +125,13 @@
 #define IMU_AXIS_REMAP_CONFIG     0x24   // Adafruit_BNO055::REMAP_CONFIG_P1
 #define IMU_AXIS_REMAP_SIGN       0x00   // Adafruit_BNO055::REMAP_SIGN_P1
 
-// Heading-confidence gate: BNO calibration levels (each 0..3) required for the
-// absolute heading to be trusted (NDOF: system + magnetometer).
-#define IMU_CALIB_SYS_MIN         2
+// Heading-confidence gate: per-sensor BNO calibration levels (each 0..3) required
+// for the absolute heading to be trusted. The BNO055 `sys` aggregate is unreliable
+// (often stays 0 even when gyro/accel/mag are all 3, and mag decays when held
+// still), so we gate on the three real sensors instead of sys.
 #define IMU_CALIB_MAG_MIN         2
+#define IMU_CALIB_GYRO_MIN        2
+#define IMU_CALIB_ACCEL_MIN       2
 
 
 // ══════════════════════════════════════════════════════════════════════════════

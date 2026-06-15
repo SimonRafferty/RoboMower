@@ -640,14 +640,16 @@ local function refresh(widget, event, touchState)
     draw_vesc_bar(widget.state_str, blade_on, is_bog)
     draw_dividers()
 
-    -- Magnetometer-calibration prompt: when the BNO heading is not yet
-    -- trustworthy (sys < 2 or mag < 2), flash a banner telling the operator to
-    -- drive slow loops in MANUAL. One-time after first setup (profile persists).
+    -- Magnetometer-calibration prompt: when the BNO heading is not yet trustworthy
+    -- (mag/gyro/accel < 2 — the `sys` aggregate is unreliable and ignored), flash a
+    -- banner telling the operator to calibrate. One-time after first setup (profile
+    -- persists). Mirrors imu_heading_is_confident() in the firmware.
     if widget.have_calib then
-        local cal     = widget.calib or 0
-        local cal_sys = bit32.band(bit32.rshift(cal, 6), 0x03)
-        local cal_mag = bit32.band(cal, 0x03)
-        if not (cal_sys >= 2 and cal_mag >= 2) then
+        local cal       = widget.calib or 0
+        local cal_gyro  = bit32.band(bit32.rshift(cal, 4), 0x03)
+        local cal_accel = bit32.band(bit32.rshift(cal, 2), 0x03)
+        local cal_mag   = bit32.band(cal, 0x03)
+        if not (cal_mag >= 2 and cal_gyro >= 2 and cal_accel >= 2) then
             if math.floor(getTime() / 50) % 2 == 0 then
                 lcd.drawFilledRectangle(0, HDR_H + 1, SCR_W, 22, C_AMBER)
                 lcd.drawText(SCR_W / 2, HDR_H + 3,

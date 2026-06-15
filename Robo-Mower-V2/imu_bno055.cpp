@@ -157,9 +157,14 @@ uint8_t imu_get_calib_status() { return s_calib; }
 
 bool imu_heading_is_confident() {
     uint8_t c = s_calib;
-    uint8_t sys = (c >> 6) & 0x03;
-    uint8_t mag =  c       & 0x03;
-    return (sys >= IMU_CALIB_SYS_MIN) && (mag >= IMU_CALIB_MAG_MIN);
+    uint8_t gyro  = (c >> 4) & 0x03;
+    uint8_t accel = (c >> 2) & 0x03;
+    uint8_t mag   =  c       & 0x03;
+    // The BNO055 `sys` aggregate is unreliable (often 0 even when the three real
+    // sensors are fully calibrated), so gate on mag/gyro/accel directly.
+    return (mag   >= IMU_CALIB_MAG_MIN)
+        && (gyro  >= IMU_CALIB_GYRO_MIN)
+        && (accel >= IMU_CALIB_ACCEL_MIN);
 }
 
 void imu_recalibrate() {
@@ -234,8 +239,11 @@ static void imu_task(void* pv) {
             // Feed gravity-removed acceleration (g) to the collision detector.
             collisionDetectUpdate(ax, ay, az);
 
-            // Auto-save the calibration profile once fully calibrated and changed.
-            if (!s_profile_saved && s_bno.isFullyCalibrated()) {
+            // Auto-save the calibration profile once the three real sensors are
+            // fully calibrated. NOT s_bno.isFullyCalibrated() — that also requires
+            // sys==3, which the BNO055 often never reaches, so the profile would
+            // otherwise never persist (forcing a re-calibrate every boot).
+            if (!s_profile_saved && gy == 3 && ac == 3 && mg == 3) {
                 uint8_t buf[22];
                 if (s_bno.getSensorOffsets(buf)) {
                     save_cal_to_nvs(buf);
