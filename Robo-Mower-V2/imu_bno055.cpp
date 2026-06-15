@@ -202,9 +202,13 @@ static void imu_task(void* pv) {
             // BNO right-hand-rule yaw (CCW+) → firmware CW+ : negate.
             float gz = -(float)gyro.z() * (float)DEG_TO_RAD;
 
-            // Euler pitch/roll already in the robot frame via axis remap.
-            float pitch = ev.orientation.z * (float)DEG_TO_RAD;
-            float roll  = ev.orientation.y * (float)DEG_TO_RAD;
+            // Euler pitch/roll in the robot frame via axis remap. Negated so the
+            // sign matches the imu.h convention (pitch nose-up +, roll right-side-
+            // down +); confirmed on the bench 2026-06-15 (BNO P1 default reads the
+            // opposite). Tilt below is sign-independent (acos of cos·cos), so this
+            // only affects the reported/displayed attitude sign.
+            float pitch = -ev.orientation.z * (float)DEG_TO_RAD;
+            float roll  = -ev.orientation.y * (float)DEG_TO_RAD;
             float tilt  = acosf(cosf(pitch) * cosf(roll));  // angle from vertical
 
             // Linear accel (gravity removed) → g, robot frame from axis remap.
