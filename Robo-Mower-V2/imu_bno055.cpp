@@ -17,6 +17,7 @@
 #include "config.h"
 #include "geometry.h"          // wrapAngle()
 #include "collision_detect.h"  // collisionDetectUpdate()
+#include "sys_log.h"           // operator-visible calibration-save confirmation
 
 #include <Adafruit_BNO055.h>
 #include <Adafruit_Sensor.h>
@@ -78,6 +79,29 @@ static void clear_cal_in_nvs() {
     p.begin(NVS_NAMESPACE, /*readOnly=*/false);
     p.remove(NVS_KEY_CAL);
     p.end();
+}
+
+// Read the BNO055's 22 calibration-offset registers DIRECTLY (in CONFIG mode),
+// bypassing Adafruit's getSensorOffsets() — that one only returns data when
+// isFullyCalibrated() is true, which in NDOF requires sys==3. A magnetically-noisy
+// machine never reaches sys==3, so the profile would otherwise never save. The
+// CONFIG↔NDOF switch restarts fusion (live calib status briefly drops then
+// re-validates from these offsets). Called once per session when gyro/accel/mag=3.
+static bool read_offsets_raw(uint8_t out[22]) {
+    s_bno.setMode(OPERATION_MODE_CONFIG);
+    delay(25);
+    bool ok = false;
+    Wire.beginTransmission((uint8_t)IMU_I2C_ADDRESS);
+    Wire.write((uint8_t)0x55);  // ACCEL_OFFSET_X_LSB_ADDR — first of 22 offset regs
+    if (Wire.endTransmission() == 0) {
+        uint8_t got = Wire.requestFrom((uint8_t)IMU_I2C_ADDRESS, (uint8_t)22);
+        uint8_t i = 0;
+        while (i < 22 && Wire.available()) out[i++] = Wire.read();
+        ok = (got == 22 && i == 22);
+    }
+    s_bno.setMode(OPERATION_MODE_NDOF);
+    delay(20);
+    return ok;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -245,9 +269,10 @@ static void imu_task(void* pv) {
             // otherwise never persist (forcing a re-calibrate every boot).
             if (!s_profile_saved && gy == 3 && ac == 3 && mg == 3) {
                 uint8_t buf[22];
-                if (s_bno.getSensorOffsets(buf)) {
+                if (read_offsets_raw(buf)) {
                     save_cal_to_nvs(buf);
                     s_profile_saved = true;
+                    sys_log_push("IMU: BNO055 calibration saved (restores on reboot)");
                     DBG_PRINTLN("[IMU] BNO055 calibration profile saved to NVS");
                 }
             }
