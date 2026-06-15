@@ -212,9 +212,10 @@ input[type=range] { width: 100%; }
 }
 #rc-gating-banner .rc-icon { font-size:2rem; }
 
-/* Magnetometer-calibration warning bar (fixed, top) */
+/* Magnetometer-calibration warning bar (fixed, just below the header tab bar so
+   it never covers the tab buttons) */
 #mag-cal-banner {
-  position:fixed; top:0; left:0; right:0; z-index:60;
+  position:fixed; top:var(--hdr-h); left:0; right:0; z-index:60;
   display:none; align-items:center; justify-content:center; gap:12px;
   background:var(--amber); color:#000; padding:8px 12px;
   font-size:0.9rem; font-weight:700; text-align:center;
