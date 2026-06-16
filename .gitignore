@@ -7,8 +7,11 @@
 # Host-test suite — kept local only (run offline); not tracked in the repo
 /host_test/
 
-# Internal design plans / specs — kept local only; not tracked in the repo
-/docs/superpowers/
+# Docs (plans, specs, TODO) — kept local only; not tracked in the repo
+/docs/
+
+# Project guidance for Claude Code — kept local only; not tracked in the repo
+/CLAUDE.md
 
 # One-off debug screenshot of a path-planning bug that's since been fixed
 /Path Plan error.jpg
