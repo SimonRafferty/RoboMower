@@ -50,6 +50,8 @@ $cli = "C:\Users\simon\Downloads\arduino-cli_1.5.0_Windows_64bit\arduino-cli.exe
 
 ### Geometry unit tests — host build (no hardware)
 
+> **`host_test/` is local-only (gitignored, not in the repo) as of 2026-06-16** — kept on the dev machine, absent from a fresh clone. The paths below are for the local working copy.
+
 `host_test/` compiles `geometry.cpp` + `geometry_test.cpp` for Windows via Zig's bundled clang (`winget install zig.zig`), plus extra concave / chained-inset scenarios in `host_test/main.cpp`:
 
 ```powershell
