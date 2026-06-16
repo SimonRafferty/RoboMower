@@ -450,6 +450,9 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
         <div class="cfg-actions">
           <button id="cfg-save-btn" disabled title="Send all config values to the mower. Saved to NVS flash and takes effect immediately">Save to Mower</button>
           <button id="cfg-reset-btn" title="Discard changes and reload all fields from the mower's current saved config">Reset to Current</button>
+          <button id="cfg-save-file-btn" title="Export the current form values to a JSON file on this device (works offline)">Save to File</button>
+          <button id="cfg-load-btn" title="Import settings from a JSON file. Missing settings use defaults; unknown settings are ignored. Review, then press Save to Mower to apply.">Load from File</button>
+          <input type="file" id="cfg-file-input" accept="application/json,.json" style="display:none">
         </div>
       </div>
     </details>
@@ -531,6 +534,10 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
               title="Fetch the latest status and system log from the mower (log shows on the Dashboard tab)">Refresh Log</button>
       <button class="ctrl-btn" id="btn-recal-imu" disabled
               title="Optional: force a fresh BNO055 compass calibration (clears the stored profile and relearns). The IMU also auto-calibrates as it drives. After pressing, drive slow figure-8/loops.">Calibrate compass</button>
+      <button class="ctrl-btn" id="btn-imu-caltest" disabled
+              title="Test that the compass calibration can be saved to flash, WITHOUT recalibrating. Writes and reads back a test value. Check the log for PASS/FAIL.">Test cal save</button>
+      <button class="ctrl-btn" id="btn-imu-savecal" disabled
+              title="Save the current compass calibration to flash now (only when fully calibrated). Verified by read-back — check the log to confirm before reassembling.">Save cal now</button>
     </div>
     <div id="diag-grid"></div>
   </section>
@@ -811,6 +818,8 @@ const Commands = {
   clearObstacles:()     => ({ cmd: 'CLEAR_OBSTACLES' }),
   clearPerimeter:()     => ({ cmd: 'CLEAR_PERIMETER' }),
   recalibrateImu:()     => ({ cmd: 'RECAL_IMU' }),
+  imuCalTest:()         => ({ cmd: 'IMUCALTEST' }),
+  imuSaveCal:()         => ({ cmd: 'IMUSAVECAL' }),
   sendPerimeter: (origin, polygon) => ({ cmd: 'SEND_PERIMETER', origin, polygon })
 };
 
@@ -1786,6 +1795,20 @@ async function main() {
       showToast('Compass recalibration started — drive slow loops in Manual', true);
     } catch (e) { showToast(e.message, false); }
   });
+  document.getElementById('btn-imu-caltest')?.addEventListener('click', async () => {
+    if (!ble.connected) { showToast('Not connected', false); return; }
+    try {
+      await ble.sendCommand(Commands.imuCalTest());
+      showToast('Cal-save self-test requested — check the log for PASS/FAIL', true);
+    } catch (e) { showToast(e.message, false); }
+  });
+  document.getElementById('btn-imu-savecal')?.addEventListener('click', async () => {
+    if (!ble.connected) { showToast('Not connected', false); return; }
+    try {
+      await ble.sendCommand(Commands.imuSaveCal());
+      showToast('Save requested — check the log to confirm it verified', true);
+    } catch (e) { showToast(e.message, false); }
+  });
 
   // ── DriveController ──────────────────────────────────
   const driveCrl = new DriveController(ble);
@@ -2001,6 +2024,28 @@ async function main() {
     'min_turn_radius_m'
   ];
 
+  // Firmware defaults (config.h) — used when a loaded config file omits a key,
+  // so importing a partial/old file never leaves a field blank. Keep in sync
+  // with Robo-Mower-V2/config.h #defines (see mower_config.cpp k_defaults).
+  const CFG_DEFAULTS = {
+    footprint_width_m: 0.60, footprint_length_m: 0.70,
+    track_width_m: 0.50,
+    wheel_radius_m: 0.10, motor_pole_pairs: 7, gear_ratio: 20.0,
+    antenna_fwd_m: -0.20, antenna_right_m: 0.00,
+    steer_to_cut_m: 0.0, cut_disc_radius_m: 0.21, cut_width_m: 0.38, strip_overlap_m: 0.02,
+    cut_height_min_mm: 35, cut_height_max_mm: 90,
+    blade_motor_pole_pairs: 10, blade_target_rpm: 2800,
+    pp_lookahead_base_m: 0.40, pp_lookahead_k: 0.80,
+    max_mowing_speed_ms: 0.15, headland_speed_ms: 0.20, transit_speed_ms: 0.30, min_creep_speed_ms: 0.05,
+    waypoint_arrive_dist_m: 0.15, max_wheel_speed_ms: 0.5,
+    max_current_a: 15.0, current_ramp_a_per_s: 3.0,
+    uncertainty_margin_m: 0.50, tilt_limit_normal_deg: 30.0, tilt_limit_careful_deg: 15.0, collision_mult_careful: 3.0,
+    heading_kp: 0.30, heading_kd: 0.05, manual_max_yaw_rate: 0.8,
+    wheel_pi_kp: 10.0, wheel_pi_ki: 2.0,
+    manual_max_duty: 0.60, manual_max_speed_ms: 0.5,
+    min_turn_radius_m: 0.0
+  };
+
   function cfgUpdateDerived(cfg) {
     const fw        = cfg.footprint_width_m  || 0;
     const fl        = cfg.footprint_length_m || 0;
@@ -2067,6 +2112,79 @@ async function main() {
     // Re-request status to restore fields from mower
     if (ble.connected) ble.sendCommand(Commands.requestStatus());
     else showToast('Not connected — showing last received values', false);
+  });
+
+  // ── Config file save / load (offline, by name) ──────────
+  // Export the current form values to a JSON file. Settings are keyed by name
+  // so a file from one firmware version still loads into another (see import).
+  async function saveConfigToFile() {
+    const out = { type: 'robomower-config', version: 1, savedAt: new Date().toISOString(),
+                  settings: cfgReadForm() };
+    const json = JSON.stringify(out, null, 2);
+    const name = 'robomower-config.json';
+    if (window.showSaveFilePicker) {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: name,
+        types: [{ description: 'RoboMower config JSON', accept: { 'application/json': ['.json'] } }]
+      });
+      const w = await handle.createWritable();
+      await w.write(json);
+      await w.close();
+    } else {
+      const blob = new Blob([json], { type: 'application/json' });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href = url; a.download = name; a.click();
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  // Populate the form from a settings object. Known keys present in the file are
+  // applied; known keys missing fall back to CFG_DEFAULTS; unknown keys ignored.
+  function applyConfigSettings(settings) {
+    const known = new Set(CFG_FIELDS);
+    let applied = 0, defaulted = 0;
+    const ignored = Object.keys(settings).filter(k => !known.has(k)).length;
+    const merged = {};
+    CFG_FIELDS.forEach(f => {
+      const v = settings[f];
+      if (v !== undefined && v !== null && v !== '' && !Number.isNaN(Number(v))) {
+        merged[f] = Number(v); applied++;
+      } else {
+        merged[f] = CFG_DEFAULTS[f]; defaulted++;
+      }
+    });
+    cfgPopulate(merged);
+    return { applied, defaulted, ignored };
+  }
+
+  document.getElementById('cfg-save-file-btn').addEventListener('click', async () => {
+    try {
+      await saveConfigToFile();
+      showToast('Settings saved to file', true);
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;   // user cancelled the dialog
+      showToast('Save to file failed: ' + (err.message || err), false);
+    }
+  });
+
+  const cfgFileInput = document.getElementById('cfg-file-input');
+  document.getElementById('cfg-load-btn').addEventListener('click', () => cfgFileInput.click());
+  cfgFileInput.addEventListener('change', async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';                              // allow re-loading the same file
+    if (!file) return;
+    try {
+      const obj = JSON.parse(await file.text());
+      const settings = (obj && typeof obj.settings === 'object') ? obj.settings : obj;
+      if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+        throw new Error('no settings object found');
+      }
+      const r = applyConfigSettings(settings);
+      showToast(`Loaded ${r.applied} setting(s), ${r.defaulted} defaulted, ${r.ignored} ignored — review, then "Save to Mower".`, true);
+    } catch (err) {
+      showToast('Config load failed: ' + (err.message || err), false);
+    }
   });
 
   // Build initial dashboard (placeholder)

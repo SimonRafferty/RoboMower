@@ -53,7 +53,8 @@ static const int   ESTOP_MAX       = 20;            ///< Circular log capacity
 static const int   ESTOP_BLOB_SIZE = ESTOP_MAX * sizeof(EStopEvent);  ///< 880 bytes
 
 // NVS blob keys
-static const char* KEY_PERIM       = "perim";
+static const char* KEY_PERIM       = "perim";    ///< legacy ENU-float perimeter (migrated to perim2)
+static const char* KEY_PERIM_LL    = "perim2";   ///< canonical lat/lon + per-point accuracy perimeter
 static const char* KEY_NAVPOLY     = "navpoly";
 static const char* KEY_WORKPOLY    = "workpoly";
 static const char* KEY_GPSORIGIN   = "gpsorigin";
@@ -515,11 +516,107 @@ bool nvs_has_valid_perimeter()
     return g_valid_perim;
 }
 
+// ── Canonical perimeter: absolute lat/lon + per-point accuracy ────────────────
+// Blob: [uint32 count][ (double lat, double lon, float acc) × count ][uint32 crc32]
+// Origin-independent — re-derived to ENU on boot against the current origin.
+static constexpr size_t LL_PT_BYTES = sizeof(double) * 2 + sizeof(float);  // 20
+
+bool nvs_save_perimeter_ll(const double *lat, const double *lon,
+                           const float *acc, int count)
+{
+    if (!lat || !lon || !acc || count < 3 || count > 500) return false;
+
+    const size_t data_size = 4 + (size_t)count * LL_PT_BYTES;
+    const size_t blob_size = data_size + 4;
+    uint8_t *blob = (uint8_t *)malloc(blob_size);
+    if (!blob) return false;
+
+    uint32_t c = (uint32_t)count;
+    memcpy(blob, &c, 4);
+    size_t off = 4;
+    for (int i = 0; i < count; i++) {
+        memcpy(blob + off, &lat[i], 8); off += 8;
+        memcpy(blob + off, &lon[i], 8); off += 8;
+        memcpy(blob + off, &acc[i], 4); off += 4;
+    }
+    uint32_t crc = crc32_compute(blob, data_size);
+    memcpy(blob + data_size, &crc, 4);
+
+    nvs_handle_t h = nvs_open_rw();
+    if (!h) { free(blob); return false; }
+    esp_err_t err = nvs_set_blob(h, KEY_PERIM_LL, blob, blob_size);
+    free(blob);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        DBG_PRINTF("[NVS] save_perimeter_ll: write error: %s\n", esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
+int nvs_load_perimeter_ll(double *lat, double *lon, float *acc, int max_count)
+{
+    if (!lat || !lon || !acc || max_count <= 0) return 0;
+
+    nvs_handle_t h = nvs_open_ro();
+    if (!h) return 0;
+
+    size_t    blob_size = 0;
+    esp_err_t err = nvs_get_blob(h, KEY_PERIM_LL, nullptr, &blob_size);
+    if (err != ESP_OK || blob_size < 4 + LL_PT_BYTES + 4) { nvs_close(h); return 0; }
+
+    uint8_t *buf = (uint8_t *)malloc(blob_size);
+    if (!buf) { nvs_close(h); return 0; }
+    err = nvs_get_blob(h, KEY_PERIM_LL, buf, &blob_size);
+    nvs_close(h);
+    if (err != ESP_OK) { free(buf); return 0; }
+
+    uint32_t count = 0;
+    memcpy(&count, buf, 4);
+    if (count < 3 || count > 500) { free(buf); return 0; }
+
+    const size_t data_size = 4 + (size_t)count * LL_PT_BYTES;
+    if (blob_size != data_size + 4) { free(buf); return 0; }
+
+    uint32_t computed = crc32_compute(buf, data_size);
+    uint32_t stored = 0;
+    memcpy(&stored, buf + data_size, 4);
+    if (computed != stored) {
+        DBG_PRINTF("[NVS] load_perimeter_ll: CRC mismatch (0x%08X vs 0x%08X)\n",
+                      (unsigned)computed, (unsigned)stored);
+        free(buf);
+        return 0;
+    }
+
+    int n = (int)count;
+    if (n > max_count) n = max_count;
+    size_t off = 4;
+    for (int i = 0; i < n; i++) {
+        memcpy(&lat[i], buf + off, 8); off += 8;
+        memcpy(&lon[i], buf + off, 8); off += 8;
+        memcpy(&acc[i], buf + off, 4); off += 4;
+    }
+    free(buf);
+    return n;
+}
+
+bool nvs_has_perimeter_ll()
+{
+    nvs_handle_t h = nvs_open_ro();
+    if (!h) return false;
+    size_t sz = 0;
+    esp_err_t err = nvs_get_blob(h, KEY_PERIM_LL, nullptr, &sz);
+    nvs_close(h);
+    return (err == ESP_OK && sz >= 4 + LL_PT_BYTES + 4);
+}
+
 void nvs_clear_perimeter()
 {
     nvs_handle_t h = nvs_open_rw();
     if (h) {
         nvs_erase_key(h, KEY_PERIM);
+        nvs_erase_key(h, KEY_PERIM_LL);
         nvs_erase_key(h, KEY_NAVPOLY);
         nvs_erase_key(h, KEY_WORKPOLY);
         nvs_commit(h);

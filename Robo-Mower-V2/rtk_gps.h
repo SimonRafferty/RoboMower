@@ -139,3 +139,21 @@ float rtk_gps_get_measurement_noise();
  * @param lon_deg  Longitude of perimeter first vertex (decimal degrees, WGS-84).
  */
 void rtk_gps_set_origin(double lat_deg, double lon_deg);
+
+
+/**
+ * @brief Convert absolute WGS-84 lat/lon to local ENU metres. Thread-safe.
+ *
+ * Uses the current origin and the SAME flat-earth formula as live GPS fixes,
+ * so perimeter points stored as lat/lon re-derive into the identical ENU frame
+ * the mower navigates in. Returns false (outputs untouched) if no origin is set.
+ */
+bool rtk_gps_latlon_to_enu(double lat_deg, double lon_deg, float *east_m, float *north_m);
+
+/**
+ * @brief Convert local ENU metres to absolute WGS-84 lat/lon. Thread-safe.
+ *
+ * Inverse of rtk_gps_latlon_to_enu(); used to migrate a legacy ENU perimeter to
+ * lat/lon storage. Returns false (outputs untouched) if no origin is set.
+ */
+bool rtk_gps_enu_to_latlon(float east_m, float north_m, double *lat_deg, double *lon_deg);

@@ -159,6 +159,34 @@ Polygon nvs_load_working_area();
  */
 bool nvs_has_valid_perimeter();
 
+// ── Canonical perimeter: absolute lat/lon + per-point accuracy (key "perim2") ──
+
+/**
+ * @brief Save the canonical perimeter as absolute WGS-84 lat/lon + accuracy.
+ *
+ * This is origin-independent storage: each point keeps its true lat/lon plus an
+ * accuracy estimate (metres). On boot the perimeter module re-derives the ENU
+ * polygon from these against the current origin, so the perimeter can never
+ * drift relative to the live GPS position (the cause of the power-up mismatch).
+ *
+ * Blob: [uint32 count][ (double lat, double lon, float acc) × count ][uint32 crc32].
+ *
+ * @param lat/lon/acc  Parallel arrays of length @p count (3..500).
+ * @return true on success.
+ */
+bool nvs_save_perimeter_ll(const double *lat, const double *lon,
+                           const float *acc, int count);
+
+/**
+ * @brief Load the canonical lat/lon perimeter. CRC-verified.
+ * @param lat/lon/acc  Output arrays, each at least @p max_count long.
+ * @return Number of points loaded (0 if absent, CRC-bad, or corrupt).
+ */
+int nvs_load_perimeter_ll(double *lat, double *lon, float *acc, int max_count);
+
+/** @brief True if a CRC-plausible "perim2" blob exists in NVS. */
+bool nvs_has_perimeter_ll();
+
 /**
  * @brief Erase the perimeter and all derived polygons (nav boundary, working
  *        area) from NVS. Resets all three validity flags to false.

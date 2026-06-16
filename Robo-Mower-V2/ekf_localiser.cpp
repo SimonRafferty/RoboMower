@@ -255,11 +255,22 @@ void ekf_init() {
 
     // Load the persisted heading offset (mounting + declination). NOT reset by
     // RESETEKF — it is a physical constant, only re-trimmed by GPS.
+    //
+    // Guard: the saved offset is only meaningful if the BNO055 booted with its
+    // calibration profile (absolute heading). If no profile loaded, the BNO
+    // heading starts RELATIVE (resets to power-up orientation), so a saved offset
+    // — which was trimmed against an absolute heading — would be wrong. In that
+    // case start at 0 and let the GPS travel chord re-trim it this session.
     {
         Preferences p;
         p.begin(EKF_NVS_NS, /*readOnly=*/true);
         s_hdg_offset = p.getFloat(EKF_NVS_KEY_OFF, 0.0f);
         p.end();
+        if (!imu_profile_loaded()) {
+            s_hdg_offset = 0.0f;
+            DBG_PRINTLN("[EKF] No BNO cal profile at boot — heading offset reset to 0 "
+                        "(BNO heading is relative; will re-trim from GPS)");
+        }
         s_hdg_offset_saved = s_hdg_offset;
         s_prev_bno_valid   = false;
     }

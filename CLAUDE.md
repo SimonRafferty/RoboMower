@@ -80,11 +80,15 @@ $cl = "../Robo-Mower-V2/src/clipper2"
 - Working directory is `Robo_Mower_2/`; the Arduino sketch is in `Robo-Mower-V2/`.
 - Docs: `telemetry.md` (CRSF payload layouts), `manual.md` (operating guide), `README.md` (full ops manual: wiring + tuning).
 
-## Known Issues & TODO (2026-06-14)
+## Known Issues & TODO (2026-06-16)
 
-**Coverage planning (spiral): working.** Covers concave gardens, pinched side-arms, uniform spacing perimeter-inward, ring bridges, centre plunge. Residual: a tiny uncut patch at each area's centre (single centroid plunge) — could upgrade to a short cross if needed.
+**Heading: BNO055 absolute fusion + GPS-trimmed offset.** Heading comes from the BNO055 (NDOF, tilt-compensated) plus an offset slowly trimmed from the GPS travel chord on straight RTK runs and persisted to NVS. User completed BNO055 calibration procedure.  The result should be saved to NVS as BNO055 has no EEPROM but it failed.  Heading always starts in relative mode.  Refer to BNO055 examples and datasheet to determine why calibration was not saved in NVS.  BNO055 is mounted to Mower Chassis so must be removed along with controller PCB to complete calibration.  User describes this as a "ball ache" so make certain calibration save works correctly before requesting further user calibration.  If GPS derived heading disagrees with BNO055, saved calibration has been lost.  Log a warning and apply a GPS heading offset to BNO055 heading.  The BNO055 relative heading resets on power-up so there is no point saving the GPS offset to NVS.
 
-**Heading: BNO055 absolute fusion + GPS-trimmed offset.** Heading comes from the BNO055 (NDOF, tilt-compensated) plus an offset slowly trimmed from the GPS travel chord on straight RTK runs and persisted to NVS. No wheel-odometry heading, no gyro-pivot hack, no GPS-lock blend, no AUTO bootstrap creep. AUTO requires `imu_heading_is_confident()` (BNO sys+mag calibration) and pauses if confidence is lost — there is **no** fallback to a lesser heading source (recalibrate or fix the mounting instead). **Unverified on hardware** until the BNO is wired (see the implementation plans under `docs/superpowers/plans/`).
+> **Update 2026-06-16 (implemented, pending hardware test — see [`docs/TODO.md`](docs/TODO.md) item 4):** `save_cal_to_nvs()` now **read-back verifies** every write and only marks the profile saved on success (else retries). Diagnostics avoid blind chassis-recal: `IMUCALTEST` proves the NVS path without recalibrating, `IMUSAVECAL` saves the live profile on Core 0 (I2C-safe) with verified read-back, and boot logs a profile checksum. EKF boot guard: if no profile loaded, the heading offset starts at 0 (BNO relative) rather than trusting a stale saved offset — per the chosen design the offset is still persisted once cal works.
+
+**Other active work-tickets / open investigations live in [`docs/TODO.md`](docs/TODO.md)** — currently: PWA *User Setting Save* (JSON-by-name, before NVS changes); *GPS / Map location inconsistency* on power-up (perimeter coordinate precision/offset — mower must never exceed the perimeter in AUTO); *Learn-point latency* (momentary TX switch missed). Read it before touching perimeter storage or the PWA settings.
+
+The lists below are steady-state facts about the **current** firmware (not TODOs):
 
 **Disabled / vestigial:**
 - **AUTO fault responses OFF** (`AUTO_FAULT_RESPONSES_ENABLED 0`): overload→RETRACE, stall→BOG_RECOVERY, obstacle→OBSTACLE_AVOID, follower-stall/slip all gated off. Blade is **RC-only** in AUTO. Only **tilt** and **collision** remain (plus always-on perimeter-breach / VESC-silence). Re-enable when detectors are trustworthy.
@@ -94,11 +98,8 @@ $cl = "../Robo-Mower-V2/src/clipper2"
 - **Battery auto-return** removed (operator decision; revisit when the mower can self-charge).
 
 **Latent traps:**
-- `perimeter_close_track()` uses a point-COUNT window (dense-perimeter assumption) — could drop a corner on a sparse perimeter. Suspect it if a recorded perimeter loses a corner.
-- After the `mow_cfg` v10→v11 bump, **saved MowerConfig reset to defaults** — operator must re-enter footprint W×L, track width, and tuning (perimeter & odocal survive in their own keys).
 - `BLADE_CURRENT_LIMIT_A` (config.h) must match the VESC Tool "Motor Current Max".
 
-**Pivot/turn tuning** (`PIVOT_*`, `NODE_*` in config.h) is still rough — revisit on hardware now that the BNO055 supplies a trustworthy heading.
 
 ## Architecture
 
@@ -225,7 +226,7 @@ All in `config.h` (~lines 57–100). Key pins: CAN TX/RX GPIO2/1 · servo GPIO5 
 
 ### EKF localiser (detail in *Architecture › EKF localiser*)
 - Prediction (`ekf_predict()`): heading = `imu_get_heading_fused() + s_hdg_offset` each tick (no integration); position dead-reckons. BNO fault → heading held (no fallback).
-- GPS update (`ekf_update_gps()`): position snap + innovation gate; on a straight, measurable RTK segment the travel chord trims `s_hdg_offset` (slow EMA, reverse-corrected), persisted to NVS (`imu`/`hdgoff`).
+- GPS update (`ekf_update_gps()`): position snap + innovation gate; on a straight, measurable RTK segment the travel chord trims `s_hdg_offset` (slow EMA, reverse-corrected), persisted to NVS (`imu`/`hdgoff2`). Boot guard: `ekf_init()` starts the offset at 0 if `imu_profile_loaded()` is false (BNO heading is relative without a cal profile).
 - **Heading confidence:** `imu_heading_is_confident()` (BNO sys+mag calib) gates AUTO start and is monitored continuously; loss → PAUSE.
 - **Heading events:** each clean straight-RTK trim publishes a front-facing event (`ekf_get_gps_heading_event()`) consumed by odo_calib. Reset on RESETEKF.
 - ENU origin lock: `rtk_gps.cpp` `rtk_gps_set_origin()` — at the first RTK-fixed fix and on perimeter upload via BLE.
@@ -300,13 +301,14 @@ Pattern enum: `state_machine.h:55`. Per-state colours (`state_machine.cpp`): INI
 **Warning:** changing the NVS namespace or renaming keys discards all saved config the user entered (perimeter, calibration, robot dimensions). Always warn the user before bumping the `mow_cfg` key or clearing the `mower` namespace.
 
 Namespace `"mower"` (these are the literal NVS key strings):
-- `perim`, `navpoly`, `workpoly` — polygon blobs with CRC32 (perimeter / nav boundary / working area)
+- `perim2` — **canonical perimeter: absolute WGS-84 lat/lon (double) + per-point accuracy (float) + CRC32** (2026-06-16). Origin-independent — re-derived to ENU on boot against the current origin, so the perimeter can't drift relative to the live fix. `perimeter_init()` migrates a legacy `perim` to this on first boot; `safety.cpp` widens the breach keep-out by `perimeter_get_accuracy_m()`.
+- `perim` — **legacy** ENU-float perimeter (still written for compatibility; superseded by `perim2`). `navpoly`, `workpoly` — derived nav-boundary / working-area ENU blobs (recomputed on every boot from the origin-consistent perimeter), CRC32.
 - `gpsorigin` — ENU origin (lat/lon + CRC32; `GpsOriginNvs` is 24 bytes)
 - `estops` — circular E-stop log (20 × 44 bytes)
 - `blade_cal` — float; auto-calibrated blade reference current (A)
 - `mow_cfg_v11` — MowerConfig blob. **Bumped v10→v11 on 2026-06-13** (footprint W×L box + `track_width_m`, removed `robot_*`/`chassis_length_m`); the `sizeof` guard rejects the old blob, so saved MowerConfig resets to defaults — operator re-enters dimensions/tuning.
 
-Namespace `"imu"`: `bnocal` — 22-byte BNO055 calibration profile blob (auto-saved when fully calibrated); `hdgoff` — float; GPS-trimmed heading offset (rad), `heading = BNO_fused + hdgoff`.
+Namespace `"imu"`: `bnocal` — 22-byte BNO055 calibration profile blob (auto-saved **read-back-verified** when fully calibrated; also via `IMUSAVECAL`); `hdgoff2` — float; GPS-trimmed heading offset (rad), `heading = BNO_fused + hdgoff2` (key bumped from `hdgoff` 2026-06-15; the EKF boot guard starts it at 0 when no `bnocal` profile loaded — see *Known Issues › Heading*). `caltst` — transient scratch key written/removed by the `IMUCALTEST` NVS self-test.
 Namespace `"collision"`: `baseline_v2` — float; adaptive collision baseline (g) for the BNO linear-accel feed (the old `baseline` key from the previous IMU is abandoned).
 
 Namespace `"odocal"` (kept apart from `mow_cfg` so manual config is untouched):

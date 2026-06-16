@@ -85,6 +85,20 @@ CRSFChannels crsf_get_channels();
 bool crsf_is_failsafe();
 
 /**
+ * Running count of CH8 momentary learn-point presses.
+ *
+ * The CH8 falling edge (release) is detected inside the CRSF receive task at
+ * the frame rate (~200 Hz) and increments this counter once per completed
+ * press. The 10 Hz state machine records a perimeter point whenever the count
+ * advances, so a brief tap is never missed (the old direct 10 Hz poll dropped
+ * presses shorter than one FSM tick). Free-running; snapshot it on LEARN entry
+ * to ignore presses made before learning started.
+ *
+ * Lock-free 32-bit read (CRSF task and loop() are both on Core 1).
+ */
+uint32_t crsf_get_learn_pt_events();
+
+/**
  * Convert a raw CRSF channel value (172–1811) to microseconds (1000–2000 µs).
  *
  * Values outside the CRSF raw range are clamped at 1000 or 2000 µs.

@@ -22,6 +22,7 @@
 #include "config.h"
 #include "mower_config.h"
 #include "clipper_offset.h"
+#include "rtk_gps.h"
 #include <cmath>
 #include <cfloat>
 #include <cstring>
@@ -90,6 +91,59 @@ static Polygon s_nav_boundary;
 /** In-memory working area polygon (CCW). */
 static Polygon s_working_area;
 
+// ── Canonical (lat/lon) perimeter storage ─────────────────────────────────────
+// The perimeter is persisted as absolute WGS-84 lat/lon (origin-independent) and
+// re-derived to the ENU s_perimeter on boot against the current origin, so it can
+// never drift relative to the live GPS position. Per-point accuracy feeds a
+// confidence-aware breach margin. Default accuracy for points of unknown
+// provenance (migrated legacy / PWA-drawn perimeters).
+static constexpr float PERIM_LEGACY_ACC_M = 0.05f;
+
+/** Scratch buffers for lat/lon (de)serialisation — reused at boot and on save. */
+static double s_ll_lat[MAX_PERIMETER_POINTS];
+static double s_ll_lon[MAX_PERIMETER_POINTS];
+static float  s_ll_acc[MAX_PERIMETER_POINTS];
+
+/** Worst-case (max) accuracy over the active perimeter points (m); 0 = perfect. */
+static float  s_perim_acc_max = 0.0f;
+
+/** Worst-case fix accuracy seen during the current recording session (m). */
+static float  s_rec_acc_worst = 0.0f;
+
+/** Map a GPS fix type to a conservative horizontal accuracy estimate (m). */
+static float accuracy_for_fix(int fix_type) {
+    switch (fix_type) {
+        case GPS_FIX_RTK_FIXED: return 0.03f;  // ~3 cm
+        case GPS_FIX_RTK_FLOAT: return 0.50f;  // ~30–50 cm
+        case GPS_FIX_DGPS:      return 1.00f;
+        case GPS_FIX_AUTO:      return 2.50f;
+        default:                return 5.00f;  // no fix — very low confidence
+    }
+}
+
+/**
+ * @brief Derive the canonical lat/lon store from an ENU polygon and persist it.
+ *
+ * Converts each ENU vertex to absolute lat/lon via the current origin (the same
+ * flat-earth transform live fixes use) and writes the "perim2" blob. Updates the
+ * in-memory worst-case accuracy used by the breach margin. No-op (returns false)
+ * if no origin is set or the polygon is out of range.
+ */
+bool perimeter_save_canonical(const Polygon &enu_poly, float acc) {
+    GpsOrigin org = rtk_gps_get_origin();
+    int m = (int)enu_poly.pts.size();
+    if (!org.set || m < 3 || m > MAX_PERIMETER_POINTS) return false;
+    for (int i = 0; i < m; i++) {
+        double la, lo;
+        rtk_gps_enu_to_latlon(enu_poly.pts[i].x, enu_poly.pts[i].y, &la, &lo);
+        s_ll_lat[i] = la;
+        s_ll_lon[i] = lo;
+        s_ll_acc[i] = acc;
+    }
+    s_perim_acc_max = acc;
+    return nvs_save_perimeter_ll(s_ll_lat, s_ll_lon, s_ll_acc, m);
+}
+
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
@@ -123,39 +177,75 @@ static void clear_in_memory_state() {
 
 void perimeter_init() {
     clear_in_memory_state();
-    s_recording  = false;
-    s_rec_count  = 0;
+    s_recording     = false;
+    s_rec_count     = 0;
+    s_perim_acc_max = 0.0f;
 
-    // Attempt to load all three polygons from NVS
-    if (!nvs_has_valid_perimeter()) {
-        DBG_PRINTLN("[PERIM] No valid perimeter in NVS — learn one before using AUTO mode");
-        return;
+    // The ENU origin is restored in rtk_gps_init() (runs before this in setup()),
+    // so it is available here for lat/lon ↔ ENU conversion.
+    GpsOrigin origin = rtk_gps_get_origin();
+
+    Polygon perim;  // ENU polygon we will navigate against
+
+    // ── Preferred: canonical lat/lon store, re-derived to ENU against the
+    //    current origin (origin-independent — fixes the power-up map mismatch). ──
+    int n = 0;
+    if (origin.set) {
+        n = nvs_load_perimeter_ll(s_ll_lat, s_ll_lon, s_ll_acc, MAX_PERIMETER_POINTS);
     }
 
-    Polygon perim = nvs_load_perimeter();
-    if (perim.pts.empty()) {
-        DBG_PRINTLN("[PERIM] NVS load failed for perimeter blob — re-learn perimeter");
-        return;
-    }
-
-    Polygon nav  = nvs_load_nav_boundary();
-    Polygon work = nvs_load_working_area();
-
-    if (nav.pts.empty() || work.pts.empty()) {
-        // Nav boundary or working area blobs are absent or CRC-corrupt.
-        // Recompute them from the raw perimeter (which loaded OK) and re-save.
-        DBG_PRINTLN("[PERIM] Nav/working-area blobs corrupt — recomputing from perimeter");
-        perim.ensureCCW();
-        nav  = insetPolygonClipper(perim, mower_config_nav_inset_m());
-        work = insetPolygonClipper(nav,   mower_config_headland_m());
-        if (nav.pts.empty() || work.pts.empty()) {
-            DBG_PRINTLN("[PERIM] Recompute failed — re-learn perimeter");
+    if (n >= 3) {
+        float acc_max = 0.0f;
+        perim.pts.reserve(n);
+        for (int i = 0; i < n; i++) {
+            float e = 0.0f, no = 0.0f;
+            rtk_gps_latlon_to_enu(s_ll_lat[i], s_ll_lon[i], &e, &no);
+            perim.pts.push_back({e, no});
+            if (s_ll_acc[i] > acc_max) acc_max = s_ll_acc[i];
+        }
+        s_perim_acc_max = acc_max;
+        DBG_PRINTF("[PERIM] Loaded canonical lat/lon perimeter: %d pts, acc<=%.2f m\n",
+                      n, (double)acc_max);
+    } else {
+        // ── Fallback: legacy ENU perimeter. Migrate it to lat/lon storage so the
+        //    next boot is origin-independent. ──
+        if (!nvs_has_valid_perimeter()) {
+            DBG_PRINTLN("[PERIM] No valid perimeter in NVS — learn one before using AUTO mode");
             return;
         }
-        nvs_save_nav_boundary(nav);
-        nvs_save_working_area(work);
-        DBG_PRINTLN("[PERIM] Recomputed and re-saved nav/working-area polygons");
+        perim = nvs_load_perimeter();
+        if (perim.pts.empty()) {
+            DBG_PRINTLN("[PERIM] NVS load failed for perimeter blob — re-learn perimeter");
+            return;
+        }
+        if (origin.set) {
+            perim.ensureCCW();
+            if (perimeter_save_canonical(perim, PERIM_LEGACY_ACC_M)) {
+                DBG_PRINTF("[PERIM] Migrated %d-pt legacy ENU perimeter to lat/lon storage\n",
+                              (int)perim.pts.size());
+            }
+        } else {
+            DBG_PRINTLN("[PERIM] No origin yet — using legacy ENU perimeter (will migrate once origin set)");
+            s_perim_acc_max = PERIM_LEGACY_ACC_M;
+        }
     }
+
+    // ── Derive nav boundary + working area from the origin-consistent ENU
+    //    perimeter (always recompute so they can never be origin-stale). ──
+    perim.ensureCCW();
+    Polygon nav  = insetPolygonClipper(perim, mower_config_nav_inset_m());
+    Polygon work = insetPolygonClipper(nav,   mower_config_headland_m());
+    if (nav.pts.empty() || work.pts.empty()) {
+        DBG_PRINTLN("[PERIM] inset failed — perimeter may be too small; re-learn perimeter");
+        return;
+    }
+    // Re-persist the origin-consistent ENU blobs so NVS-reading consumers (e.g.
+    // ble_server build_map_json) get the same geometry the mower navigates — if
+    // the origin shifted since the last save, the old ENU "perim" would otherwise
+    // make the PWA map drift again. Sparse perimeter (~10 pts) → tiny writes.
+    nvs_save_perimeter(perim);
+    nvs_save_nav_boundary(nav);
+    nvs_save_working_area(work);
 
     s_perimeter    = perim;
     s_nav_boundary = nav;
@@ -178,17 +268,19 @@ void perimeter_start_recording() {
     nvs_clear_perimeter();
     clear_in_memory_state();
 
-    s_rec_count  = 0;
-    s_rec_last_x = 0.0f;
-    s_rec_last_y = 0.0f;
-    s_recording  = true;
+    s_rec_count     = 0;
+    s_rec_last_x    = 0.0f;
+    s_rec_last_y    = 0.0f;
+    s_rec_acc_worst = 0.0f;
+    s_recording     = true;
     DBG_PRINTLN("[PERIM] Recording started (previous perimeter cleared)");
 }
 
 bool perimeter_record_point(float x, float y, int fix_type, bool force) {
     if (!s_recording) return false;
 
-    (void)fix_type;  // EKF/GPS position used regardless of fix quality
+    // fix_type does NOT gate recording (position is used regardless of quality) —
+    // it only feeds the worst-case accuracy used by the confidence-aware breach.
     if (!force) {
         // Distance gate: only record if far enough from last waypoint
         float dist = 0.0f;
@@ -209,6 +301,9 @@ bool perimeter_record_point(float x, float y, int fix_type, bool force) {
     s_rec_count++;
     s_rec_last_x = x;
     s_rec_last_y = y;
+
+    float acc = accuracy_for_fix(fix_type);
+    if (acc > s_rec_acc_worst) s_rec_acc_worst = acc;
     return true;
 }
 
@@ -344,6 +439,14 @@ bool perimeter_finish_recording(char *error_msg) {
         strncpy(error_msg, "NVS write failed for perimeter", 64);
         return false;
     }
+    // Canonical lat/lon store (origin-independent). Worst-case fix accuracy from
+    // this session feeds the confidence-aware breach margin. A failure here is
+    // non-fatal: the ENU perimeter above still navigates; perimeter_init() will
+    // migrate it on the next boot.
+    if (!perimeter_save_canonical(poly,
+            s_rec_acc_worst > 0.0f ? s_rec_acc_worst : PERIM_LEGACY_ACC_M)) {
+        DBG_PRINTLN("[PERIM] WARNING: canonical lat/lon save failed (ENU perimeter still saved)");
+    }
     if (!nvs_save_nav_boundary(nav)) {
         strncpy(error_msg, "NVS write failed for nav boundary", 64);
         return false;
@@ -441,6 +544,10 @@ Polygon perimeter_get_nav_boundary() {
 
 Polygon perimeter_get_working_area() {
     return s_working_area;
+}
+
+float perimeter_get_accuracy_m() {
+    return s_perim_acc_max;
 }
 
 void perimeter_clear() {

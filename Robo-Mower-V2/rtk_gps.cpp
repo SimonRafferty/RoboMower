@@ -404,3 +404,29 @@ void rtk_gps_set_origin(double lat_deg, double lon_deg) {
     extern volatile bool g_ble_map_pending;
     g_ble_map_pending = true;
 }
+
+// ── Shared ENU ↔ lat/lon conversion ──────────────────────────────────────────
+// Flat-earth, IDENTICAL math to the GPS task (see gps_poll_task_fn) so a
+// perimeter stored as lat/lon and a live fix convert into exactly the same ENU
+// frame. This is what makes a lat/lon-stored perimeter origin-independent:
+// re-deriving it on boot against the current origin can never disagree with the
+// live position, even if the origin itself shifts between sessions.
+static constexpr double METRES_PER_DEG_LAT = 111319.5;
+
+bool rtk_gps_latlon_to_enu(double lat_deg, double lon_deg, float *east_m, float *north_m) {
+    GpsOrigin o = rtk_gps_get_origin();
+    if (!o.set) return false;
+    if (east_m)  *east_m  = (float)((lon_deg - o.lon_deg)
+                                    * cos(o.lat_deg * M_PI / 180.0) * METRES_PER_DEG_LAT);
+    if (north_m) *north_m = (float)((lat_deg - o.lat_deg) * METRES_PER_DEG_LAT);
+    return true;
+}
+
+bool rtk_gps_enu_to_latlon(float east_m, float north_m, double *lat_deg, double *lon_deg) {
+    GpsOrigin o = rtk_gps_get_origin();
+    if (!o.set) return false;
+    if (lat_deg) *lat_deg = o.lat_deg + (double)north_m / METRES_PER_DEG_LAT;
+    if (lon_deg) *lon_deg = o.lon_deg + (double)east_m
+                                        / (METRES_PER_DEG_LAT * cos(o.lat_deg * M_PI / 180.0));
+    return true;
+}

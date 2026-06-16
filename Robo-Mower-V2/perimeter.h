@@ -175,6 +175,28 @@ Polygon perimeter_get_nav_boundary();
 Polygon perimeter_get_working_area();
 
 /**
+ * @brief Worst-case (largest) GPS accuracy estimate across the perimeter points (m).
+ *
+ * Derived from the fix quality at each recorded corner (0 ≈ perfect). The safety
+ * breach watchdog widens its keep-out by this value so a perimeter recorded with
+ * low-confidence fixes is treated more cautiously — the mower must never exceed
+ * the perimeter in AUTO. Returns 0 if no perimeter is loaded.
+ */
+float perimeter_get_accuracy_m();
+
+/**
+ * @brief Persist an ENU polygon as the canonical lat/lon perimeter ("perim2").
+ *
+ * Converts each ENU vertex to absolute lat/lon via the current GPS origin and
+ * writes the origin-independent perimeter store, tagging every point with the
+ * given accuracy (m). Used by SEND_PERIMETER (PWA upload) so the uploaded
+ * perimeter survives reboot without origin drift. No-op if no origin is set.
+ *
+ * @return true on success.
+ */
+bool perimeter_save_canonical(const Polygon &enu_poly, float acc);
+
+/**
  * @brief Erase all stored perimeter data from NVS and clear in-memory state.
  *
  * Calls nvs_clear_perimeter() and resets the internal valid flag plus all

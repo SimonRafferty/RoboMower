@@ -44,6 +44,15 @@ static CRSFChannels      g_crsf;                ///< Protected by g_mutex
 static SemaphoreHandle_t g_mutex  = nullptr;
 static volatile bool     g_telemetry_window = false; ///< true when >2ms line silence
 
+// CH8 momentary learn-point edge latch. The edge is detected here at the CRSF
+// frame rate (~200 Hz) instead of in the 10 Hz state-machine loop, so a brief
+// press is never missed. s_learn_pt_events increments once per completed press
+// (high→low release); the FSM consumes it via crsf_get_learn_pt_events().
+// Only touched inside process_frame() (CRSF task), except the volatile counter
+// which is read lock-free from the FSM (Core 1, same core — atomic word).
+static volatile uint32_t g_learn_pt_events = 0;
+static bool              s_ch8_high        = false;
+
 // ── CRC8 lookup table (poly 0xD5 = DVB-S2) ───────────────────────────────────
 static uint8_t s_crc8_table[256];
 
@@ -156,6 +165,18 @@ static void process_frame(uint8_t type, const uint8_t *payload, uint8_t payload_
         }
         g_crsf.failsafe      = false;
         g_crsf.last_frame_ms = now;
+
+        // CH8 momentary learn-point: count a completed press on release
+        // (high→low). 1500±30 µs hysteresis mirrors the FSM's sw2_decode, so
+        // the falling-edge "record on release" semantics are preserved — just
+        // sampled fast enough that short taps are no longer dropped.
+        const uint16_t ch8 = g_crsf.ch[CRSF_CH_LEARN_PT];
+        if (ch8 > 1530u) {
+            s_ch8_high = true;
+        } else if (ch8 < 1470u) {
+            if (s_ch8_high) g_learn_pt_events++;
+            s_ch8_high = false;
+        }
         xSemaphoreGive(g_mutex);
     }
 }
@@ -337,6 +358,10 @@ CRSFChannels crsf_get_channels() {
         snapshot.failsafe = true;
     }
     return snapshot;
+}
+
+uint32_t crsf_get_learn_pt_events() {
+    return g_learn_pt_events;   // volatile 32-bit read; lock-free is safe on Core 1
 }
 
 bool crsf_is_failsafe() {

@@ -21,6 +21,7 @@
 #include "rtk_gps.h"
 #include "geometry.h"
 #include "mower_config.h"   // mower_config_nav_inset_m() for the breach threshold
+#include "perimeter.h"      // perimeter_get_accuracy_m() for confidence-aware breach
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -259,7 +260,15 @@ static void safety_task(void * /*pv*/)
                 checked = true;
                 xSemaphoreGive(s_nav_mutex);
             }
-            const float breach_thresh = -PERIMETER_BREACH_DIST_M;
+            // Confidence-aware margin: a perimeter recorded with low-confidence
+            // GPS fixes is less trustworthy, so shrink the allowed overshoot by
+            // its accuracy estimate — the mower breaches (stops) sooner and must
+            // never exceed the perimeter. Floored at 0.10 m so a high-confidence
+            // perimeter keeps essentially the full PERIMETER_BREACH_DIST_M
+            // tolerance and the threshold can never collapse to zero.
+            float eff_breach_dist = PERIMETER_BREACH_DIST_M - perimeter_get_accuracy_m();
+            if (eff_breach_dist < 0.10f) eff_breach_dist = 0.10f;
+            const float breach_thresh = -eff_breach_dist;
             static bool s_perim_breach_warned = false;
             if (checked && (dist < breach_thresh)) {
                 // Hard-stop motors every 50 ms tick while breach persists.

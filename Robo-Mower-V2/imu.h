@@ -55,3 +55,20 @@ bool imu_heading_is_confident();
 /** Force a fresh magnetometer recalibration: discard the stored NVS profile and
  *  relearn from motion. The new profile is auto-saved once fully calibrated. */
 void imu_recalibrate();
+
+/** True if a calibration profile was successfully restored from NVS at boot.
+ *  When false, the BNO055 heading starts relative — the EKF then starts its
+ *  GPS-trimmed heading offset at 0 rather than trusting a stale saved offset. */
+bool imu_profile_loaded();
+
+/** Request an immediate save of the current calibration (performed on Core 0 to
+ *  keep the I2C bus single-owner). Verifies the write by read-back; reports the
+ *  result to the system log. Refused unless gyro/accel/mag are all fully (3)
+ *  calibrated. Use after the operator confirms a good calibration so we KNOW it
+ *  persisted before reassembling the chassis. */
+void imu_request_save();
+
+/** Self-test the NVS calibration path WITHOUT touching the BNO055 or needing a
+ *  physical recalibration: writes a known 22-byte pattern, reads it back from a
+ *  fresh handle, and reports PASS/FAIL to the system log. @return true on PASS. */
+bool imu_nvs_selftest();

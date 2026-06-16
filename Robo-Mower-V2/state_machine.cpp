@@ -180,7 +180,7 @@ static int        s_wp_index = 0;
 
 // ── LEARN_PERIMETER state locals ──────────────────────────────────────────────
 static bool s_ch5_prev = false;   // previous CH5 active state for edge detection
-static bool s_ch8_prev = false;   // previous CH8 state for falling-edge detection
+static uint32_t s_learn_pt_seen = 0;  // last consumed CH8 learn-point event count (crsf_get_learn_pt_events)
 static bool s_learn_first_point = true;  // true until first CH8 press in learn mode
 
 // ── Return-to-home position (saved at perimeter recording start) ──────────────
@@ -277,14 +277,14 @@ static constexpr uint16_t CH4_HI_US = 1750;   // auto(1500) ↔ auto-return(2000
 static constexpr uint16_t CH5_US    = 1500;   // learn off(1000) ↔ on(2000)
 static constexpr uint16_t CH6_US    = 1500;   // disarmed(1000) ↔ armed(2000)
 static constexpr uint16_t CH7_US    = 1500;   // pause off(1000) ↔ on(2000)
-static constexpr uint16_t CH8_US    = 1500;   // learn-point momentary off(1000) ↔ on(2000)
+// CH8 (learn-point momentary) is edge-detected in crsf_input at the CRSF frame
+// rate, not polled here — see crsf_get_learn_pt_events() and the LEARN handler.
 
 // Latched switch states (initialised to safe defaults)
 static uint8_t s_ch4_pos  = 0;      // 0=manual, 1=auto, 2=auto-return
 static bool    s_ch5_on   = false;
 static bool    s_ch6_on   = false;   // armed
 static bool    s_ch7_on   = false;   // pause
-static bool    s_ch8_on   = false;   // learn point (momentary)
 
 // Wrappers matching the original API — now read latched state
 static inline bool ch4_is_manual(uint16_t)      { return s_ch4_pos == 0; }
@@ -573,6 +573,22 @@ void state_machine_handle_serial(const char *raw_cmd) {
             coverage_planner_get_total_progress(),
             ekf_get_position_uncertainty(),
             collisionGetBaseline());
+        return;
+    }
+
+    // ── IMUCALTEST / IMUSAVECAL — BNO055 calibration NVS diagnostics ───────────
+    if (strcasecmp(cmd, "IMUCALTEST") == 0) {
+        bool ok = imu_nvs_selftest();
+        DBG_PRINTF("[IMU] NVS self-test: %s\r\n", ok ? "PASS" : "FAIL");
+        return;
+    }
+    if (strcasecmp(cmd, "IMUSAVECAL") == 0) {
+        if (!imu_heading_is_confident()) {
+            DBG_PRINTLN("[IMU] save refused — gyro/accel/mag not all 3 (drive slow loops first)");
+        } else {
+            imu_request_save();
+            DBG_PRINTLN("[IMU] calibration save requested — check log for verified result");
+        }
         return;
     }
 
@@ -969,6 +985,12 @@ static void handle_send_perimeter(const char *json) {
     if (!nvs_save_perimeter(poly)) {
         ble_server_send_ack("SEND_PERIMETER", false, "nvs save failed"); return;
     }
+    // Save the canonical lat/lon perimeter (origin-independent) so it survives
+    // reboot without map drift and so it overwrites any stale "perim2" from a
+    // previous perimeter. PWA-drawn points carry no GPS fix, so tag them with a
+    // small default accuracy. perimeter_init() below loads this back.
+    perimeter_save_canonical(poly, 0.05f);
+
     // Derive nav boundary and working area
     Polygon nav  = insetPolygonClipper(poly, mower_config_nav_inset_m());
     Polygon work = insetPolygonClipper(nav, mower_config_headland_m());
@@ -1109,6 +1131,28 @@ static void handle_ble_command(const char *json) {
     if (strcmp(cmd, "RECAL_IMU") == 0) {
         imu_recalibrate();
         sys_log_push("IMU: compass recalibration started (drive slow loops in Manual)");
+        request_beep(BEEP_CONFIRM);
+        return;
+    }
+
+    // ── IMUCALTEST — prove the NVS calibration path without recalibrating ──────
+    if (strcmp(cmd, "IMUCALTEST") == 0) {
+        bool ok = imu_nvs_selftest();
+        ble_server_send_ack(cmd, ok, ok ? "NVS self-test PASS" : "NVS self-test FAIL");
+        request_beep(ok ? BEEP_CONFIRM : BEEP_WARNING);
+        return;
+    }
+
+    // ── IMUSAVECAL — save the current calibration now (read-back verified) ─────
+    if (strcmp(cmd, "IMUSAVECAL") == 0) {
+        if (!imu_heading_is_confident()) {
+            ble_server_send_ack(cmd, false, "not fully calibrated — drive slow loops first");
+            request_beep(BEEP_WARNING);
+            return;
+        }
+        imu_request_save();   // performed on Core 0; result reported to the log
+        sys_log_push("IMU: calibration save requested");
+        ble_server_send_ack(cmd, true, "save requested — check log for verified result");
         request_beep(BEEP_CONFIRM);
         return;
     }
@@ -1588,7 +1632,7 @@ void state_machine_update() {
     s_ch5_on  = sw2_decode(rc.ch[CRSF_CH_LEARN], CH5_US, s_ch5_on);
     s_ch6_on  = sw2_decode(rc.ch[CRSF_CH_ARM],   CH6_US, s_ch6_on);
     s_ch7_on  = sw2_decode(rc.ch[CRSF_CH_PAUSE], CH7_US, s_ch7_on);
-    s_ch8_on  = sw2_decode(rc.ch[CRSF_CH_LEARN_PT], CH8_US, s_ch8_on);
+    // CH8 learn-point is latched in crsf_input (CRSF rate); consumed in LEARN.
 
     // Re-arm the AUTO-denial beep/log when CH4 leaves the AUTO position
     if (s_ch4_pos != 1) s_auto_deny_latch = false;
@@ -2007,6 +2051,8 @@ void state_machine_update() {
     case STATE_LEARN_PERIMETER: {
         if (g_state_entry) {
             s_learn_first_point = true;
+            // Ignore any CH8 presses made before entering LEARN.
+            s_learn_pt_seen = crsf_get_learn_pt_events();
             s_heading_active = false;
             heading_controller_reset();
             vesc_set_current(VESC_ID_BLADE, 0);
@@ -2032,8 +2078,14 @@ void state_machine_update() {
         // Drive with heading stabilisation while recording
         drive_manual(rc, pose, sm_dt);
 
-        // Record point on CH8 release (falling edge of momentary switch)
-        if (!s_ch8_on && s_ch8_prev) {
+        // Record a point for each CH8 momentary press. The press edge is latched
+        // in crsf_input at the CRSF frame rate, so even a brief tap registers
+        // (the old 10 Hz poll dropped short presses). Consume all pending events
+        // but record only once per tick — distinct corners are always >1 tick
+        // apart, so collapsing here only de-dups physically-impossible doubles.
+        uint32_t learn_ev = crsf_get_learn_pt_events();
+        if (learn_ev != s_learn_pt_seen) {
+            s_learn_pt_seen = learn_ev;
             // First point clears old perimeter and starts fresh recording
             if (s_learn_first_point) {
                 perimeter_start_recording();
@@ -3177,7 +3229,6 @@ void state_machine_update() {
 
     // ── Update previous-channel states ───────────────────────────────────────
     s_ch5_prev = ch5_active;
-    s_ch8_prev = s_ch8_on;
 
     // ── Apply pending state transition ────────────────────────────────────────
     if (g_transition_pending) {

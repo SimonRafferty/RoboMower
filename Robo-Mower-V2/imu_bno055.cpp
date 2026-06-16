@@ -24,6 +24,7 @@
 #include <Wire.h>
 #include <Preferences.h>
 #include <math.h>
+#include <cstring>
 
 // ── NVS ───────────────────────────────────────────────────────────────────────
 static const char* NVS_NAMESPACE = "imu";
@@ -51,7 +52,9 @@ static volatile uint8_t s_calib         = 0;      // packed sys/gyro/accel/mag
 static volatile bool    s_imu_fault     = false;
 static volatile bool    s_initialized   = false;
 static volatile bool    s_force_recal   = false;  // imu_recalibrate() request
+static volatile bool    s_save_request  = false;  // imu_request_save() — performed on Core 0
 static volatile bool    s_profile_saved = false;  // a good profile is persisted
+static volatile bool    s_profile_loaded_boot = false;  // a profile was restored at boot
 static volatile uint32_t s_last_valid_ms = 0;
 
 static TaskHandle_t     s_task_handle   = nullptr;
@@ -67,11 +70,36 @@ static bool load_cal_from_nvs(uint8_t out[22]) {
     return n == 22;
 }
 
-static void save_cal_to_nvs(const uint8_t buf[22]) {
+// Persist the 22-byte profile AND verify it read back identically from a freshly
+// opened handle. The old code assumed the write stuck (the reported bug: "saved"
+// logged but absent on reboot). The read-back tells us definitively whether the
+// blob reached flash, so a silent write failure can no longer masquerade as
+// success — s_profile_saved is only set when this returns true.
+static bool save_cal_to_nvs(const uint8_t buf[22]) {
+    {
+        Preferences p;
+        if (!p.begin(NVS_NAMESPACE, /*readOnly=*/false)) {
+            DBG_PRINTLN("[IMU] cal save: NVS begin(rw) failed");
+            return false;
+        }
+        size_t w = p.putBytes(NVS_KEY_CAL, buf, 22);
+        p.end();   // Preferences::end() flushes/commits the namespace
+        if (w != 22) {
+            DBG_PRINTF("[IMU] cal save: putBytes wrote %u/22 bytes\n", (unsigned)w);
+            return false;
+        }
+    }
+    uint8_t check[22] = {0};
     Preferences p;
-    p.begin(NVS_NAMESPACE, /*readOnly=*/false);
-    p.putBytes(NVS_KEY_CAL, buf, 22);
+    p.begin(NVS_NAMESPACE, /*readOnly=*/true);
+    size_t r = p.getBytes(NVS_KEY_CAL, check, 22);
     p.end();
+    if (r != 22 || memcmp(check, buf, 22) != 0) {
+        DBG_PRINTF("[IMU] cal save: read-back FAILED (r=%u)\n", (unsigned)r);
+        return false;
+    }
+    DBG_PRINTLN("[IMU] cal save: read-back verified OK");
+    return true;
 }
 
 static void clear_cal_in_nvs() {
@@ -134,10 +162,17 @@ bool imu_init() {
     uint8_t cal[22];
     if (load_cal_from_nvs(cal)) {
         s_bno.setSensorOffsets(cal);
-        s_profile_saved = true;
-        DBG_PRINTLN("[IMU] BNO055 calibration profile restored from NVS");
+        s_profile_saved       = true;
+        s_profile_loaded_boot = true;
+        // Log a checksum so consecutive boots can be compared from the BLE log:
+        // a changing/zero sum across boots means the profile is not persisting.
+        uint16_t sum = 0;
+        for (int i = 0; i < 22; i++) sum += cal[i];
+        DBG_PRINTF("[IMU] BNO055 calibration profile restored from NVS (chk=0x%04X)\n", sum);
+        sys_log_push("IMU: BNO055 calibration profile restored from NVS");
     } else {
         DBG_PRINTLN("[IMU] No stored BNO055 calibration — drive loops to calibrate");
+        sys_log_push("IMU: no stored BNO055 calibration (heading starts relative)");
     }
 
     s_last_valid_ms = millis();
@@ -197,6 +232,58 @@ void imu_recalibrate() {
     s_force_recal   = true;   // task re-enters NDOF to drop the live profile
 }
 
+bool imu_profile_loaded() {
+    return s_profile_loaded_boot;
+}
+
+void imu_request_save() {
+    s_save_request = true;    // performed on Core 0 in imu_task (I2C-safe)
+}
+
+// Prove the NVS path can store and read back 22 bytes in the "imu" namespace
+// WITHOUT touching the BNO055 or requiring a physical recalibration (the sensor
+// must be unbolted to recal — a "ball ache"). Writes a known pattern to a scratch
+// key, reads it back from a fresh handle, removes it, and reports PASS/FAIL.
+// Pure NVS, so safe to call from Core 1 (NVS has its own internal locking).
+bool imu_nvs_selftest() {
+    uint8_t pat[22], chk[22] = {0};
+    for (int i = 0; i < 22; i++) pat[i] = (uint8_t)(0xA5 ^ i);
+
+    {
+        Preferences p;
+        if (!p.begin(NVS_NAMESPACE, /*readOnly=*/false)) {
+            sys_log_push("IMU: NVS self-test FAIL (begin rw)");
+            return false;
+        }
+        size_t w = p.putBytes("caltst", pat, 22);
+        p.end();
+        if (w != 22) {
+            DBG_PRINTF("[IMU] NVS self-test: wrote %u/22\n", (unsigned)w);
+            sys_log_push("IMU: NVS self-test FAIL (write)");
+            return false;
+        }
+    }
+
+    bool ok;
+    {
+        Preferences p;
+        p.begin(NVS_NAMESPACE, /*readOnly=*/true);
+        size_t r = p.getBytes("caltst", chk, 22);
+        p.end();
+        ok = (r == 22 && memcmp(chk, pat, 22) == 0);
+    }
+    {
+        Preferences p;
+        p.begin(NVS_NAMESPACE, /*readOnly=*/false);
+        p.remove("caltst");
+        p.end();
+    }
+
+    DBG_PRINTF("[IMU] NVS self-test: %s\n", ok ? "PASS" : "FAIL");
+    sys_log_push(ok ? "IMU: NVS self-test PASS" : "IMU: NVS self-test FAIL");
+    return ok;
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  100 Hz sampling task (Core 0)
 // ══════════════════════════════════════════════════════════════════════════════
@@ -217,6 +304,26 @@ static void imu_task(void* pv) {
             delay(25);
             s_bno.setMode(OPERATION_MODE_NDOF);
             DBG_PRINTLN("[IMU] recalibration started — drive slow loops");
+        }
+
+        // Operator-triggered "save calibration now" (imu_request_save). MUST run
+        // here on Core 0 — read_offsets_raw() drives the I2C bus, which this task
+        // owns; doing it from the Core-1 command handler would corrupt the bus.
+        if (s_save_request) {
+            s_save_request = false;
+            uint8_t c = s_calib;
+            uint8_t gy = (c >> 4) & 0x03, ac = (c >> 2) & 0x03, mg = c & 0x03;
+            if (gy == 3 && ac == 3 && mg == 3) {
+                uint8_t buf[22];
+                if (read_offsets_raw(buf) && save_cal_to_nvs(buf)) {
+                    s_profile_saved = true;
+                    sys_log_push("IMU: calibration saved + verified (manual)");
+                } else {
+                    sys_log_push("IMU: manual calibration save FAILED");
+                }
+            } else {
+                sys_log_push("IMU: manual save refused — gyro/accel/mag not all 3");
+            }
         }
 
         sensors_event_t ev;
@@ -269,11 +376,15 @@ static void imu_task(void* pv) {
             // otherwise never persist (forcing a re-calibrate every boot).
             if (!s_profile_saved && gy == 3 && ac == 3 && mg == 3) {
                 uint8_t buf[22];
-                if (read_offsets_raw(buf)) {
-                    save_cal_to_nvs(buf);
+                // Only set s_profile_saved when the read-back actually verified —
+                // otherwise leave it false so the next fully-calibrated sample
+                // retries instead of silently giving up (the reported failure).
+                if (read_offsets_raw(buf) && save_cal_to_nvs(buf)) {
                     s_profile_saved = true;
-                    sys_log_push("IMU: BNO055 calibration saved (restores on reboot)");
+                    sys_log_push("IMU: BNO055 calibration saved + verified (restores on reboot)");
                     DBG_PRINTLN("[IMU] BNO055 calibration profile saved to NVS");
+                } else {
+                    sys_log_push("IMU: BNO055 calibration save FAILED — will retry");
                 }
             }
 
