@@ -131,6 +131,24 @@ float cutting_monitor_get_avg_current();
  */
 float cutting_monitor_get_load_fraction();
 
+/**
+ * @brief Get RPM-based blade load fraction (0.0 – 1.0).  [Feature 2, 2026-06-16]
+ *
+ * Derived from blade RPM droop, EMA-smoothed:
+ *     rpm_load = clamp((target_erpm - |actual_erpm|) / target_erpm, 0, 1)
+ * = 0.0 at/above the target RPM (free spin), 1.0 at standstill. Because the blade
+ * VESC is current-limited, RPM is a truer load proxy than current. This is the
+ * value shown on the TX16S MOWER_STATUS load byte and the PWA bladeLoad bar.
+ *
+ * Reads 0.0 whenever the blade is not commanded or still within the spin-up grace
+ * (BLADE_FAULT_GRACE_MS) — so a stopped blade never reads as fully loaded.
+ *
+ * Thread-safe via internal spinlock.
+ *
+ * @return RPM load fraction; 0.0 when the blade is off / spinning up.
+ */
+float cutting_monitor_get_rpm_load_fraction();
+
 
 // ── Auto-calibration ──────────────────────────────────────────────────────────
 

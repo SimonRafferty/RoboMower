@@ -292,7 +292,7 @@ static String build_telemetry_json() {
         coverage_planner_get_strip_progress(),
         state_machine_get_cut_height_mm(),
         obstacle_get_count(), unc,
-        blade_rpm, blade.current_A, cutting_monitor_get_load_fraction(),
+        blade_rpm, blade.current_A, cutting_monitor_get_rpm_load_fraction(),  // RPM-based load (Feature 2)
         cut_names[(int)cs],
         batt, bat_names[(int)bs],
         collisionGetBaseline(),
@@ -313,13 +313,50 @@ static String build_telemetry_json() {
     return String("{}");
 }
 
-/** Append a polygon as a JSON array: [[x,y],...] */
-static void append_polygon(String &out, const Polygon &poly) {
+/** Append an ENU polygon as a JSON array of absolute WGS-84 lat/lon: [[lat,lon],...]
+ *  The mower is the single owner of the projection (WGS-84 local tangent plane),
+ *  so the PWA consumes lat/lon directly with no scheme translation. */
+static void append_polygon_ll(String &out, const Polygon &poly) {
     out += '[';
     for (size_t i = 0; i < poly.pts.size(); i++) {
         if (i) out += ',';
-        char pt[32];
-        snprintf(pt, sizeof(pt), "[%.3f,%.3f]", poly.pts[i].x, poly.pts[i].y);
+        double la = 0.0, lo = 0.0;
+        rtk_gps_enu_to_latlon(poly.pts[i].x, poly.pts[i].y, &la, &lo);
+        char pt[40];
+        snprintf(pt, sizeof(pt), "[%.7f,%.7f]", la, lo);
+        out += pt;
+    }
+    out += ']';
+}
+
+/** Append the canonical perimeter as [[lat,lon,acc],...] — exact stored WGS-84
+ *  coordinates with per-point GPS confidence (no ENU round-trip), so the PWA map
+ *  carries the same per-corner confidence the mower holds. Falls back to the ENU
+ *  perimeter (converted to lat/lon, worst-case accuracy) if no canonical store. */
+static void append_perimeter_ll(String &out, const Polygon &fallback_enu) {
+    int n = perimeter_canonical_count();
+    if (n >= 3) {
+        out += '[';
+        for (int i = 0; i < n; i++) {
+            if (i) out += ',';
+            double la = 0.0, lo = 0.0; float ac = 0.05f;
+            perimeter_canonical_point(i, &la, &lo, &ac);
+            char pt[56];
+            snprintf(pt, sizeof(pt), "[%.7f,%.7f,%.2f]", la, lo, (double)ac);
+            out += pt;
+        }
+        out += ']';
+        return;
+    }
+    // Fallback: convert the ENU perimeter, tag with the worst-case accuracy.
+    float acc = perimeter_get_accuracy_m();
+    out += '[';
+    for (size_t i = 0; i < fallback_enu.pts.size(); i++) {
+        if (i) out += ',';
+        double fla = 0.0, flo = 0.0;
+        rtk_gps_enu_to_latlon(fallback_enu.pts[i].x, fallback_enu.pts[i].y, &fla, &flo);
+        char pt[56];
+        snprintf(pt, sizeof(pt), "[%.7f,%.7f,%.2f]", fla, flo, (double)acc);
         out += pt;
     }
     out += ']';
@@ -339,7 +376,7 @@ static String build_map_json() {
 
     String out;
     out.reserve(2048);
-    out += "{\"type\":\"map\",";
+    out += "{\"type\":\"map\",\"v\":2,";
 
     // GPS origin
     char orig_buf[80];
@@ -359,14 +396,15 @@ static String build_map_json() {
         out += grid_buf;
     }
 
-    // Polygons
-    out += "\"perimeter\":";    append_polygon(out, perim);  out += ',';
-    out += "\"nav_boundary\":"; append_polygon(out, nav);    out += ',';
-    out += "\"working_area\":"; append_polygon(out, work);   out += ',';
+    // Polygons — emitted as absolute WGS-84 lat/lon (single coordinate scheme).
+    // Perimeter carries per-point accuracy [[lat,lon,acc],...]; the rest [[lat,lon],...].
+    out += "\"perimeter\":";    append_perimeter_ll(out, perim); out += ',';
+    out += "\"nav_boundary\":"; append_polygon_ll(out, nav);     out += ',';
+    out += "\"working_area\":"; append_polygon_ll(out, work);    out += ',';
 
     // In-progress recording points (visible on map during LEARN)
     Polygon rec = perimeter_get_recording_points();
-    out += "\"recording\":"; append_polygon(out, rec); out += ',';
+    out += "\"recording\":"; append_polygon_ll(out, rec); out += ',';
 
     // Mowed cells
     std::vector<std::pair<uint8_t,uint8_t>> mowed;
@@ -388,23 +426,31 @@ static String build_map_json() {
     (void)n_obs;
     out += "],";
 
-    // Current mower position — use GPS for x/y (same frame as perimeter) and
-    // EKF for heading (real-time from IMU gyro integration).
+    // Current mower position — emitted as absolute lat/lon. Prefer GPS (same frame
+    // as the perimeter); fall back to the EKF pose. Heading is the real-time EKF
+    // heading (BNO fusion).
     {
+        float ex = 0.0f, ny = 0.0f, hdg = 0.0f;
+        bool have = false;
         GpsMeasurement gps_pos = rtk_gps_get_measurement();
-        float map_hdg = ekf_is_seeded() ? ekf_get_pose().heading : 0.0f;
-        char pos_buf[80];
         if (gps_pos.valid) {
-            snprintf(pos_buf, sizeof(pos_buf),
-                "\"pos\":{\"x\":%.3f,\"y\":%.3f,\"hdg\":%.3f},",
-                gps_pos.enu_east_m, gps_pos.enu_north_m, map_hdg);
-            out += pos_buf;
+            ex = gps_pos.enu_east_m; ny = gps_pos.enu_north_m;
+            hdg = ekf_is_seeded() ? ekf_get_pose().heading : 0.0f;
+            have = true;
         } else if (ekf_is_seeded()) {
             Pose2D p = ekf_get_pose();
-            snprintf(pos_buf, sizeof(pos_buf),
-                "\"pos\":{\"x\":%.3f,\"y\":%.3f,\"hdg\":%.3f},",
-                p.x, p.y, p.heading);
-            out += pos_buf;
+            ex = p.x; ny = p.y; hdg = p.heading;
+            have = true;
+        }
+        if (have) {
+            double la = 0.0, lo = 0.0;
+            if (rtk_gps_enu_to_latlon(ex, ny, &la, &lo)) {
+                char pos_buf[88];
+                snprintf(pos_buf, sizeof(pos_buf),
+                    "\"pos\":{\"lat\":%.7f,\"lon\":%.7f,\"hdg\":%.3f},",
+                    la, lo, hdg);
+                out += pos_buf;
+            }
         }
     }
 
@@ -427,8 +473,10 @@ static String build_map_json() {
                 } else {
                     out += ',';
                 }
-                char pt[24];
-                snprintf(pt, sizeof(pt), "[%.2f,%.2f]", wp.x, wp.y);
+                double la = 0.0, lo = 0.0;
+                rtk_gps_enu_to_latlon(wp.x, wp.y, &la, &lo);
+                char pt[40];
+                snprintf(pt, sizeof(pt), "[%.7f,%.7f]", la, lo);
                 out += pt;
             } else {
                 if (in_seg) {
@@ -463,25 +511,30 @@ static String build_map_json() {
         int ccw_steps = n - nearest;       // nearest → 0 going forwards (wrapping)
 
         out += "\"transit_path\":[";
-        char pt[24];
-        // Start with mower position
-        snprintf(pt, sizeof(pt), "[%.2f,%.2f]", pose.x, pose.y);
+        char pt[44];
+        double la = 0.0, lo = 0.0;
+        // Start with mower position (lat/lon)
+        rtk_gps_enu_to_latlon(pose.x, pose.y, &la, &lo);
+        snprintf(pt, sizeof(pt), "[%.7f,%.7f]", la, lo);
         out += pt;
 
         if (cw_steps <= ccw_steps) {
             // Walk backwards: nearest, nearest-1, ..., 0
             for (int i = nearest; i >= 0; i--) {
-                snprintf(pt, sizeof(pt), ",[%.2f,%.2f]", perim.pts[i].x, perim.pts[i].y);
+                rtk_gps_enu_to_latlon(perim.pts[i].x, perim.pts[i].y, &la, &lo);
+                snprintf(pt, sizeof(pt), ",[%.7f,%.7f]", la, lo);
                 out += pt;
             }
         } else {
             // Walk forwards: nearest, nearest+1, ..., n-1, 0
             for (int i = nearest; i < n; i++) {
-                snprintf(pt, sizeof(pt), ",[%.2f,%.2f]", perim.pts[i].x, perim.pts[i].y);
+                rtk_gps_enu_to_latlon(perim.pts[i].x, perim.pts[i].y, &la, &lo);
+                snprintf(pt, sizeof(pt), ",[%.7f,%.7f]", la, lo);
                 out += pt;
             }
             // Close to vertex 0
-            snprintf(pt, sizeof(pt), ",[%.2f,%.2f]", perim.pts[0].x, perim.pts[0].y);
+            rtk_gps_enu_to_latlon(perim.pts[0].x, perim.pts[0].y, &la, &lo);
+            snprintf(pt, sizeof(pt), ",[%.7f,%.7f]", la, lo);
             out += pt;
         }
         out += "],";
@@ -542,7 +595,7 @@ static String build_status_json() {
         "\"heading_kp\":%.2f,\"heading_kd\":%.2f,\"manual_max_yaw_rate\":%.2f,"
         "\"wheel_pi_kp\":%.2f,\"wheel_pi_ki\":%.2f,"
         "\"manual_max_duty\":%.2f,\"manual_max_speed_ms\":%.3f,"
-        "\"min_turn_radius_m\":%.3f},",
+        "\"min_turn_radius_m\":%.3f,\"min_move_duty\":%.3f},",
         mc.footprint_width_m, mc.footprint_length_m,
         mc.track_width_m,
         mc.wheel_radius_m, (int)mc.motor_pole_pairs, mc.gear_ratio,
@@ -561,7 +614,7 @@ static String build_status_json() {
         mc.heading_kp, mc.heading_kd, mc.manual_max_yaw_rate,
         mc.wheel_pi_kp, mc.wheel_pi_ki,
         mc.manual_max_duty, mc.manual_max_speed_ms,
-        mc.min_turn_radius_m);
+        mc.min_turn_radius_m, mc.min_move_duty);
     out += cbuf;
 
     // Append system log array (last N messages, newest last)

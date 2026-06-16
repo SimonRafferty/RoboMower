@@ -37,6 +37,7 @@
 #include "cutting_monitor.h"
 #include "bog_recovery.h"
 #include "retrace.h"
+#include "blade_recovery.h"   // Feature 2: RPM-load recovery (hosts STATE_RETRACE)
 #include "safety.h"
 #include "obstacle_map.h"
 #include "battery_monitor.h"
@@ -793,7 +794,7 @@ static void emit_telemetry() {
         s_desired_cut_height_mm,
         obstacle_get_count(),
         unc,
-        blade_rpm, blade.current_A, cutting_monitor_get_load_fraction(),
+        blade_rpm, blade.current_A, cutting_monitor_get_rpm_load_fraction(),  // RPM-based load (Feature 2)
         cut_names[(int)cs],
         batt, bat_names[(int)bs],
         (int)s_blade_commanded, 0 /* lockout removed 2026-06-12 */,
@@ -912,96 +913,115 @@ static bool json_get_str(const char *json, const char *key, char *buf, int bufsz
     return i > 0;
 }
 
-/** Parse a SEND_PERIMETER JSON command — extracts origin and polygon points.
- *  JSON shape: {"cmd":"SEND_PERIMETER","origin":{"lat":X,"lon":Y},"polygon":[[x,y],...]}
- *  Saves to NVS, reinitialises obstacle map, re-plans if AUTO. */
+/** Parse a SEND_PERIMETER JSON command (protocol v2: absolute WGS-84 lat/lon +
+ *  per-point accuracy). JSON shape:
+ *    {"cmd":"SEND_PERIMETER","v":2,"polygon":[[lat,lon,acc],...]}
+ *  The firmware OWNS the ENU origin (first vertex); older ENU-offset uploads are
+ *  rejected so a PWA/firmware version mismatch can't silently mis-place the
+ *  perimeter. Stores the canonical lat/lon perimeter, then re-derives ENU. */
 static void handle_send_perimeter(const char *json) {
-    // Extract origin lat/lon
-    double lat = 0.0, lon = 0.0;
-    const char *orig = strstr(json, "\"origin\":");
-    if (!orig) { ble_server_send_ack("SEND_PERIMETER", false, "no origin"); return; }
-    if (sscanf(orig, "\"origin\":{\"lat\":%lf,\"lon\":%lf", &lat, &lon) != 2) {
-        ble_server_send_ack("SEND_PERIMETER", false, "bad origin"); return;
+    // Require protocol v2 — pre-v2 PWAs sent ENU offsets against a PWA-chosen
+    // origin (the old "translating between schemes" error source). Fail loudly.
+    if (!strstr(json, "\"v\":2")) {
+        ble_server_send_ack("SEND_PERIMETER", false, "old PWA - update to v2 (lat/lon)");
+        return;
     }
 
-    // Parse polygon array [[x,y],...]
+    // Parse polygon array of [lat, lon, acc] triples (acc optional).
     const char *poly_start = strstr(json, "\"polygon\":[");
     if (!poly_start) { ble_server_send_ack("SEND_PERIMETER", false, "no polygon"); return; }
     poly_start += strlen("\"polygon\":[");
 
-    Polygon poly;
+    // Transient heap buffers (freed on return) — no permanent static buffer.
+    std::vector<double> la, lo;
+    std::vector<float>  ac;
+
     const char *p = poly_start;
-    while (*p) {
-        // Skip whitespace and commas
+    while (*p && (int)la.size() < MAX_PERIMETER_POINTS) {
         while (*p == ' ' || *p == '\t' || *p == ',') p++;
-        if (*p == ']') break;   // end of polygon array
+        if (*p == ']') break;            // end of polygon array
         if (*p != '[') { p++; continue; }
-        p++;  // skip '['
-        float x = 0.0f, y = 0.0f;
+        p++;                             // skip '['
+        double lat = 0.0, lon = 0.0; float acc = 0.0f;
         int consumed = 0;
-        if (sscanf(p, "%f,%f%n", &x, &y, &consumed) == 2) {
-            poly.pts.push_back({x, y});
+        if (sscanf(p, "%lf,%lf,%f%n", &lat, &lon, &acc, &consumed) >= 2) {
+            la.push_back(lat);
+            lo.push_back(lon);
+            ac.push_back(acc > 0.0f ? acc : 0.05f);   // tolerate a missing accuracy field
             p += consumed;
         }
-        // Skip to closing ']' of this pair
         const char *close = strchr(p, ']');
         if (close) p = close + 1; else break;
     }
+    int n = (int)la.size();
 
-    if ((int)poly.pts.size() < 4) {
+    if (n < 4) {
         ble_server_send_ack("SEND_PERIMETER", false, "too few points (need 4+)"); return;
     }
 
-    // The origin is the first perimeter vertex. All polygon coordinates are
-    // ENU offsets from this point. Setting the origin here ensures the GPS
-    // module converts lat/lon fixes into the same ENU frame as the perimeter.
-    // The EKF is reset so it re-seeds from GPS in the new frame on the next
-    // fix (typically within ~1 second).
-    rtk_gps_set_origin(lat, lon);
+    // Firmware owns the ENU origin = first perimeter vertex. Setting it makes the
+    // GPS module convert live fixes into the same ENU frame as the perimeter; the
+    // EKF is reset so it re-seeds from GPS in the new frame on the next fix.
+    rtk_gps_set_origin(la[0], lo[0]);
     ekf_init();
-    DBG_PRINTF("[BLE] SEND_PERIMETER: origin (%.6f,%.6f), EKF reset\r\n", lat, lon);
+    DBG_PRINTF("[BLE] SEND_PERIMETER: %d pts, origin (%.7f,%.7f), EKF reset\r\n",
+               n, la[0], lo[0]);
 
-    // Validate and save via perimeter module (derives nav boundary + working area)
+    // Build the ENU polygon (origin now set) for validation / auto-clean only.
+    Polygon poly;
+    poly.pts.reserve(n);
+    for (int i = 0; i < n; i++) {
+        float e = 0.0f, no = 0.0f;
+        rtk_gps_latlon_to_enu(la[i], lo[i], &e, &no);
+        poly.pts.push_back({e, no});
+    }
     poly.ensureCCW();
 
     // Auto-clean spurs / self-intersecting loops drawn in the PWA editor.
-    // Keeps the largest CCW sub-polygon (same logic as perimeter_finish_recording).
+    bool cleaned = false;
     if (isSelfIntersecting(poly)) {
-        auto cleaned = splitSelfIntersecting(poly);
-        if (cleaned.empty()) {
-            ble_server_send_ack("SEND_PERIMETER", false, "polygon self-intersects (could not auto-clean)");
+        auto parts = splitSelfIntersecting(poly);
+        if (parts.empty()) {
+            ble_server_send_ack("SEND_PERIMETER", false,
+                                "polygon self-intersects (could not auto-clean)");
             return;
         }
         int best = 0;
-        for (int i = 1; i < (int)cleaned.size(); i++) {
-            if (cleaned[i].area() > cleaned[best].area()) best = i;
-        }
-        poly = cleaned[best];
+        for (int i = 1; i < (int)parts.size(); i++)
+            if (parts[i].area() > parts[best].area()) best = i;
+        poly = parts[best];
         poly.ensureCCW();
-        DBG_PRINTF("[BLE] SEND_PERIMETER: auto-cleaned self-intersecting polygon → %d pts\n",
+        cleaned = true;
+        DBG_PRINTF("[BLE] SEND_PERIMETER: auto-cleaned self-intersecting polygon -> %d pts\n",
                    (int)poly.pts.size());
     }
 
-    if (!nvs_save_perimeter(poly)) {
-        ble_server_send_ack("SEND_PERIMETER", false, "nvs save failed"); return;
+    // Persist the canonical absolute lat/lon perimeter (the single source of truth).
+    //  • Normal case: store the EXACT PWA lat/lon + per-point accuracy (no ENU
+    //    round-trip, so per-corner confidence is preserved).
+    //  • Self-intersecting (rare): the cleaned ENU geometry no longer maps 1:1 to
+    //    the uploaded points, so fall back to the ENU->latlon round-trip tagged
+    //    with the worst-case accuracy across all uploaded points.
+    bool ok;
+    if (!cleaned) {
+        ok = perimeter_store_canonical_latlon(la.data(), lo.data(), ac.data(), n);
+    } else {
+        float worst = 0.0f;
+        for (int i = 0; i < n; i++) if (ac[i] > worst) worst = ac[i];
+        ok = perimeter_save_canonical(poly, worst > 0.0f ? worst : 0.05f);
     }
-    // Save the canonical lat/lon perimeter (origin-independent) so it survives
-    // reboot without map drift and so it overwrites any stale "perim2" from a
-    // previous perimeter. PWA-drawn points carry no GPS fix, so tag them with a
-    // small default accuracy. perimeter_init() below loads this back.
-    perimeter_save_canonical(poly, 0.05f);
+    if (!ok) { ble_server_send_ack("SEND_PERIMETER", false, "nvs save failed"); return; }
 
-    // Derive nav boundary and working area
-    Polygon nav  = insetPolygonClipper(poly, mower_config_nav_inset_m());
-    Polygon work = insetPolygonClipper(nav, mower_config_headland_m());
-    nvs_save_nav_boundary(nav);
-    nvs_save_working_area(work);
-
-    // Re-init perimeter and obstacle map
+    // Re-derive everything (ENU perimeter, nav boundary, working area, breach
+    // accuracy) from the canonical store, and re-persist the derived ENU blobs.
     perimeter_init();
-    obstacle_map_init(poly);
+    if (!perimeter_is_valid()) {
+        ble_server_send_ack("SEND_PERIMETER", false, "perimeter too small for robot");
+        return;
+    }
+    obstacle_map_init(perimeter_get_perimeter());
 
-    // Generate mowing plan so the PWA can display the planned path
+    // Generate mowing plan so the PWA can display the planned path.
     coverage_planner_plan(
         perimeter_get_perimeter(),
         perimeter_get_nav_boundary(),
@@ -1349,6 +1369,7 @@ static void handle_ble_command(const char *json) {
         gf("\"manual_max_duty\"",       cfg.manual_max_duty);
         gf("\"manual_max_speed_ms\"",  cfg.manual_max_speed_ms);
         gf("\"min_turn_radius_m\"",    cfg.min_turn_radius_m);
+        gf("\"min_move_duty\"",        cfg.min_move_duty);
 
         // Validate critical geometry constraints before saving
         if (cfg.cut_width_m <= cfg.strip_overlap_m + 0.01f) {
@@ -2290,6 +2311,37 @@ void state_machine_update() {
             }
         }
 
+        // ── RPM-load recovery trigger (Feature 2) ──────────────────────────────
+        // INDEPENDENT of AUTO_FAULT_RESPONSES_ENABLED: enabling this does NOT wake
+        // the old current-overload / stall / slip / obstacle detectors. Fires on a
+        // SUSTAINED high RPM-based load and hosts the hybrid back-up + height-step-
+        // down maneuver in STATE_RETRACE. The blade is LEFT ARMED (deck-only
+        // recovery) so it keeps cutting via the keepalive. Default OFF
+        // (BLADE_RPM_RECOVERY_ENABLED 0) — verify the Tx load reading first.
+        {
+            static uint32_t s_rpm_load_high_since_ms = 0;
+            float rpm_load = cutting_monitor_get_rpm_load_fraction();
+            if (BLADE_RPM_RECOVERY_ENABLED && obs_armed && s_blade_commanded
+                && rpm_load >= BLADE_RPM_RECOVERY_LOAD) {
+                if (s_rpm_load_high_since_ms == 0) {
+                    s_rpm_load_high_since_ms = millis();
+                } else if ((millis() - s_rpm_load_high_since_ms) >= BLADE_RPM_RECOVERY_CONFIRM_MS) {
+                    s_rpm_load_high_since_ms = 0;
+                    char l[SYS_LOG_MAX_LEN];
+                    snprintf(l, sizeof(l), "AUTO: rpm-load %.0f%% sustained - blade recovery",
+                             (double)(rpm_load * 100.0f));
+                    sys_log_push(l);
+                    collisionSaveBaselineForced();
+                    // Do NOT zero the blade: recovery raises the deck only; the
+                    // blade keepalive keeps it spinning so it can re-cut the patch.
+                    transition_to(STATE_RETRACE);
+                    break;
+                }
+            } else {
+                s_rpm_load_high_since_ms = 0;
+            }
+        }
+
         if (AUTO_FAULT_RESPONSES_ENABLED && obs_armed && cs == CUTTING_OVERLOADED) {
             // Save strip end for retrace
             if (s_wp_index < s_wp_count) {
@@ -2338,11 +2390,14 @@ void state_machine_update() {
         float margin = dist_to_edge - uncertainty;
         const MowerConfig &mc_ua = mower_config_get();
 
-        // Speed scale: 1.0 when margin >= threshold, ramps to 0 at margin=0
+        // Speed scale: PURE proximity factor — 1.0 when margin >= threshold,
+        // ramps linearly to 0 at margin=0. Do NOT floor it here with a
+        // min_creep/max_mowing fraction: that made max_mowing_speed_ms cancel
+        // (v = max_mowing × min_creep/max_mowing = min_creep), so the mow-speed
+        // setting had no effect near the perimeter — the outer spiral rings, which
+        // ARE the perimeter, so margin<=0 there. The absolute min_creep floor is
+        // applied downstream in node_follower (after this scale).
         float speed_scale = clampf(margin / mc_ua.uncertainty_margin_m, 0.0f, 1.0f);
-        // Floor: never below min_creep fraction
-        float min_scale = mc_ua.min_creep_speed_ms / mc_ua.max_mowing_speed_ms;
-        speed_scale = max(speed_scale, min_scale);
 
         // Collision sensitivity: lower multiplier when margin is low
         bool careful = (margin < mc_ua.uncertainty_margin_m);
@@ -2440,12 +2495,41 @@ void state_machine_update() {
             // below zero, so the minimum turn radius was ~half the track width and
             // sharp nodes were overshot. Now bounded to ±max_v in both directions.
             {
-                float max_v = mower_config_get().max_mowing_speed_ms;
+                // Clamp to the mechanical wheel-speed limit, NOT max_mowing_speed_ms.
+                // transit_speed_ms (0.30) and headland_speed_ms (0.20) are MEANT to
+                // exceed mow speed (0.15); clamping to max_mowing silently capped them
+                // to mow speed, so the transit slider did nothing above mow speed.
+                // node_follower already scales wheels to <= max_wheel_speed_ms; this is
+                // just the outer bound. Keep the +/- so a track can counter-rotate
+                // (tank steer / pivot on the spot) to reach tight corner nodes.
+                float max_v = mower_config_get().max_wheel_speed_ms;
                 cmd.left_ms  = clampf(cmd.left_ms,  -max_v, max_v);
                 cmd.right_ms = clampf(cmd.right_ms, -max_v, max_v);
             }
             // Duty-cycle ramp toward desired wheel velocities (ramp is reset on AUTO entry)
             node_follower_to_vesc_duty(cmd);
+
+            // ── AUTO drive diagnostic → PWA log (no field serial access) ───────
+            // Throttled to 0.5 Hz so it doesn't flood the 50-entry sys_log ring and
+            // bury state-transition / fault entries. Lets the operator confirm from
+            // the PWA Diagnostics log that each speed slider now changes the desired
+            // wheel speed, that the perimeter slowdown still ramps `scale`, and
+            // whether the mower is stuck pivoting (`piv`, a separate heading issue).
+            {
+                static uint32_t s_drv_log_ms = 0;
+                if ((uint32_t)(millis() - s_drv_log_ms) >= 2000u) {
+                    s_drv_log_ms = millis();
+                    float dl = 0.0f, dr = 0.0f;
+                    node_follower_get_last_duty(&dl, &dr);
+                    char line[SYS_LOG_MAX_LEN];
+                    snprintf(line, sizeof(line),
+                             "AUTO drv des=%.2f/%.2f duty=%.2f/%.2f scale=%.2f piv=%d",
+                             (double)cmd.left_ms, (double)cmd.right_ms,
+                             (double)dl, (double)dr, (double)speed_scale,
+                             node_follower_is_pivoting() ? 1 : 0);
+                    sys_log_push(line);
+                }
+            }
 
             // ── Robust waypoint advancement (reached OR passed) ───────────────
             // Advancing only on a tight physical-arrival window (waypoint_arrive_dist_m,
@@ -2572,12 +2656,16 @@ void state_machine_update() {
     }
 
     // ── STATE_RETRACE ─────────────────────────────────────────────────────────
+    // Re-purposed (Feature 2, 2026-06-16) to host the RPM-load blade_recovery
+    // maneuver (hybrid back-up + height-step-down, blade stays armed). The legacy
+    // retrace.cpp/bog_recovery.cpp remain in-tree as gated dead code. The Tx still
+    // shows "RETRACE" (telemetry flag 0x08) during this recovery.
     case STATE_RETRACE: {
         if (g_state_entry) {
-            DBG_PRINTF("[RETRACE] Entering RETRACE: strip_end=(%.3f, %.3f) h=%.0fmm\r\n",
-                s_retrace_strip_end_x, s_retrace_strip_end_y, s_desired_cut_height_mm);
-            retrace_enter(pose, s_retrace_strip_end_x, s_retrace_strip_end_y,
-                          s_desired_cut_height_mm);
+            DBG_PRINTF("[BLADE-REC] Entering recovery at (%.3f, %.3f) h=%.0fmm\r\n",
+                pose.x, pose.y, s_desired_cut_height_mm);
+            blade_recovery_enter(pose, perimeter_get_perimeter(),
+                                 s_desired_cut_height_mm);
         }
 
         // Tilt safety: also applies during recovery states
@@ -2585,8 +2673,8 @@ void state_machine_update() {
             float tilt_deg = imu_get_tilt_rad() * (180.0f / M_PI);
             float tilt_lim = mower_config_get().tilt_limit_normal_deg;
             if (tilt_deg > tilt_lim) {
-                DBG_PRINTF("[RETRACE] Tilt %.1f > %.1f — pausing.\n", tilt_deg, tilt_lim);
-                retrace_exit();
+                DBG_PRINTF("[BLADE-REC] Tilt %.1f > %.1f — pausing.\n", tilt_deg, tilt_lim);
+                blade_recovery_exit();
                 transition_to(STATE_PAUSED, true);
                 break;
             }
@@ -2594,45 +2682,44 @@ void state_machine_update() {
 
         showLedsWithGps(COL_RED);
 
+        // Blade stays armed during recovery — feed the monitor the real commanded
+        // state/target so rpm-load and BLADE_FAULT are meaningful (the keepalive
+        // after the switch keeps issuing SET_RPM while s_blade_commanded is true).
         {
             VescStatus blade = vesc_get_status(VESC_ID_BLADE);
             cutting_monitor_update(speed, blade.current_A, blade.erpm,
-                                   (float)BLADE_TARGET_ERPM, false, battery_get_voltage());
+                                   s_blade_ramp_erpm, s_blade_commanded,
+                                   battery_get_voltage());
         }
 
         CuttingStatus cs = cutting_monitor_get_status();
-        RetraceResult result = retrace_update(pose, speed, cs);
+        BladeRecoveryResult result = blade_recovery_update(pose, speed, cs);
 
         switch (result) {
-        case RETRACE_IN_PROGRESS:
+        case BLADE_RECOVERY_IN_PROGRESS:
             break;
 
-        case RETRACE_COMPLETE:
-            retrace_exit();
-            DBG_PRINTLN("[RETRACE] Complete — resuming AUTO_MOWING.");
-            s_blade_commanded = true;
+        case BLADE_RECOVERY_COMPLETE:
+        case BLADE_RECOVERY_GAVE_UP:
+            blade_recovery_exit();
+            DBG_PRINTLN(result == BLADE_RECOVERY_COMPLETE
+                ? "[BLADE-REC] Complete — resuming AUTO_MOWING."
+                : "[BLADE-REC] Gave up — resuming AUTO_MOWING (patch logged).");
+            // The recovery backed up / re-cut, so the old waypoint index is stale —
+            // re-plan from the current position and reload waypoints.
+            coverage_planner_reset_to_nearest(pose.x, pose.y);
+            s_wp_count = load_waypoints_from_planner();
+            s_wp_index = 0;
+            s_blade_commanded = true;   // already armed — keep it so
             transition_to(STATE_AUTO_MOWING);
             break;
 
-        case RETRACE_STALLED:
-            retrace_exit();
-            DBG_PRINTLN("[RETRACE] Stalled during retrace — entering BOG_RECOVERY.");
-            transition_to(STATE_BOG_RECOVERY);
-            break;
-
-        case RETRACE_BLADE_FAULT:
-            DBG_PRINTLN("[SM] Blade fault in RETRACE — pausing");
+        case BLADE_RECOVERY_BLADE_FAULT:
+            DBG_PRINTLN("[SM] Blade fault in recovery — pausing");
 #if !BENCH_TEST_NO_VESC
-            retrace_exit();
+            blade_recovery_exit();
             transition_to(STATE_PAUSED, true);
 #endif
-            break;
-
-        case RETRACE_GAVE_UP:
-            retrace_exit();
-            DBG_PRINTLN("[RETRACE] Max retries exceeded — resuming AUTO_MOWING.");
-            s_blade_commanded = true;
-            transition_to(STATE_AUTO_MOWING);
             break;
         }
         break;
@@ -3144,7 +3231,7 @@ void state_machine_update() {
         td.hprog          = (uint8_t)(coverage_planner_get_headland_progress() * 100.0f);
         td.sprog          = (uint8_t)(coverage_planner_get_strip_progress()    * 100.0f);
         td.cut_height_mm  = (uint8_t)state_machine_get_cut_height_mm();
-        td.blade_load_pct = (uint8_t)(cutting_monitor_get_load_fraction()     * 100.0f);
+        td.blade_load_pct = (uint8_t)(cutting_monitor_get_rpm_load_fraction() * 100.0f);  // RPM-based (Feature 2)
         td.fix_type       = (uint8_t)gps.fix_type;
         td.calib_status   = imu_get_calib_status();
         td.flags          = (s_last_armed && g_state != STATE_PAUSED

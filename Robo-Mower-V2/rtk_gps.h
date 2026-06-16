@@ -144,9 +144,10 @@ void rtk_gps_set_origin(double lat_deg, double lon_deg);
 /**
  * @brief Convert absolute WGS-84 lat/lon to local ENU metres. Thread-safe.
  *
- * Uses the current origin and the SAME flat-earth formula as live GPS fixes,
- * so perimeter points stored as lat/lon re-derive into the identical ENU frame
- * the mower navigates in. Returns false (outputs untouched) if no origin is set.
+ * Uses the current origin and the SAME WGS-84 local-tangent-plane projection as
+ * live GPS fixes, so perimeter points stored as lat/lon re-derive into the
+ * identical ENU frame the mower navigates in. Returns false (outputs untouched)
+ * if no origin is set.
  */
 bool rtk_gps_latlon_to_enu(double lat_deg, double lon_deg, float *east_m, float *north_m);
 

@@ -12,7 +12,7 @@
 // NVS storage: same "mower" namespace as nvs_storage.cpp to avoid wasting slots.
 // Key must be ≤ 15 characters.
 static const char *k_nvs_ns  = "mower";
-static const char *k_nvs_key = "mow_cfg_v11"; // bumped: footprint W×L box + track_width_m (removed robot_*/chassis_length)
+static const char *k_nvs_key = "mow_cfg_v12"; // bumped: + min_move_duty (kickstart). v11 added footprint W×L box + track_width_m
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -58,6 +58,7 @@ static const MowerConfig k_defaults = {
     /* manual_max_duty        */ MANUAL_MAX_DUTY,
     /* manual_max_speed_ms    */ MANUAL_MAX_SPEED_MS,
     /* min_turn_radius_m      */ MIN_TURNING_RADIUS_M,
+    /* min_move_duty          */ MIN_MOVE_DUTY,
 };
 
 static MowerConfig s_cfg;

@@ -13,9 +13,27 @@
 
 static float s_duty[2] = {0.0f, 0.0f};  // [LEFT=0, RIGHT=1]
 
+// Below this commanded wheel speed the command is treated as "stop" — no
+// kickstart is applied, so a commanded halt is a true halt and a wheel held
+// near-still (e.g. the inner wheel of a turn) is not forced to spin.
+static const float MIN_MOVE_CMD_MS = 0.01f;  // [m/s]
+
 void wheel_duty_ramp_reset() {
     s_duty[0] = 0.0f;
     s_duty[1] = 0.0f;
+}
+
+/** Static-friction kickstart. When a real wheel move is commanded (|desired_ms|
+ *  above the stop threshold) but the duty is below the break-free floor
+ *  (MowerConfig.min_move_duty), raise |duty| to that floor in the COMMANDED
+ *  direction so the wheel actually starts. A duty already above the floor, or a
+ *  near-zero command, is returned unchanged. min_move_duty <= 0 disables it. */
+static float apply_min_move_duty(float duty, float desired_ms, const MowerConfig &mc) {
+    float floor_d = clampf(mc.min_move_duty, 0.0f, mc.manual_max_duty);
+    if (floor_d <= 0.0f)                       return duty;  // feature off
+    if (fabsf(desired_ms) < MIN_MOVE_CMD_MS)   return duty;  // commanded stop
+    if (fabsf(duty)       >= floor_d)          return duty;  // already breaking free
+    return (desired_ms >= 0.0f) ? floor_d : -floor_d;
 }
 
 float wheel_duty_ramp_compute(uint8_t vesc_id, float desired_ms) {
@@ -40,6 +58,7 @@ float wheel_duty_ramp_compute(uint8_t vesc_id, float desired_ms) {
         }
         float max_ms = (mc.max_wheel_speed_ms > 0.1f) ? mc.max_wheel_speed_ms : 1.0f;
         float duty   = (desired_ms / max_ms) * mc.manual_max_duty;
+        duty = apply_min_move_duty(duty, desired_ms, mc);   // break static friction at creep
         duty = clampf(duty, -mc.manual_max_duty, mc.manual_max_duty);
         s_duty[idx] = duty;
         vesc_set_duty(vesc_id, duty);
@@ -61,6 +80,11 @@ float wheel_duty_ramp_compute(uint8_t vesc_id, float desired_ms) {
 
     // Clamp duty to [-max_duty, +max_duty]
     s_duty[idx] = clampf(s_duty[idx], -mc.manual_max_duty, mc.manual_max_duty);
+
+    // Static-friction kickstart: hold |duty| at the break-free floor while a move
+    // is commanded so the wheel can't sit below break-free and stall (and so the
+    // integrator doesn't have to ramp up from ~0 every time it starts from rest).
+    s_duty[idx] = apply_min_move_duty(s_duty[idx], desired_ms, mc);
 
     vesc_set_duty(vesc_id, s_duty[idx]);
     return s_duty[idx];

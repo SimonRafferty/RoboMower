@@ -197,6 +197,30 @@ float perimeter_get_accuracy_m();
 bool perimeter_save_canonical(const Polygon &enu_poly, float acc);
 
 /**
+ * @brief Persist absolute lat/lon perimeter points with PER-POINT accuracy.
+ *
+ * Stores the EXACT WGS-84 coordinates the PWA captured (no ENU round-trip) plus
+ * each point's GPS confidence, so the map and the mower hold identical points and
+ * per-corner confidence. Follow with perimeter_init() to re-derive ENU geometry.
+ *
+ * @return true on success.
+ */
+bool perimeter_store_canonical_latlon(const double *lat, const double *lon,
+                                      const float *acc, int n);
+
+/** @brief Number of points in the canonical lat/lon store (0 if none loaded). */
+int perimeter_canonical_count();
+
+/**
+ * @brief Read one canonical perimeter point (absolute lat/lon + accuracy).
+ *
+ * Lets the BLE MAP push stream the perimeter (exact stored coordinates + per-point
+ * confidence, no ENU round-trip) without a duplicate buffer. Returns false if the
+ * index is out of range.
+ */
+bool perimeter_canonical_point(int i, double *lat, double *lon, float *acc);
+
+/**
  * @brief Erase all stored perimeter data from NVS and clear in-memory state.
  *
  * Calls nvs_clear_perimeter() and resets the internal valid flag plus all

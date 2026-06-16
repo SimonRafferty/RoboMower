@@ -85,6 +85,11 @@ struct MowerConfig {
 
     // ── Turning geometry ─────────────────────────────────────────────────────
     float    min_turn_radius_m;           // minimum path-following turn radius [m]; 0 = tracked (pivot)
+
+    // ── AUTO drive ────────────────────────────────────────────────────────────
+    // Appended at the end (keeps the positional NVS layout of all fields above
+    // intact). NVS key bumped to mow_cfg_v12 for this addition.
+    float    min_move_duty;               // static-friction kickstart: min |duty| when a wheel move is commanded [0–1]; 0 = off
 };
 
 

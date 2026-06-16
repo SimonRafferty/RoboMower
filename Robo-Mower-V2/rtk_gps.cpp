@@ -5,7 +5,7 @@
 //    • Serial1 bidirectional UART to DFRobot RTK LoRa GPS module (RX=10, TX=14)
 //    • Uses DFRobot_RTK_LoRa library — request/response protocol (not NMEA stream)
 //    • Latitude/longitude polled via getLat()/getLon(), quality via getQuality()
-//    • Flat-earth ENU conversion relative to perimeter origin (first vertex)
+//    • WGS-84 local-tangent-plane ENU conversion relative to perimeter origin
 //    • Antenna-to-steering-centre offset transform (uses EKF heading)
 //    • ENU origin set only by perimeter upload; persisted to NVS across reboots
 //    • FreeRTOS poll task (Core 0, priority 6, stack 4096 — per ARCHITECTURE.md)
@@ -75,6 +75,28 @@ static uint32_t          s_last_valid_ms     = 0;    // millis() of last valid p
 static SemaphoreHandle_t s_mutex             = nullptr;
 static GpsFix            s_last_logged_fix   = GPS_FIX_NONE;  // for fix-change log events
 
+
+// ── WGS-84 local-tangent-plane projection ─────────────────────────────────────
+// Replaces the old fixed 111319.5 m/deg flat-earth constant with the proper
+// ellipsoidal radii of curvature evaluated at the ORIGIN latitude, so lat/lon ↔
+// local metres is exact at the origin and < 1 cm over a garden, correct at any
+// latitude on earth. Computed inline from the (mutex-snapshotted) origin — the
+// GPS path runs at ~3 Hz and perimeter conversions are rare, so no global cache
+// is needed.
+//   M = meridional radius of curvature      → metres per degree of latitude
+//   N = prime-vertical radius of curvature   → metres per degree of longitude (×cosφ)
+static void geodetic_scales(double lat0_deg, double *m_per_deg_north, double *m_per_deg_east) {
+    static constexpr double WGS84_A  = 6378137.0;         // semi-major axis [m]
+    static constexpr double WGS84_E2 = 6.69437999014e-3;  // first eccentricity² (2f − f²)
+    static constexpr double DEG2RAD  = M_PI / 180.0;
+    double s        = sin(lat0_deg * DEG2RAD);
+    double den      = 1.0 - WGS84_E2 * s * s;
+    double sqrt_den = sqrt(den);
+    double M = WGS84_A * (1.0 - WGS84_E2) / (den * sqrt_den);  // = a(1−e²)/den^1.5
+    double N = WGS84_A / sqrt_den;
+    if (m_per_deg_north) *m_per_deg_north = M * DEG2RAD;
+    if (m_per_deg_east)  *m_per_deg_east  = N * cos(lat0_deg * DEG2RAD) * DEG2RAD;
+}
 
 
 // ── CRC32 (nibble-LUT, no large static table) ─────────────────────────────────
@@ -217,13 +239,11 @@ static void gps_poll_task_fn(void* /*arg*/) {
         bool  valid    = false;
 
         if (origin.set && fix_type != GPS_FIX_NONE) {
-            // Flat-earth ENU from antenna lat/lon
-            float ant_east = static_cast<float>(
-                (lon_deg - origin.lon_deg)
-                * cos(origin.lat_deg * M_PI / 180.0)
-                * 111319.5);
-            float ant_north = static_cast<float>(
-                (lat_deg - origin.lat_deg) * 111319.5);
+            // WGS-84 local-tangent-plane ENU from antenna lat/lon
+            double mpd_n, mpd_e;
+            geodetic_scales(origin.lat_deg, &mpd_n, &mpd_e);
+            float ant_east  = static_cast<float>((lon_deg - origin.lon_deg) * mpd_e);
+            float ant_north = static_cast<float>((lat_deg - origin.lat_deg) * mpd_n);
 
             // Apply physical antenna offset to get steering-centre ENU
             // Uses current EKF heading; 0.0f is safe before EKF initialises
@@ -406,27 +426,29 @@ void rtk_gps_set_origin(double lat_deg, double lon_deg) {
 }
 
 // ── Shared ENU ↔ lat/lon conversion ──────────────────────────────────────────
-// Flat-earth, IDENTICAL math to the GPS task (see gps_poll_task_fn) so a
-// perimeter stored as lat/lon and a live fix convert into exactly the same ENU
-// frame. This is what makes a lat/lon-stored perimeter origin-independent:
-// re-deriving it on boot against the current origin can never disagree with the
-// live position, even if the origin itself shifts between sessions.
-static constexpr double METRES_PER_DEG_LAT = 111319.5;
+// WGS-84 local tangent plane (geodetic_scales), IDENTICAL math to the GPS task
+// (see gps_poll_task_fn) so a perimeter stored as lat/lon and a live fix convert
+// into exactly the same ENU frame. This is what makes a lat/lon-stored perimeter
+// origin-independent: re-deriving it on boot against the current origin can never
+// disagree with the live position, even if the origin itself shifts between
+// sessions. The PWA mirrors this exact formula for its grid overlay.
 
 bool rtk_gps_latlon_to_enu(double lat_deg, double lon_deg, float *east_m, float *north_m) {
     GpsOrigin o = rtk_gps_get_origin();
     if (!o.set) return false;
-    if (east_m)  *east_m  = (float)((lon_deg - o.lon_deg)
-                                    * cos(o.lat_deg * M_PI / 180.0) * METRES_PER_DEG_LAT);
-    if (north_m) *north_m = (float)((lat_deg - o.lat_deg) * METRES_PER_DEG_LAT);
+    double mpd_n, mpd_e;
+    geodetic_scales(o.lat_deg, &mpd_n, &mpd_e);
+    if (east_m)  *east_m  = (float)((lon_deg - o.lon_deg) * mpd_e);
+    if (north_m) *north_m = (float)((lat_deg - o.lat_deg) * mpd_n);
     return true;
 }
 
 bool rtk_gps_enu_to_latlon(float east_m, float north_m, double *lat_deg, double *lon_deg) {
     GpsOrigin o = rtk_gps_get_origin();
     if (!o.set) return false;
-    if (lat_deg) *lat_deg = o.lat_deg + (double)north_m / METRES_PER_DEG_LAT;
-    if (lon_deg) *lon_deg = o.lon_deg + (double)east_m
-                                        / (METRES_PER_DEG_LAT * cos(o.lat_deg * M_PI / 180.0));
+    double mpd_n, mpd_e;
+    geodetic_scales(o.lat_deg, &mpd_n, &mpd_e);
+    if (lat_deg) *lat_deg = o.lat_deg + (double)north_m / mpd_n;
+    if (lon_deg) *lon_deg = o.lon_deg + (double)east_m  / mpd_e;
     return true;
 }

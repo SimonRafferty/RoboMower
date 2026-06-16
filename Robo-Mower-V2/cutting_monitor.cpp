@@ -36,6 +36,12 @@ static int      g_buf_head  = 0;                // next write index
 static bool     g_buf_full  = false;            // true after first full revolution
 static float    g_rolling_avg = 0.0f;           // current rolling average (A, compensated)
 
+// ── RPM-based load (Feature 2, 2026-06-16) ───────────────────────────────────
+// EMA-smoothed fraction derived from blade RPM droop (target vs actual eRPM).
+// Drives the Tx/PWA load display and the (default-off) load recovery/adaptive
+// speed. 0 = free spin at/above target, 1 = standstill. Read via the spinlock.
+static float    g_rpm_load = 0.0f;
+
 // ── Runtime blade reference current ──────────────────────────────────────────
 // Initialised from NVS on boot; updated by auto-calibration.
 static float    g_blade_max_A = BLADE_MAX_EXPECTED_CURRENT_A_DEFAULT;
@@ -297,9 +303,33 @@ void cutting_monitor_update(float fused_velocity,
         updateCalibration(blade_current_A);
     }
 
+    // ── Step 6b: RPM-based load (Feature 2) ───────────────────────────────
+    // rpm_load = (target_erpm - |actual_erpm|) / target_erpm, clamped 0..1.
+    // Using eRPM directly (pole-pairs cancel). Reads 0 whenever the blade is
+    // not commanded or still inside the spin-up grace — without this guard the
+    // formula would read 100% at standstill (the false-overload trap that bit
+    // the current-based metric). When live, smooth with an EMA.
+    bool rpm_valid = blade_commanded
+                  && g_blade_cmd_since_ms != 0
+                  && (now - g_blade_cmd_since_ms) > BLADE_FAULT_GRACE_MS
+                  && blade_target_erpm > 1.0f;
+    float rpm_load_inst = 0.0f;
+    if (rpm_valid) {
+        rpm_load_inst = (blade_target_erpm - fabsf(blade_actual_erpm)) / blade_target_erpm;
+        if (rpm_load_inst < 0.0f) rpm_load_inst = 0.0f;
+        if (rpm_load_inst > 1.0f) rpm_load_inst = 1.0f;
+    }
+    float rpm_load_new;
+    if (!rpm_valid) {
+        rpm_load_new = 0.0f;  // snap to 0 promptly when the blade is off/spinning up
+    } else {
+        rpm_load_new = g_rpm_load + BLADE_RPM_LOAD_EMA_ALPHA * (rpm_load_inst - g_rpm_load);
+    }
+
     // ── Step 7: Publish atomically ────────────────────────────────────────
     portENTER_CRITICAL(&g_mux);
     g_confirmed_status = confirmed;
+    g_rpm_load = rpm_load_new;
     portEXIT_CRITICAL(&g_mux);
 }
 
@@ -328,6 +358,13 @@ float cutting_monitor_get_load_fraction() {
     // auto-calibrated g_blade_max_A is no longer used as the load reference — it
     // was capturing idle current as 100%, so idle read ~105%.
     return avg / BLADE_CURRENT_LIMIT_A;
+}
+
+float cutting_monitor_get_rpm_load_fraction() {
+    portENTER_CRITICAL(&g_mux);
+    float lf = g_rpm_load;
+    portEXIT_CRITICAL(&g_mux);
+    return lf;
 }
 
 void cutting_monitor_start_auto_cal() {

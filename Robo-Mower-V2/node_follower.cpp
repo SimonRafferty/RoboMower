@@ -9,6 +9,7 @@
 #include "vesc_can.h"
 #include "odo_calib.h"
 #include "sys_log.h"
+#include "cutting_monitor.h"   // Feature 2: RPM load for (disabled) adaptive speed
 #include <math.h>
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -37,7 +38,10 @@ static float    g_session_distance_m = 0.0f;    ///< distance driven this AUTO s
 
 /** Select target forward speed by waypoint type and proximity to the node.
  *  Tiers: transit > headland > long-grass > mowing; ramped to zero within 0.5 m
- *  of the node, then floored at the creep speed so it never fully stops. */
+ *  of the node. The absolute min_creep_speed floor is applied by the CALLER,
+ *  AFTER the uncertainty speed_scale (see node_follower_compute) — flooring here
+ *  would be undone by the later ×speed_scale, and the old two-floor arrangement
+ *  let the perimeter speed_scale cancel max_mowing_speed entirely. */
 static float computeTargetSpeed(float dist_to_wp, bool mowing, bool headland,
                                  float cut_height_mm) {
     const MowerConfig &mc = mower_config_get();
@@ -54,7 +58,6 @@ static float computeTargetSpeed(float dist_to_wp, bool mowing, bool headland,
     if (dist_to_wp < 0.5f)
         v *= (dist_to_wp / 0.5f);
 
-    v = max(v, mc.min_creep_speed_ms);
     return v;
 }
 
@@ -229,8 +232,30 @@ WheelCmd node_follower_compute(const Pose2D &pose, float current_speed,
     }
 
     // ── Drive branch: heading P-controller + speed profile ────────────────────
+    // Base speed (from config) → scaled down near the perimeter → floored at the
+    // absolute creep speed. Order matters: the floor is applied AFTER speed_scale
+    // so a slowdown can only reach min_creep, never zero, and so max_mowing_speed
+    // is NOT cancelled by a min_creep/max_mowing fraction (the old bug — the mow
+    // speed setting then had no effect anywhere margin <= 0, i.e. the outer rings).
     float v_cmd = computeTargetSpeed(dist, node.mowing, node.headland, cut_height_mm);
     v_cmd *= speed_scale;
+#if BLADE_LOAD_ADAPTIVE_SPEED_ENABLED
+    // Feature 2 (DISABLED by default): slow proportionally to RPM-based blade load.
+    // Applied BEFORE the min_creep floor, so high load can only slow to creep, never
+    // to a stall. factor = 1 at/below the knee, ramping to MIN_FACTOR at full load.
+    {
+        float load = cutting_monitor_get_rpm_load_fraction();
+        float over = load - BLADE_LOAD_SPEED_KNEE;
+        if (over > 0.0f) {
+            float f = 1.0f - (over / (1.0f - BLADE_LOAD_SPEED_KNEE))
+                               * (1.0f - BLADE_LOAD_SPEED_MIN_FACTOR);
+            f = (f < BLADE_LOAD_SPEED_MIN_FACTOR) ? BLADE_LOAD_SPEED_MIN_FACTOR
+              : (f > 1.0f ? 1.0f : f);
+            v_cmd *= f;
+        }
+    }
+#endif
+    v_cmd = max(v_cmd, mc.min_creep_speed_ms);
 
     // Yaw rate proportional to heading error, capped. omega>0 = turn right (CW).
     float omega = clampf(NODE_HEADING_KP * hdg_err, -NODE_YAW_RATE_MAX, NODE_YAW_RATE_MAX);

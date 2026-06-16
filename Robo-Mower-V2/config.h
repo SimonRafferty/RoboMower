@@ -26,6 +26,10 @@
 // DEBUG_SERIAL: when 1, enable USB Serial debug output (bench testing).
 //               when 0, all Serial output compiles to no-ops (production / field).
 //               Does NOT affect Serial2 (CRSF) or BLE telemetry.
+// KEEP THIS 0. There is NO USB serial access while the mower is operating, so
+// serial debug cannot validate field behaviour. Route all runtime diagnostics to
+// the PWA log via sys_log_push() (surfaced in the STATUS JSON `log` array and the
+// PWA Diagnostics tab) instead of Serial.
 #define DEBUG_SERIAL                 0
 
 // BENCH_TEST_NO_VESC: set to 1 ONLY when testing on bench without VESCs connected.
@@ -257,6 +261,32 @@
 // Rolling average window for load assessment
 #define BLADE_LOAD_SAMPLE_WINDOW_MS  500   // [ms] — rolling window; 500ms masks brief spikes (A03 corrected)
 
+// ── Feature 2 (2026-06-16): RPM-based blade load + load recovery + adaptive speed ─
+// The blade VESC is current-limited (SET_RPM PID caps current), so RPM is a better
+// load proxy than current: free spin holds the target RPM; under load the RPM droops.
+//   rpm_load = clamp((blade_target_rpm - actual_rpm) / blade_target_rpm, 0, 1)
+// = 0 % at/above target, 100 % at standstill. This drives the Tx/PWA load display
+// (cutting_monitor_get_rpm_load_fraction()). The current-based fraction is retained
+// for diagnostics (amps) and the (inert) classifier.
+#define BLADE_RPM_LOAD_EMA_ALPHA      0.30f   // EMA smoothing on the displayed/triggering rpm-load
+
+// Load-triggered recovery (hosted in the existing STATE_RETRACE slot). This flag is
+// INDEPENDENT of AUTO_FAULT_RESPONSES_ENABLED — enabling it does NOT wake the old
+// current-overload / stall / slip / obstacle detectors. Default OFF: field-verify the
+// RPM load reading on the Tx before letting it move actuators (user decision).
+#define BLADE_RPM_RECOVERY_ENABLED        0       // master gate for the new recovery
+#define BLADE_RPM_RECOVERY_LOAD           0.80f   // [fraction] rpm-load that triggers recovery (~560 rpm at 2800)
+#define BLADE_RPM_RECOVERY_CONFIRM_MS     1500    // [ms] rpm-load must stay high this long before triggering
+#define BLADE_RECOVERY_BACKUP_MAX_M       1.0f    // [m] max reverse distance (perimeter-clipped)
+#define BLADE_RECOVERY_MAX_PASSES         BOG_MAX_RETRIES  // re-use the bog step-down retry budget (6)
+
+// Load-adaptive mow speed (built but DISABLED this cycle — user deferred it so it
+// cannot obscure other issues while debugging the new metric). Applied at the
+// node_follower speed hook, BEFORE the min_creep floor, so it can only slow, never stall.
+#define BLADE_LOAD_ADAPTIVE_SPEED_ENABLED 0       // master gate for inverse-load speed
+#define BLADE_LOAD_SPEED_KNEE             0.50f   // [fraction] rpm-load above which slowdown begins
+#define BLADE_LOAD_SPEED_MIN_FACTOR       0.40f   // [×] floor on the speed factor before min_creep
+
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  RC INPUT — CRSF CHANNEL THRESHOLDS
@@ -420,6 +450,14 @@
 // integrate against a frozen reading (error never closes → duty winds up to
 // max → runaway). Falls back to bounded open-loop duty instead.
 #define DUTY_FEEDBACK_STALE_MS       500    // [ms]
+
+// Static-friction kickstart (AUTO duty floor). At creep speed the proportional
+// open-loop duty (≈0.06) sits below the duty needed to break static friction, so
+// the wheels never start. When a real wheel move is commanded, the AUTO duty ramp
+// floors |duty| to at least this value in the commanded direction. Runtime-tunable
+// as MowerConfig.min_move_duty (PWA). 0 disables the kickstart. Tune in field:
+// raise until the mower reliably starts from rest at creep; lower if it lurches.
+#define MIN_MOVE_DUTY                0.12f  // [duty 0–1] — break-free duty floor
 
 // Wheel-slip detection: if GPS/EKF speed < wheel_erpm_speed × this threshold,
 // the wheels are spinning but the robot is barely moving → bog-in-progress.

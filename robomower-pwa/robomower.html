@@ -428,6 +428,7 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
           <label>Headland speed m/s<input type="number" class="cfg-input" id="cfg-headland_speed_ms" step="0.01" title="Forward speed during perimeter/headland passes (m/s)"></label>
           <label>Transit speed m/s<input type="number" class="cfg-input" id="cfg-transit_speed_ms"   step="0.01" title="Forward speed during non-mowing transitions between strips (m/s)"></label>
           <label>Creep speed m/s<input  type="number" class="cfg-input" id="cfg-min_creep_speed_ms"  step="0.01" title="Minimum commanded speed (m/s). The mower never goes slower than this — prevents stalling mid-path"></label>
+          <label>Min move duty<input    type="number" class="cfg-input" id="cfg-min_move_duty"       step="0.01" min="0" max="1" title="Static-friction kickstart: minimum AUTO drive duty (0–1) applied when a wheel move is commanded, so the wheels actually start at creep speed. Raise until it reliably starts from rest; lower if it lurches. 0 = disabled. Default 0.12"></label>
           <label>Arrive dist m<input    type="number" class="cfg-input" id="cfg-waypoint_arrive_dist_m" step="0.01" title="Distance to a waypoint at which it is considered reached (metres)"></label>
           <label>Max wheel m/s<input    type="number" class="cfg-input" id="cfg-max_wheel_speed_ms"  step="0.05" title="Maximum surface speed of either wheel (m/s)"></label>
           <label>Max current A<input    type="number" class="cfg-input" id="cfg-max_current_a"       step="0.5" title="Drive motor continuous current limit (amps)"></label>
@@ -794,11 +795,29 @@ async function savePerimeterToFile(perim) {
   }
 }
 
-/** Parse a perimeter JSON string from a loaded file. Throws on invalid format. */
+/** Parse a perimeter JSON string from a loaded file → { points: [[lat,lon,acc],...] }.
+ *  Accepts v2 (absolute lat/lon + accuracy) and migrates the legacy v1 format
+ *  ({origin, polygon:[[x,y],...]} in ENU metres) using the saved origin. */
 function parsePerimeterFile(str) {
   const obj = JSON.parse(str);
-  if (!obj.origin?.lat || !obj.polygon?.length) throw new Error('Invalid perimeter JSON — missing origin or polygon');
-  return obj;
+  // v2: { version:2, points:[{lat,lon,acc}|[lat,lon,acc], ...] }
+  if (Array.isArray(obj.points) && obj.points.length) {
+    const points = obj.points.map(p =>
+      Array.isArray(p) ? [p[0], p[1], p.length >= 3 ? p[2] : 0.05]
+                       : [p.lat, p.lon, (p.acc != null ? p.acc : 0.05)]);
+    return { points };
+  }
+  // Legacy v1: ENU offsets against an origin → migrate to absolute lat/lon (WGS-84).
+  if (obj.origin?.lat && Array.isArray(obj.polygon) && obj.polygon.length) {
+    const o = obj.origin;
+    const a = 6378137.0, e2 = 6.69437999014e-3, d2r = Math.PI / 180;
+    const s = Math.sin(o.lat * d2r), den = 1 - e2 * s * s;
+    const mPerDegN = (a * (1 - e2) / Math.pow(den, 1.5)) * d2r;
+    const mPerDegE = (a / Math.sqrt(den)) * Math.cos(o.lat * d2r) * d2r;
+    const points = obj.polygon.map(([x, y]) => [o.lat + y / mPerDegN, o.lon + x / mPerDegE, 0.05]);
+    return { points };
+  }
+  throw new Error('Invalid perimeter JSON — expected v2 points or legacy origin/polygon');
 }
 
 // ══════════════════════════════════════════════════════
@@ -820,7 +839,8 @@ const Commands = {
   recalibrateImu:()     => ({ cmd: 'RECAL_IMU' }),
   imuCalTest:()         => ({ cmd: 'IMUCALTEST' }),
   imuSaveCal:()         => ({ cmd: 'IMUSAVECAL' }),
-  sendPerimeter: (origin, polygon) => ({ cmd: 'SEND_PERIMETER', origin, polygon })
+  // Protocol v2: absolute WGS-84 lat/lon + per-point accuracy. polygon = [[lat,lon,acc],...]
+  sendPerimeter: (polygon) => ({ cmd: 'SEND_PERIMETER', v: 2, polygon })
 };
 
 // ══════════════════════════════════════════════════════
@@ -977,9 +997,11 @@ class MapManager {
     this._tileLayer  = null;
     this._satellite  = false;
     this._perimOrigin = null;   // ENU origin — derived from perimeter (file or ESP32)
-    this._lastPos     = null;   // buffered ENU position for deferred placement
+    this._lastPos     = null;   // buffered lat/lon position for deferred placement
     this._originMark  = null;   // orange dot at the perimeter origin (first vertex)
     this._perimLayer  = null;
+    this._perimAcc    = null;   // per-corner accuracy (m), aligned with perimeter ring
+    this._accGroup    = null;   // per-corner confidence overlay (circles + dots)
     this._navLayer    = null;
     this._workLayer   = null;
     this._recGroup    = null;   // in-progress recording points (LEARN mode)
@@ -1048,6 +1070,9 @@ class MapManager {
       // Calling disableDraw here (not later) prevents Geoman removing the finished layer
       this._map.pm.disableDraw();
       if (this._perimLayer) this._map.removeLayer(this._perimLayer);
+      // A freshly drawn perimeter has no recorded GPS confidence — clear stale overlay.
+      if (this._accGroup) { this._map.removeLayer(this._accGroup); this._accGroup = null; }
+      this._perimAcc = null;
       this._perimLayer = e.layer;
       this._perimLayer.setStyle({ color: '#4488ff', weight: 2.5, fillOpacity: 0.08, fillColor: '#4488ff' });
       this._updateToolbarState();
@@ -1058,6 +1083,8 @@ class MapManager {
       if (e.layer === this._perimLayer) {
         this._perimLayer  = null;
         this._perimOrigin = null;
+        this._perimAcc    = null;
+        if (this._accGroup) { this._map.removeLayer(this._accGroup); this._accGroup = null; }
         this._updateOriginMark();
         this._updateToolbarState();
       }
@@ -1071,11 +1098,19 @@ class MapManager {
     this._updateOriginMark();
   }
 
+  // ENU metres → absolute WGS-84 lat/lon, anchored at the firmware-supplied
+  // origin. Uses the SAME WGS-84 local-tangent-plane projection as the firmware
+  // (geodetic_scales in rtk_gps.cpp) so overlays computed in local metres (the
+  // mowed-cells grid) align exactly with the lat/lon perimeter. Perimeter, paths
+  // and position now arrive as lat/lon and need no conversion.
   _enuToLatLon(x, y) {
-    if (!this._perimOrigin) return [0, 0];
-    const lat = this._perimOrigin.lat + y / 111319.5;
-    const lon = this._perimOrigin.lon + x / (111319.5 * Math.cos(this._perimOrigin.lat * Math.PI / 180));
-    return [lat, lon];
+    const o = this._perimOrigin;
+    if (!o) return [0, 0];
+    const a = 6378137.0, e2 = 6.69437999014e-3, d2r = Math.PI / 180;
+    const s = Math.sin(o.lat * d2r), den = 1 - e2 * s * s;
+    const mPerDegN = (a * (1 - e2) / Math.pow(den, 1.5)) * d2r;          // metres per ° lat
+    const mPerDegE = (a / Math.sqrt(den)) * Math.cos(o.lat * d2r) * d2r; // metres per ° lon
+    return [o.lat + y / mPerDegN, o.lon + x / mPerDegE];
   }
 
   _updateOriginMark() {
@@ -1097,32 +1132,15 @@ class MapManager {
     ).bindTooltip('Perimeter origin').addTo(this._map);
   }
 
-  _latLonToEnu(lat, lon, origin) {
-    const o = origin || this._perimOrigin;
-    if (!o) return [0, 0];
-    const y = (lat - o.lat) * 111319.5;
-    const x = (lon - o.lon) * 111319.5 * Math.cos(o.lat * Math.PI / 180);
-    return [x, y];
-  }
-
-  _polyToLatLons(pts, origin) {
-    const o = origin || this._perimOrigin;
-    if (!o) return [];
-    return pts.map(([x, y]) => {
-      const lat = o.lat + y / 111319.5;
-      const lon = o.lon + x / (111319.5 * Math.cos(o.lat * Math.PI / 180));
-      return [lat, lon];
-    });
-  }
-
   loadMapData(data) {
     this._mapData = data;
     console.log('[Map] loadMapData: origin=', data.origin,
                 'perimeter pts=', data.perimeter?.length ?? 'missing');
 
-    // The ESP32 map JSON includes the GPS ENU origin — the lat/lon where the firmware
-    // established its coordinate frame. All polygon vertices and the mower position
-    // are ENU offsets from this point. Only adopt when non-zero (zero = GPS not yet fixed).
+    // The ESP32 map JSON includes the GPS origin (lat/lon where the firmware
+    // established its coordinate frame). Perimeter, paths and position now arrive
+    // as absolute lat/lon; the origin is only the anchor for the mowed-cells grid
+    // overlay (still sent in local metres). Adopt when non-zero (zero = no fix yet).
     const hadOrigin = !!this._perimOrigin;
     if (data.origin?.lat || data.origin?.lon) {
       this._perimOrigin = data.origin;
@@ -1135,9 +1153,9 @@ class MapManager {
     this._applyMapData(data);
     this._updateOriginMark();
 
-    // If origin just became known and there is a buffered position, place it now.
+    // If a buffered position exists (arrived before the map), place it now.
     if (!hadOrigin && this._perimOrigin && this._lastPos) {
-      this.updatePosition(this._lastPos.x, this._lastPos.y, this._lastPos.hdg);
+      this.updatePosition(this._lastPos.lat, this._lastPos.lon, this._lastPos.hdg);
     }
   }
 
@@ -1146,7 +1164,7 @@ class MapManager {
     this._renderPlannedPaths(data);
     this._renderMowedCells(data);
     this._renderObstacles(data);
-    if (data.pos) this.updatePosition(data.pos.x, data.pos.y, data.pos.hdg);
+    if (data.pos) this.updatePosition(data.pos.lat, data.pos.lon, data.pos.hdg);
 
     // Fit view to perimeter (including padded partial perimeters)
     if (this._perimLayer) {
@@ -1161,35 +1179,57 @@ class MapManager {
     if (this._perimLayer) { this._map.removeLayer(this._perimLayer); this._perimLayer = null; }
     if (this._navLayer)   { this._map.removeLayer(this._navLayer);   this._navLayer   = null; }
     if (this._workLayer)  { this._map.removeLayer(this._workLayer);  this._workLayer  = null; }
+    if (this._accGroup)   { this._map.removeLayer(this._accGroup);   this._accGroup   = null; }
 
-    // Pad partial perimeter (1-2 points) to a 1m triangle so it's an editable polygon.
-    // The synthetic points are purely in the WebUI — firmware NVS is only updated
-    // if the user edits the polygon and/or sends it back to the ESP32.
-    let perimPts = data.perimeter ? [...data.perimeter] : [];
+    // Perimeter points arrive as absolute [lat, lon, acc]. Pad a partial
+    // perimeter (1-2 points) to a small triangle so it stays an editable polygon.
+    // The synthetic points are purely cosmetic in the WebUI (default accuracy).
+    let perimPts = data.perimeter
+      ? data.perimeter.map(p => [p[0], p[1], (p.length >= 3 ? p[2] : 0.05)])
+      : [];
     if (perimPts.length === 1) {
-      const [x, y] = perimPts[0];
-      perimPts.push([x + 1, y], [x + 0.5, y + 0.866]);
+      const [lat, lon] = perimPts[0];
+      const dLat = 1 / 111319.5, dLon = dLat / Math.cos(lat * Math.PI / 180);
+      perimPts.push([lat, lon + dLon, 0.05], [lat + 0.866 * dLat, lon + 0.5 * dLon, 0.05]);
     } else if (perimPts.length === 2) {
-      const [x0, y0] = perimPts[0];
-      const [x1, y1] = perimPts[1];
-      const mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
-      const dx = x1 - x0, dy = y1 - y0;
-      const len = Math.sqrt(dx * dx + dy * dy) || 1;
-      const side = Math.max(len, 1);
-      perimPts.push([mx - dy / len * side * 0.5, my + dx / len * side * 0.5]);
+      const [lat0, lon0] = perimPts[0];
+      const [lat1, lon1] = perimPts[1];
+      const mLat = (lat0 + lat1) / 2, mLon = (lon0 + lon1) / 2;
+      const dLat = lat1 - lat0, dLon = lon1 - lon0;
+      perimPts.push([mLat - dLon * 0.5, mLon + dLat * 0.5, 0.05]);
     }
+
+    // Per-point accuracy aligned with the rendered ring — reused on re-upload.
+    this._perimAcc = perimPts.map(p => p[2]);
 
     if (perimPts.length >= 3) {
-      this._perimLayer = L.polygon(this._polyToLatLons(perimPts), {
+      this._perimLayer = L.polygon(perimPts.map(p => [p[0], p[1]]), {
         color: '#4488ff', weight: 2.5, fillOpacity: 0.08, fillColor: '#4488ff'
       }).addTo(this._map);
+
+      // Confidence overlay — one accuracy circle (radius = σ metres) + a
+      // colour-graded dot per corner, so the map shows the same per-corner GPS
+      // confidence the mower holds. Green ≤5 cm (RTK fixed), amber ≤0.5 m (float),
+      // red worse. Leaflet circles take metres and handle the projection.
+      this._accGroup = L.layerGroup();
+      perimPts.forEach(([lat, lon, acc]) => {
+        const col = acc <= 0.05 ? '#22cc44' : acc <= 0.5 ? '#ffaa00' : '#ff3333';
+        L.circle([lat, lon], {
+          radius: Math.max(acc, 0.05), color: col, weight: 1,
+          fillColor: col, fillOpacity: 0.12
+        }).addTo(this._accGroup);
+        L.circleMarker([lat, lon], {
+          radius: 5, color: '#fff', weight: 1.5, fillColor: col, fillOpacity: 1
+        }).bindTooltip(`±${acc.toFixed(2)} m`).addTo(this._accGroup);
+      });
+      this._accGroup.addTo(this._map);
     }
 
-    // In-progress recording points (shown during active LEARN session)
+    // In-progress recording points (shown during active LEARN session) — lat/lon.
     if (this._recGroup) { this._map.removeLayer(this._recGroup); this._recGroup = null; }
     if (data.recording?.length > 0) {
       this._recGroup = L.layerGroup();
-      const lls = this._polyToLatLons(data.recording);
+      const lls = data.recording.map(p => [p[0], p[1]]);
       lls.forEach((ll, i) => {
         L.circleMarker(ll, {
           radius: 6, color: '#8833cc', fillColor: '#bb66ff', fillOpacity: 0.8, weight: 2
@@ -1216,7 +1256,7 @@ class MapManager {
     if (data.mow_path?.length > 0) {
       const multiLls = data.mow_path
         .filter(seg => seg.length > 1)
-        .map(seg => this._polyToLatLons(seg));
+        .map(seg => seg.map(p => [p[0], p[1]]));
       if (multiLls.length > 0) {
         this._mowPathLayer = L.polyline(multiLls, {
           color: '#00cc44', weight: 1.5, dashArray: '6,4', opacity: 0.7
@@ -1226,7 +1266,7 @@ class MapManager {
 
     // Transit path — dashed orange line from mower to mow start
     if (data.transit_path?.length > 1) {
-      const lls = this._polyToLatLons(data.transit_path);
+      const lls = data.transit_path.map(p => [p[0], p[1]]);
       this._transitLayer = L.polyline(lls, {
         color: '#ff8c00', weight: 2, dashArray: '8,6', opacity: 0.8
       }).addTo(this._map);
@@ -1262,11 +1302,11 @@ class MapManager {
     this._obsGroup.addTo(this._map);
   }
 
-  updatePosition(x, y, hdg) {
-    this._lastPos = { x, y, hdg };
+  updatePosition(lat, lon, hdg) {
+    this._lastPos = { lat, lon, hdg };
     if (!this._map) return;
-    if (!this._perimOrigin) return;
-    const ll = this._enuToLatLon(x, y);
+    if (lat == null || lon == null) return;
+    const ll = [lat, lon];
     const deg = hdg * 180 / Math.PI;
     const icon = L.divIcon({
       className: '',
@@ -1340,28 +1380,43 @@ class MapManager {
     }
   }
 
+  // Return the edited perimeter as absolute [[lat, lon, acc], ...] for upload/save.
+  // Accuracy is reused from the loaded perimeter when the ring is unchanged in
+  // count (un-moved corners keep their recorded GPS confidence); otherwise each
+  // point gets a default (user-drawn corners carry no GPS fix).
   getEditedPolygon() {
     if (!this._perimLayer) return null;
-    // getLatLngs returns nested array for polygons — unwrap one level
+    // getLatLngs returns a nested array for polygons — unwrap one level
     const lls = this._perimLayer.getLatLngs();
     const ring = Array.isArray(lls[0]) ? lls[0] : lls;
-    // Origin is always the first perimeter vertex. All ENU coordinates are
-    // offsets from this point. Vertex[0] will always be (0, 0) in ENU.
-    const o = { lat: ring[0].lat, lon: ring[0].lng };
-    this._perimOrigin = o;
-    return ring.map(ll => this._latLonToEnu(ll.lat, ll.lng, o));
+    const accs = this._perimAcc;
+    const useAcc = Array.isArray(accs) && accs.length === ring.length;
+    // Origin is the first vertex (the firmware adopts it as the ENU anchor).
+    this._perimOrigin = { lat: ring[0].lat, lon: ring[0].lng };
+    return ring.map((ll, i) => [ll.lat, ll.lng, useAcc ? accs[i] : 0.05]);
   }
 
-  // Load a perimeter from a JSON file directly onto the map.
-  // The file's origin becomes the reference frame for all ENU conversions,
-  // including the mower arrow (until the ESP32 pushes a map with its own origin).
+  // Load a perimeter from a JSON file directly onto the map. Points are absolute
+  // [[lat, lon, acc], ...]; parsePerimeterFile() migrates the legacy ENU format.
   loadFilePerimeter(data) {
-    if (!data.origin || !data.polygon?.length) return;
-    this._perimOrigin = data.origin;
+    const pts = data.points;
+    if (!pts?.length) return;
+    this._perimOrigin = { lat: pts[0][0], lon: pts[0][1] };
+    this._perimAcc = pts.map(p => (p.length >= 3 ? p[2] : 0.05));
     if (this._perimLayer) this._map.removeLayer(this._perimLayer);
-    this._perimLayer = L.polygon(this._polyToLatLons(data.polygon), {
+    if (this._accGroup) { this._map.removeLayer(this._accGroup); this._accGroup = null; }
+    this._perimLayer = L.polygon(pts.map(p => [p[0], p[1]]), {
       color: '#4488ff', weight: 2.5, fillOpacity: 0.08, fillColor: '#4488ff'
     }).addTo(this._map);
+    // Confidence overlay (same styling as _renderPolygons)
+    this._accGroup = L.layerGroup();
+    pts.forEach(p => {
+      const acc = p.length >= 3 ? p[2] : 0.05;
+      const col = acc <= 0.05 ? '#22cc44' : acc <= 0.5 ? '#ffaa00' : '#ff3333';
+      L.circle([p[0], p[1]], { radius: Math.max(acc, 0.05), color: col, weight: 1, fillColor: col, fillOpacity: 0.12 }).addTo(this._accGroup);
+      L.circleMarker([p[0], p[1]], { radius: 5, color: '#fff', weight: 1.5, fillColor: col, fillOpacity: 1 }).bindTooltip(`±${acc.toFixed(2)} m`).addTo(this._accGroup);
+    });
+    this._accGroup.addTo(this._map);
     this._map.fitBounds(this._perimLayer.getBounds(), { padding: [20, 20] });
     this._updateOriginMark();
     this._updateToolbarState();
@@ -1836,7 +1891,12 @@ async function main() {
       window._prevBattState = d.battState;
     }
     document.getElementById('dash-grid').innerHTML = buildDashboard(telem);
-    mapMgr.updatePosition(d.x, d.y, d.hdg);
+    // Live marker from the EKF position (steering centre, survives GPS dropouts),
+    // projected with the same WGS-84 formula as the firmware at the firmware origin.
+    if (mapMgr.origin) {
+      const [plat, plon] = mapMgr._enuToLatLon(d.x, d.y);
+      mapMgr.updatePosition(plat, plon, d.hdg);
+    }
     mapMgr._logPositionDiagnostic(d.x, d.y, d.lat, d.lon);
     document.getElementById('cut-height-val').textContent = Math.round(d.cutH) + 'mm';
 
@@ -1918,7 +1978,8 @@ async function main() {
     const pts = mapMgr.getEditedPolygon();
     if (!pts || pts.length < 4) return;
     try {
-      await savePerimeterToFile({ origin: mapMgr.origin, polygon: pts });
+      // v2 file: absolute [lat, lon, acc] points (no origin needed).
+      await savePerimeterToFile({ version: 2, points: pts });
       showToast('Perimeter saved', true);
     } catch (e) {
       if (e.name !== 'AbortError') showToast('Save failed: ' + e.message, false);
@@ -1930,7 +1991,7 @@ async function main() {
     if (!pts || pts.length < 4) return;
     if (!ble.connected) { showToast('Not connected', false); return; }
     try {
-      await ble.sendCommand(Commands.sendPerimeter(mapMgr.origin, pts));
+      await ble.sendCommand(Commands.sendPerimeter(pts));
       showToast('Sent to mower — awaiting ACK', true);
     } catch (e) {
       showToast('Upload failed: ' + e.message, false);
@@ -2021,7 +2082,8 @@ async function main() {
     'heading_kp','heading_kd','manual_max_yaw_rate',
     'wheel_pi_kp','wheel_pi_ki',
     'manual_max_duty','manual_max_speed_ms',
-    'min_turn_radius_m'
+    'min_turn_radius_m',
+    'min_move_duty'
   ];
 
   // Firmware defaults (config.h) — used when a loaded config file omits a key,
@@ -2043,7 +2105,8 @@ async function main() {
     heading_kp: 0.30, heading_kd: 0.05, manual_max_yaw_rate: 0.8,
     wheel_pi_kp: 10.0, wheel_pi_ki: 2.0,
     manual_max_duty: 0.60, manual_max_speed_ms: 0.5,
-    min_turn_radius_m: 0.0
+    min_turn_radius_m: 0.0,
+    min_move_duty: 0.12
   };
 
   function cfgUpdateDerived(cfg) {

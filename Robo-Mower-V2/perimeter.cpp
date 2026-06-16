@@ -107,6 +107,9 @@ static float  s_ll_acc[MAX_PERIMETER_POINTS];
 /** Worst-case (max) accuracy over the active perimeter points (m); 0 = perfect. */
 static float  s_perim_acc_max = 0.0f;
 
+/** Number of points currently held in the canonical lat/lon store (s_ll_*). */
+static int    s_ll_count = 0;
+
 /** Worst-case fix accuracy seen during the current recording session (m). */
 static float  s_rec_acc_worst = 0.0f;
 
@@ -141,7 +144,55 @@ bool perimeter_save_canonical(const Polygon &enu_poly, float acc) {
         s_ll_acc[i] = acc;
     }
     s_perim_acc_max = acc;
+    s_ll_count      = m;
     return nvs_save_perimeter_ll(s_ll_lat, s_ll_lon, s_ll_acc, m);
+}
+
+/**
+ * @brief Store absolute lat/lon perimeter points with PER-POINT accuracy.
+ *
+ * Unlike perimeter_save_canonical(), this takes the EXACT WGS-84 coordinates the
+ * PWA captured (no ENU round-trip) plus each point's GPS confidence, so the map
+ * and the mower hold identical points and per-corner confidence. Updates the
+ * in-memory worst-case accuracy and persists the "perim2" store. The caller is
+ * expected to follow with perimeter_init() to re-derive the ENU geometry.
+ *
+ * @return true on success.
+ */
+bool perimeter_store_canonical_latlon(const double *lat, const double *lon,
+                                      const float *acc, int n) {
+    if (!lat || !lon || n < 3 || n > MAX_PERIMETER_POINTS) return false;
+    float acc_max = 0.0f;
+    for (int i = 0; i < n; i++) {
+        s_ll_lat[i] = lat[i];
+        s_ll_lon[i] = lon[i];
+        float a = (acc && acc[i] > 0.0f) ? acc[i] : PERIM_LEGACY_ACC_M;
+        s_ll_acc[i] = a;
+        if (a > acc_max) acc_max = a;
+    }
+    s_perim_acc_max = acc_max;
+    s_ll_count      = n;
+    return nvs_save_perimeter_ll(s_ll_lat, s_ll_lon, s_ll_acc, n);
+}
+
+/** Number of points in the canonical lat/lon store (0 if none loaded). */
+int perimeter_canonical_count() {
+    return s_ll_count;
+}
+
+/**
+ * @brief Read one canonical perimeter point (absolute lat/lon + accuracy).
+ *
+ * Used by the BLE MAP push to stream the perimeter without a duplicate buffer,
+ * so the PWA receives exactly the stored coordinates and confidence (no ENU
+ * round-trip). Returns false if @p i is out of range.
+ */
+bool perimeter_canonical_point(int i, double *lat, double *lon, float *acc) {
+    if (i < 0 || i >= s_ll_count) return false;
+    if (lat) *lat = s_ll_lat[i];
+    if (lon) *lon = s_ll_lon[i];
+    if (acc) *acc = s_ll_acc[i];
+    return true;
 }
 
 
@@ -180,6 +231,7 @@ void perimeter_init() {
     s_recording     = false;
     s_rec_count     = 0;
     s_perim_acc_max = 0.0f;
+    s_ll_count      = 0;
 
     // The ENU origin is restored in rtk_gps_init() (runs before this in setup()),
     // so it is available here for lat/lon ↔ ENU conversion.
@@ -204,6 +256,7 @@ void perimeter_init() {
             if (s_ll_acc[i] > acc_max) acc_max = s_ll_acc[i];
         }
         s_perim_acc_max = acc_max;
+        s_ll_count      = n;   // s_ll_* now holds the active perimeter (for MAP push)
         DBG_PRINTF("[PERIM] Loaded canonical lat/lon perimeter: %d pts, acc<=%.2f m\n",
                       n, (double)acc_max);
     } else {

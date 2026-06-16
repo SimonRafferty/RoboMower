@@ -546,7 +546,7 @@ local function parse_telemetry(widget)
             local state_enum = data[1] or 0
             widget.state_str  = STATE_NAMES[state_enum] or "?"
             widget.cut_mm     = data[4] or widget.cut_mm
-            widget.blade_load = data[5] or 0
+            widget.blade_load = data[5] or 0   -- RPM-based load % (Feature 2): 0=free spin, 100=stalled
             widget.fix_type   = data[6] or 0
             widget.flags      = data[7] or 0
             -- EKF uncertainty: uint16 big-endian in cm, convert to mm for display
