@@ -372,6 +372,25 @@ GpsMeasurement rtk_gps_get_measurement() {
     return m;
 }
 
+float rtk_gps_accuracy_m(int fix_type, float hdop) {
+    // Live horizontal-accuracy estimate (2D RMS, metres). The DFRobot receiver
+    // exposes fix quality + HDOP but no raw hAcc, so derive it the SAME way the
+    // EKF (ekf_update_gps) and the PWA gpsAccLabel do — base × max(hdop,1) × √2 —
+    // so the perimeter is tagged with exactly the accuracy the operator sees
+    // (e.g. RTK-Float ≈ 0.21 m at HDOP 1, not a fixed 0.50 m table value).
+    float base;
+    switch (fix_type) {
+        case 4:  base = 0.01f; break;  // RTK fixed  ~1 cm
+        case 5:  base = 0.15f; break;  // RTK float  ~15 cm
+        case 2:  base = 0.50f; break;  // DGPS       ~50 cm
+        default: base = 1.00f; break;  // GPS/none   ~1 m
+    }
+    float sigma = base * fmaxf(hdop, 1.0f) * 1.41421356f;  // ×√2 → 2D RMS
+    if (sigma < 0.005f) sigma = 0.005f;
+    if (sigma > 5.0f)   sigma = 5.0f;
+    return sigma;
+}
+
 GpsOrigin rtk_gps_get_origin() {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     GpsOrigin o = s_origin;

@@ -89,6 +89,16 @@ void rtk_gps_init();
  */
 GpsMeasurement rtk_gps_get_measurement();
 
+/**
+ * @brief Live horizontal-accuracy estimate (2D RMS, metres) for a given fix.
+ *
+ * Single source of truth for "how accurate is the fix right now", matching the
+ * EKF measurement sigma and the PWA display: base(fix) × max(hdop,1) × √2.
+ * Used to tag recorded perimeter corners with the actual accuracy instead of a
+ * coarse fixed table. Clamped to [0.005, 5.0] m.
+ */
+float rtk_gps_accuracy_m(int fix_type, float hdop);
+
 
 /**
  * @brief Get the current ENU origin (perimeter first vertex). Thread-safe.

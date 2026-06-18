@@ -264,10 +264,18 @@ static String build_telemetry_json() {
     // the state machine has been running long enough that a real absence is meaningful.
     if (now_ms < 5000) { mod_vl = mod_vr = mod_vb = 1; }
 
-    char buf[768];   // headroom for IMU calibration fields
+    // EKF steering-centre position as absolute lat/lon — the firmware owns the
+    // projection (WGS-84 local tangent plane), so the PWA plots the live arrow
+    // directly from posLat/posLon with no origin re-projection (fixes the
+    // map/mower offset + the arrow only moving on a manual map fetch).
+    double pos_lat = 0.0, pos_lon = 0.0;
+    rtk_gps_enu_to_latlon(pose.x, pose.y, &pos_lat, &pos_lon);
+
+    char buf[832];   // headroom for IMU calibration + posLat/posLon fields
     int len = snprintf(buf, sizeof(buf),
         "{\"t\":%lu,\"state\":\"%s\","
         "\"x\":%.3f,\"y\":%.3f,\"hdg\":%.3f,"
+        "\"posLat\":%.7f,\"posLon\":%.7f,"
         "\"lat\":%.7f,\"lon\":%.7f,"
         "\"fix\":%d,\"sat\":%d,\"hdop\":%.2f,\"difAge\":%.1f,\"vel\":%.3f,"
         "\"hprog\":%.3f,\"sprog\":%.3f,"
@@ -286,6 +294,7 @@ static String build_telemetry_json() {
         "\"mod\":{\"imu\":%d,\"gps\":%d,\"rc\":%d,\"can\":%d,\"vL\":%d,\"vR\":%d,\"vB\":%d}}",
         (unsigned long)millis(), sname,
         pose.x, pose.y, pose.heading,
+        pos_lat, pos_lon,
         gps.lat_deg, gps.lon_deg,
         (int)gps.fix_type, (int)gps.sat_count, gps.hdop, gps.dif_age_s, speed,
         coverage_planner_get_headland_progress(),
@@ -574,7 +583,22 @@ static String build_status_json() {
 
     // Append mower config object
     const MowerConfig &mc = mower_config_get();
-    static char cbuf[1400];  // static: BSS segment, not stack — build_status_json() is called from one BLE task only
+
+    // BNO055 calibration profile (22 offset bytes as 44 hex chars + quality 0..9),
+    // carried in the config so the PWA can back it up to the settings file and
+    // restore it after an NVS wipe / new board. Empty when no profile is saved.
+    char calfld[80]; calfld[0] = '\0';
+    {
+        uint8_t cb[22], cq = 0;
+        if (imu_get_saved_cal(cb, &cq)) {
+            char hex[45];
+            for (int i = 0; i < 22; i++) snprintf(hex + i * 2, 3, "%02x", cb[i]);
+            snprintf(calfld, sizeof(calfld),
+                     ",\"bnocal\":\"%s\",\"bnocalq\":%u", hex, (unsigned)cq);
+        }
+    }
+
+    static char cbuf[1536];  // static: BSS segment, not stack — build_status_json() is called from one BLE task only (incl. bnocal hex)
     snprintf(cbuf, sizeof(cbuf),
         "\"cfg\":{"
         "\"footprint_width_m\":%.3f,\"footprint_length_m\":%.3f,"
@@ -595,7 +619,7 @@ static String build_status_json() {
         "\"heading_kp\":%.2f,\"heading_kd\":%.2f,\"manual_max_yaw_rate\":%.2f,"
         "\"wheel_pi_kp\":%.2f,\"wheel_pi_ki\":%.2f,"
         "\"manual_max_duty\":%.2f,\"manual_max_speed_ms\":%.3f,"
-        "\"min_turn_radius_m\":%.3f,\"min_move_duty\":%.3f},",
+        "\"min_turn_radius_m\":%.3f,\"min_move_duty\":%.3f%s},",
         mc.footprint_width_m, mc.footprint_length_m,
         mc.track_width_m,
         mc.wheel_radius_m, (int)mc.motor_pole_pairs, mc.gear_ratio,
@@ -614,7 +638,7 @@ static String build_status_json() {
         mc.heading_kp, mc.heading_kd, mc.manual_max_yaw_rate,
         mc.wheel_pi_kp, mc.wheel_pi_ki,
         mc.manual_max_duty, mc.manual_max_speed_ms,
-        mc.min_turn_radius_m, mc.min_move_duty);
+        mc.min_turn_radius_m, mc.min_move_duty, calfld);
     out += cbuf;
 
     // Append system log array (last N messages, newest last)

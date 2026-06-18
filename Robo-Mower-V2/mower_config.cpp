@@ -12,7 +12,7 @@
 // NVS storage: same "mower" namespace as nvs_storage.cpp to avoid wasting slots.
 // Key must be ≤ 15 characters.
 static const char *k_nvs_ns  = "mower";
-static const char *k_nvs_key = "mow_cfg_v12"; // bumped: + min_move_duty (kickstart). v11 added footprint W×L box + track_width_m
+static const char *k_nvs_key = "mow_cfg_v13"; // bumped 2026-06-17: refresh compile-time defaults to the operator's saved config (no struct change; bump forces the new defaults past any stale v12 blob). v12 added min_move_duty; v11 added footprint W×L box + track_width_m
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>

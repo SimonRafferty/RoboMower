@@ -63,10 +63,21 @@ bool imu_profile_loaded();
 
 /** Request an immediate save of the current calibration (performed on Core 0 to
  *  keep the I2C bus single-owner). Verifies the write by read-back; reports the
- *  result to the system log. Refused unless gyro/accel/mag are all fully (3)
- *  calibrated. Use after the operator confirms a good calibration so we KNOW it
- *  persisted before reassembling the chassis. */
+ *  result to the system log. Refused unless mag AND gyro are fully (3) calibrated
+ *  (accel is a bonus). Mostly redundant now that the firmware auto-saves the best
+ *  calibration continuously, but kept for an explicit operator save. */
 void imu_request_save();
+
+/** Read the calibration profile persisted in NVS (22 offset bytes + quality 0..9).
+ *  NVS-only (no BNO/I2C access), safe from any core. Used to export the calibration
+ *  in the PWA settings file so it survives an NVS wipe / new board.
+ *  @return true if a saved profile exists (out/quality filled), false otherwise. */
+bool imu_get_saved_cal(uint8_t out[22], uint8_t *quality);
+
+/** Restore a calibration profile (22 offset bytes + quality) from the settings
+ *  file: persist it to NVS (read-back verified) and apply it to the live BNO055
+ *  on Core 0. @return true if the NVS write verified. */
+bool imu_restore_cal(const uint8_t buf[22], uint8_t quality);
 
 /** Self-test the NVS calibration path WITHOUT touching the BNO055 or needing a
  *  physical recalibration: writes a known 22-byte pattern, reads it back from a

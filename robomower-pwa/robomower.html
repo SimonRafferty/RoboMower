@@ -771,15 +771,23 @@ class TelemetryStore {
 //  SECTION: PERIMETER FILE I/O
 // ══════════════════════════════════════════════════════
 
+/** Local date as YYYY-MM-DD, for dating saved filenames (perimeter + config). */
+function dateStamp() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
 /** Save a perimeter object to a JSON file.
  *  Uses the File System Access API (showSaveFilePicker) when available,
  *  giving a proper Save-As dialog. Falls back to a silent <a download> on
  *  browsers that don't support it (Firefox, older Edge). */
 async function savePerimeterToFile(perim) {
   const json = JSON.stringify(perim, null, 2);
+  const name = `perimeter-${dateStamp()}.json`;
   if (window.showSaveFilePicker) {
     const handle = await window.showSaveFilePicker({
-      suggestedName: 'perimeter.json',
+      suggestedName: name,
       types: [{ description: 'Perimeter JSON', accept: { 'application/json': ['.json'] } }]
     });
     const writable = await handle.createWritable();
@@ -790,7 +798,7 @@ async function savePerimeterToFile(perim) {
     const blob = new Blob([json], { type: 'application/json' });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement('a');
-    a.href = url; a.download = 'perimeter.json'; a.click();
+    a.href = url; a.download = name; a.click();
     URL.revokeObjectURL(url);
   }
 }
@@ -1891,9 +1899,15 @@ async function main() {
       window._prevBattState = d.battState;
     }
     document.getElementById('dash-grid').innerHTML = buildDashboard(telem);
-    // Live marker from the EKF position (steering centre, survives GPS dropouts),
-    // projected with the same WGS-84 formula as the firmware at the firmware origin.
-    if (mapMgr.origin) {
+    // Live marker: plot the firmware's EKF steering-centre lat/lon directly
+    // (posLat/posLon). The firmware owns the WGS-84 projection, so the arrow
+    // tracks at the telemetry rate with no PWA-side origin re-projection — this
+    // removes the map/mower offset and the "arrow only moves on a manual map
+    // fetch" issue. Fall back to re-projecting ENU x,y for firmware that predates
+    // the posLat/posLon fields.
+    if (d.posLat != null && d.posLon != null && (d.posLat !== 0 || d.posLon !== 0)) {
+      mapMgr.updatePosition(d.posLat, d.posLon, d.hdg);
+    } else if (mapMgr.origin) {
       const [plat, plon] = mapMgr._enuToLatLon(d.x, d.y);
       mapMgr.updatePosition(plat, plon, d.hdg);
     }
@@ -2109,6 +2123,11 @@ async function main() {
     min_move_duty: 0.12
   };
 
+  // BNO055 calibration carried opaquely (not a form field) so it round-trips
+  // through the settings file and "Save to Mower" — backs up the hard-won cal so
+  // it survives an NVS wipe / new board. bnocal = 44 hex chars (22 bytes), q = 0..9.
+  let cfgCalHex = null, cfgCalQ = null;
+
   function cfgUpdateDerived(cfg) {
     const fw        = cfg.footprint_width_m  || 0;
     const fl        = cfg.footprint_length_m || 0;
@@ -2154,6 +2173,11 @@ async function main() {
   // _cfgPopulateFromStatus is called from ble.onStatus (defined above)
   function _cfgPopulateFromStatus(json) {
     cfgPopulate(json.cfg);
+    // Capture the mower's saved BNO calibration so it can be backed up to file.
+    if (json.cfg && json.cfg.bnocal) {
+      cfgCalHex = json.cfg.bnocal;
+      cfgCalQ   = (json.cfg.bnocalq != null) ? json.cfg.bnocalq : null;
+    }
     const sl = document.getElementById('cut-height-slider');
     sl.min = json.cfg.cut_height_min_mm ?? 35;
     sl.max = json.cfg.cut_height_max_mm ?? 90;
@@ -2162,6 +2186,9 @@ async function main() {
   document.getElementById('cfg-save-btn').addEventListener('click', async () => {
     if (!ble.connected) { showToast('Not connected', false); return; }
     const cfg = cfgReadForm();
+    // Round-trip the calibration so loading a settings file then "Save to Mower"
+    // restores it to NVS + the live sensor.
+    if (cfgCalHex) { cfg.bnocal = cfgCalHex; if (cfgCalQ != null) cfg.bnocalq = cfgCalQ; }
     const btn = document.getElementById('cfg-save-btn');
     btn.disabled = true;
     try {
@@ -2183,8 +2210,10 @@ async function main() {
   async function saveConfigToFile() {
     const out = { type: 'robomower-config', version: 1, savedAt: new Date().toISOString(),
                   settings: cfgReadForm() };
+    // Back up the BNO055 calibration alongside the settings (survives NVS wipe).
+    if (cfgCalHex) out.imu_cal = { bnocal: cfgCalHex, bnocalq: cfgCalQ };
     const json = JSON.stringify(out, null, 2);
-    const name = 'robomower-config.json';
+    const name = `robomower-config-${dateStamp()}.json`;
     if (window.showSaveFilePicker) {
       const handle = await window.showSaveFilePicker({
         suggestedName: name,
@@ -2244,7 +2273,15 @@ async function main() {
         throw new Error('no settings object found');
       }
       const r = applyConfigSettings(settings);
-      showToast(`Loaded ${r.applied} setting(s), ${r.defaulted} defaulted, ${r.ignored} ignored — review, then "Save to Mower".`, true);
+      // Calibration: top-level imu_cal (current format) or legacy inside settings.
+      const cal = obj.imu_cal || (settings.bnocal ? { bnocal: settings.bnocal, bnocalq: settings.bnocalq } : null);
+      let calNote = '';
+      if (cal && typeof cal.bnocal === 'string' && cal.bnocal.length === 44) {
+        cfgCalHex = cal.bnocal;
+        cfgCalQ   = (cal.bnocalq != null) ? cal.bnocalq : null;
+        calNote   = ` + IMU calibration (q${cfgCalQ ?? '?'}/9)`;
+      }
+      showToast(`Loaded ${r.applied} setting(s), ${r.defaulted} defaulted, ${r.ignored} ignored${calNote} — review, then "Save to Mower".`, true);
     } catch (err) {
       showToast('Config load failed: ' + (err.message || err), false);
     }

@@ -63,12 +63,14 @@ void perimeter_start_recording();
  *
  * @param x         Steering centre ENU east coordinate (metres).
  * @param y         Steering centre ENU north coordinate (metres).
- * @param fix_type  Current GPS fix type (0=none … 4=RTK fixed).
+ * @param acc_m     Live horizontal-accuracy estimate at this point (metres),
+ *                  from rtk_gps_accuracy_m(). Does not gate recording; the worst
+ *                  value seen tags the perimeter (confidence-aware breach).
  * @param force     If true, bypass the 0.2 m distance gate (use for explicit
  *                  button-press recording where the user chooses each point).
  * @return true  A new waypoint was appended; false otherwise.
  */
-bool perimeter_record_point(float x, float y, int fix_type, bool force = false);
+bool perimeter_record_point(float x, float y, float acc_m, bool force = false);
 
 /**
  * @brief Finish recording: close, validate, derive polygons, save to NVS.

@@ -137,6 +137,16 @@
 #define IMU_CALIB_GYRO_MIN        2
 #define IMU_CALIB_ACCEL_MIN       2
 
+// Calibration auto-save (BNO055). The good-cal window is brief, so the firmware
+// continuously captures the BEST calibration it sees and persists it to NVS the
+// moment mag AND gyro both reach full (the heading-critical pair), then again
+// whenever the total quality (gyro+accel+mag, 0..9) strictly improves — no button
+// press, no missing the window. Saving briefly switches BNO mode (disruptive), so
+// only strict improvements are saved. Lower IMU_CAL_AUTOSAVE_MAG/GYRO to 2 if you
+// can never hold full mag/gyro, at the cost of a slightly less accurate heading.
+#define IMU_CAL_AUTOSAVE_MAG      3      // mag must reach this before auto-saving (0..3)
+#define IMU_CAL_AUTOSAVE_GYRO     3      // gyro must reach this before auto-saving (0..3)
+
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  PHYSICAL DIMENSIONS  (all from steering centre = midpoint of front driven axle)
@@ -150,8 +160,8 @@
 // box (the radius the footprint corners sweep when the robot pivots on the spot)
 // — see mower_config_nav_inset_m(). Measure the true outer extents, including
 // any blade/guard overhang. (Steering centre assumed ~central in the box.)
-#define FOOTPRINT_WIDTH_M         0.60f  // overall width, outer edge to outer edge [m]
-#define FOOTPRINT_LENGTH_M        0.70f  // overall length, front-most to rear-most [m]
+#define FOOTPRINT_WIDTH_M         0.67f  // overall width, outer edge to outer edge [m]
+#define FOOTPRINT_LENGTH_M        0.60f  // overall length, front-most to rear-most [m]
 
 // ── Steering track (drivetrain) ──────────────────────────────────────────────
 // Distance between the two track/wheel CENTRELINES — NOT the overall width.
@@ -159,7 +169,7 @@
 //   dHeading = (dRight − dLeft) / TRACK_WIDTH_M.
 // For tracks of width w, this is (overall width − w): the steer reference runs
 // up the middle of each track. Seeds odo_calib, which then GPS-calibrates it.
-#define TRACK_WIDTH_M             0.50f  // track centre to centre [m]
+#define TRACK_WIDTH_M             0.55f  // track centre to centre [m]
 #define WHEEL_HALF_TRACK_M        (TRACK_WIDTH_M / 2.0f)       // [m] — half of track width
 
 // ── RTK antenna offset from steering centre ───────────────────────────────────
@@ -172,7 +182,7 @@
 // Signed distance from steering centre to cutting disc centre.
 // Negative = blade behind steering centre (typical for front-drive + rear-castor).
 // Measure on the actual chassis and update this value.
-#define STEER_CENTRE_TO_CUT_CENTRE_M   0.0f  // [m] — positive=ahead, negative=behind
+#define STEER_CENTRE_TO_CUT_CENTRE_M   -0.04f // [m] — positive=ahead, negative=behind
 #define CUT_DISC_RADIUS_M              0.21f // [m] — Gtech CLM021 cutting radius (420mm dia / 2)
 
 
@@ -181,9 +191,9 @@
 // ══════════════════════════════════════════════════════════════════════════════
 
 // Drive motor parameters (same for left and right VESCs)
-#define MOTOR_POLE_PAIRS             7       // [count] — rotor magnet pole PAIRS (not poles)
-#define GEAR_RATIO                20.0f     // [ratio] — gearbox reduction (motor to wheel)
-#define WHEEL_RADIUS_M             0.10f    // [m] — driven wheel radius; measure on chassis
+#define MOTOR_POLE_PAIRS            11       // [count] — rotor magnet pole PAIRS (not poles)
+#define GEAR_RATIO                 5.0f     // [ratio] — gearbox reduction (motor to wheel)
+#define WHEEL_RADIUS_M             0.125f   // [m] — driven wheel radius; measure on chassis
 
 // Minimum turning radius: 0.0 = tracked/skid-steer (pivot on the spot).
 // Wheeled differential without reverse on inner wheel: typically TRACK_WIDTH_M * 0.5.
@@ -210,12 +220,12 @@
 
 // Strip geometry
 #define CUT_WIDTH_M                0.38f   // [m] — effective cut width per pass (≈ blade dia − overlap)
-#define STRIP_OVERLAP_M            0.02f   // [m] — additional overlap between adjacent strips
+#define STRIP_OVERLAP_M            0.10f   // [m] — additional overlap between adjacent strips
 
 // Cut height range — servo maps linearly between these values (stored in NVS after cal)
 // CUT_HEIGHT_MAX_MM also used as safe height for bog recovery passes.
 #define CUT_HEIGHT_MIN_MM          35      // [mm] — minimum deck height (measured mechanical limit)
-#define CUT_HEIGHT_MAX_MM          90      // [mm] — maximum deck height (measured mechanical limit)
+#define CUT_HEIGHT_MAX_MM         100      // [mm] — maximum deck height (measured mechanical limit)
 
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -315,7 +325,7 @@
 #define LONG_GRASS_THRESHOLD_MM    100     // [mm] — cut height above which LONG_GRASS_SPEED is used
 #define TRANSIT_SPEED_MS           0.30f   // [m/s] — speed during headland transitions
 #define HEADLAND_SPEED_MS          0.20f   // [m/s] — speed during perimeter/headland passes
-#define MIN_CREEP_SPEED_MS         0.05f   // [m/s] — minimum commanded speed (below this = stopped)
+#define MIN_CREEP_SPEED_MS         0.10f   // [m/s] — minimum commanded speed (below this = stopped)
 
 // Path following
 #define WAYPOINT_ARRIVE_DIST_M     0.15f   // [m] — distance to waypoint to consider it reached
@@ -406,7 +416,7 @@
 // ── Uncertainty-aware navigation ─────────────────────────────────────────
 #define UNCERTAINTY_MARGIN_M          0.50f  // [m] margin below which caution begins
 #define TILT_LIMIT_NORMAL_DEG        30.0f   // [deg] max tilt in normal operation
-#define TILT_LIMIT_CAREFUL_DEG       15.0f   // [deg] max tilt when margin is low
+#define TILT_LIMIT_CAREFUL_DEG       20.0f   // [deg] max tilt when margin is low
 #define COLLISION_MULT_CAREFUL        3.0f   // collision multiplier when margin is low
 #define TILT_EMA_ALPHA               0.016f  // EMA filter for tilt/pitch/roll (~0.6s at the 100Hz IMU task)
 
@@ -415,7 +425,7 @@
 // The correction is a velocity differential applied to each wheel's speed setpoint.
 #define HEADING_KP                   0.30f  // [(m/s)/rad]
 #define HEADING_KD                   0.05f  // [(m/s)/(rad/s)]
-#define MANUAL_MAX_YAW_RATE          0.8f   // [rad/s] yaw rate at full steering deflection
+#define MANUAL_MAX_YAW_RATE          0.2f   // [rad/s] yaw rate at full steering deflection
 
 // ── ESP32-side wheel speed PI ────────────────────────────────────────────────
 // VESC runs in current-control mode; the ESP32 closes the velocity loop.
@@ -438,7 +448,7 @@
 // crsf_us_to_norm() already zeroes ±5%; this adds a larger rescaled band on top.
 #define MANUAL_DEADBAND              0.10f  // [fraction 0–1] — 10% each side of centre
 #define MANUAL_EXPO                  0.65f  // [0–1] — exponential curve; 0=linear, 1=full cubic
-#define MANUAL_MAX_DUTY              0.60f  // [0–1] — duty ceiling for both MANUAL and AUTO_MOWING
+#define MANUAL_MAX_DUTY              0.40f  // [0–1] — duty ceiling for both MANUAL and AUTO_MOWING
 #define MANUAL_MAX_SPEED_MS          0.5f   // [m/s] — max wheel speed at full throttle stick in manual mode
 #define MANUAL_DUTY_RAMP_PER_S       0.4f   // [duty/s] — max rate of change of wheel duty in manual mode (prevents wheelies)
 
@@ -457,7 +467,7 @@
 // floors |duty| to at least this value in the commanded direction. Runtime-tunable
 // as MowerConfig.min_move_duty (PWA). 0 disables the kickstart. Tune in field:
 // raise until the mower reliably starts from rest at creep; lower if it lurches.
-#define MIN_MOVE_DUTY                0.12f  // [duty 0–1] — break-free duty floor
+#define MIN_MOVE_DUTY                0.15f  // [duty 0–1] — break-free duty floor
 
 // Wheel-slip detection: if GPS/EKF speed < wheel_erpm_speed × this threshold,
 // the wheels are spinning but the robot is barely moving → bog-in-progress.

@@ -110,19 +110,10 @@ static float  s_perim_acc_max = 0.0f;
 /** Number of points currently held in the canonical lat/lon store (s_ll_*). */
 static int    s_ll_count = 0;
 
-/** Worst-case fix accuracy seen during the current recording session (m). */
+/** Worst-case fix accuracy seen during the current recording session (m).
+ *  Fed the LIVE accuracy estimate (rtk_gps_accuracy_m) per corner by the caller;
+ *  the largest value tags the whole perimeter and widens the breach keep-out. */
 static float  s_rec_acc_worst = 0.0f;
-
-/** Map a GPS fix type to a conservative horizontal accuracy estimate (m). */
-static float accuracy_for_fix(int fix_type) {
-    switch (fix_type) {
-        case GPS_FIX_RTK_FIXED: return 0.03f;  // ~3 cm
-        case GPS_FIX_RTK_FLOAT: return 0.50f;  // ~30–50 cm
-        case GPS_FIX_DGPS:      return 1.00f;
-        case GPS_FIX_AUTO:      return 2.50f;
-        default:                return 5.00f;  // no fix — very low confidence
-    }
-}
 
 /**
  * @brief Derive the canonical lat/lon store from an ENU polygon and persist it.
@@ -329,11 +320,14 @@ void perimeter_start_recording() {
     DBG_PRINTLN("[PERIM] Recording started (previous perimeter cleared)");
 }
 
-bool perimeter_record_point(float x, float y, int fix_type, bool force) {
+bool perimeter_record_point(float x, float y, float acc_m, bool force) {
     if (!s_recording) return false;
 
-    // fix_type does NOT gate recording (position is used regardless of quality) —
+    // acc_m does NOT gate recording (position is used regardless of quality) —
     // it only feeds the worst-case accuracy used by the confidence-aware breach.
+    // The caller passes the LIVE accuracy estimate (rtk_gps_accuracy_m) so the
+    // perimeter is tagged with the real fix accuracy (e.g. RTK-Float ~0.21 m),
+    // not a coarse fixed table value.
     if (!force) {
         // Distance gate: only record if far enough from last waypoint
         float dist = 0.0f;
@@ -355,8 +349,7 @@ bool perimeter_record_point(float x, float y, int fix_type, bool force) {
     s_rec_last_x = x;
     s_rec_last_y = y;
 
-    float acc = accuracy_for_fix(fix_type);
-    if (acc > s_rec_acc_worst) s_rec_acc_worst = acc;
+    if (acc_m > s_rec_acc_worst) s_rec_acc_worst = acc_m;
     return true;
 }
 

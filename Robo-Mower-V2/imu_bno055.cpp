@@ -29,6 +29,7 @@
 // ── NVS ───────────────────────────────────────────────────────────────────────
 static const char* NVS_NAMESPACE = "imu";
 static const char* NVS_KEY_CAL   = "bnocal";   // 22-byte BNO offsets blob
+static const char* NVS_KEY_CALQ  = "bnocalq";  // uint8 quality (gyro+accel+mag, 0..9) of the saved profile
 static const char* NVS_KEY_HDG   = "hdgoff";   // float heading offset (used in Plan 2)
 
 static const float G_PER_MS2 = 1.0f / 9.80665f;  // m/s² → g for collision feed
@@ -53,7 +54,9 @@ static volatile bool    s_imu_fault     = false;
 static volatile bool    s_initialized   = false;
 static volatile bool    s_force_recal   = false;  // imu_recalibrate() request
 static volatile bool    s_save_request  = false;  // imu_request_save() — performed on Core 0
+static volatile bool    s_reload_request = false; // imu_restore_cal() — Core 0 re-applies the NVS profile to the BNO
 static volatile bool    s_profile_saved = false;  // a good profile is persisted
+static volatile uint8_t s_saved_cal_q   = 0;      // quality (gyro+accel+mag, 0..9) of the persisted profile; best-so-far gate for auto-save
 static volatile bool    s_profile_loaded_boot = false;  // a profile was restored at boot
 static volatile uint32_t s_last_valid_ms = 0;
 
@@ -70,12 +73,23 @@ static bool load_cal_from_nvs(uint8_t out[22]) {
     return n == 22;
 }
 
+// Quality (gyro+accel+mag, 0..9) recorded alongside the saved profile. 0 if absent
+// (legacy profile saved before quality tracking) — auto-save then re-captures the
+// next good cal and tags it, so the stored quality self-heals on first use.
+static uint8_t load_cal_quality() {
+    Preferences p;
+    p.begin(NVS_NAMESPACE, /*readOnly=*/true);
+    uint8_t q = p.getUChar(NVS_KEY_CALQ, 0);
+    p.end();
+    return q;
+}
+
 // Persist the 22-byte profile AND verify it read back identically from a freshly
 // opened handle. The old code assumed the write stuck (the reported bug: "saved"
 // logged but absent on reboot). The read-back tells us definitively whether the
 // blob reached flash, so a silent write failure can no longer masquerade as
 // success — s_profile_saved is only set when this returns true.
-static bool save_cal_to_nvs(const uint8_t buf[22]) {
+static bool save_cal_to_nvs(const uint8_t buf[22], uint8_t quality) {
     {
         Preferences p;
         if (!p.begin(NVS_NAMESPACE, /*readOnly=*/false)) {
@@ -83,6 +97,7 @@ static bool save_cal_to_nvs(const uint8_t buf[22]) {
             return false;
         }
         size_t w = p.putBytes(NVS_KEY_CAL, buf, 22);
+        p.putUChar(NVS_KEY_CALQ, quality);   // tag the profile with its quality
         p.end();   // Preferences::end() flushes/commits the namespace
         if (w != 22) {
             DBG_PRINTF("[IMU] cal save: putBytes wrote %u/22 bytes\n", (unsigned)w);
@@ -106,6 +121,7 @@ static void clear_cal_in_nvs() {
     Preferences p;
     p.begin(NVS_NAMESPACE, /*readOnly=*/false);
     p.remove(NVS_KEY_CAL);
+    p.remove(NVS_KEY_CALQ);
     p.end();
 }
 
@@ -164,6 +180,11 @@ bool imu_init() {
         s_bno.setSensorOffsets(cal);
         s_profile_saved       = true;
         s_profile_loaded_boot = true;
+        // Seed the best-so-far gate with the saved profile's quality so auto-save
+        // only OVERWRITES it with a strictly better calibration ("better than the
+        // current one"). Legacy profiles (no quality tag) read 0 → the next good
+        // cal re-saves once and tags it.
+        s_saved_cal_q = load_cal_quality();
         // Log a checksum so consecutive boots can be compared from the BLE log:
         // a changing/zero sum across boots means the profile is not persisting.
         uint16_t sum = 0;
@@ -229,6 +250,7 @@ bool imu_heading_is_confident() {
 void imu_recalibrate() {
     clear_cal_in_nvs();
     s_profile_saved = false;
+    s_saved_cal_q   = 0;      // forget the old quality so the next good cal is captured
     s_force_recal   = true;   // task re-enters NDOF to drop the live profile
 }
 
@@ -238,6 +260,23 @@ bool imu_profile_loaded() {
 
 void imu_request_save() {
     s_save_request = true;    // performed on Core 0 in imu_task (I2C-safe)
+}
+
+bool imu_get_saved_cal(uint8_t out[22], uint8_t *quality) {
+    if (!load_cal_from_nvs(out)) return false;   // NVS-only, safe from any core
+    if (quality) *quality = load_cal_quality();
+    return true;
+}
+
+bool imu_restore_cal(const uint8_t buf[22], uint8_t quality) {
+    if (quality > 9) quality = 9;
+    // Persist (read-back verified) on the calling core — NVS has its own locking.
+    if (!save_cal_to_nvs(buf, quality)) return false;
+    s_saved_cal_q   = quality;
+    s_profile_saved = true;
+    s_reload_request = true;   // ask the Core-0 task to apply it to the live BNO055
+    sys_log_push("IMU: calibration restored to NVS (applying to sensor)");
+    return true;
 }
 
 // Prove the NVS path can store and read back 22 bytes in the "imu" namespace
@@ -306,6 +345,19 @@ static void imu_task(void* pv) {
             DBG_PRINTLN("[IMU] recalibration started — drive slow loops");
         }
 
+        // Calibration restored from the settings file (imu_restore_cal wrote NVS on
+        // Core 1). Apply it to the live BNO055 here on Core 0 (I2C owner). Reading
+        // the blob from NVS avoids a cross-core buffer race.
+        if (s_reload_request) {
+            s_reload_request = false;
+            uint8_t cal[22];
+            if (load_cal_from_nvs(cal)) {
+                s_bno.setSensorOffsets(cal);   // Adafruit switches to CONFIG and back
+                s_profile_loaded_boot = true;
+                sys_log_push("IMU: calibration from file applied to sensor");
+            }
+        }
+
         // Operator-triggered "save calibration now" (imu_request_save). MUST run
         // here on Core 0 — read_offsets_raw() drives the I2C bus, which this task
         // owns; doing it from the Core-1 command handler would corrupt the bus.
@@ -313,16 +365,18 @@ static void imu_task(void* pv) {
             s_save_request = false;
             uint8_t c = s_calib;
             uint8_t gy = (c >> 4) & 0x03, ac = (c >> 2) & 0x03, mg = c & 0x03;
-            if (gy == 3 && ac == 3 && mg == 3) {
+            if (mg == 3 && gy == 3) {   // heading-critical pair; accel is a bonus
+                uint8_t q = (uint8_t)(gy + ac + mg);
                 uint8_t buf[22];
-                if (read_offsets_raw(buf) && save_cal_to_nvs(buf)) {
+                if (read_offsets_raw(buf) && save_cal_to_nvs(buf, q)) {
                     s_profile_saved = true;
+                    s_saved_cal_q   = q;
                     sys_log_push("IMU: calibration saved + verified (manual)");
                 } else {
                     sys_log_push("IMU: manual calibration save FAILED");
                 }
             } else {
-                sys_log_push("IMU: manual save refused — gyro/accel/mag not all 3");
+                sys_log_push("IMU: manual save refused — need mag+gyro = 3");
             }
         }
 
@@ -370,19 +424,29 @@ static void imu_task(void* pv) {
             // Feed gravity-removed acceleration (g) to the collision detector.
             collisionDetectUpdate(ax, ay, az);
 
-            // Auto-save the calibration profile once the three real sensors are
-            // fully calibrated. NOT s_bno.isFullyCalibrated() — that also requires
-            // sys==3, which the BNO055 often never reaches, so the profile would
-            // otherwise never persist (forcing a re-calibrate every boot).
-            if (!s_profile_saved && gy == 3 && ac == 3 && mg == 3) {
+            // Continuous best-so-far calibration auto-save. The good-cal window is
+            // brief and fades within seconds, so instead of a one-shot save (which
+            // missed the window and forced a manual button press) we capture it the
+            // MOMENT mag AND gyro both reach full — the heading-critical pair — and
+            // again whenever the total quality (gyro+accel+mag, 0..9) STRICTLY
+            // improves beyond what's already persisted. Strict-improvement only,
+            // because each save briefly switches BNO mode (read_offsets_raw) which
+            // disrupts fusion; we don't want to thrash it. s_saved_cal_q carries the
+            // persisted profile's quality across boots, so this also means "save
+            // only when better than the current one". Reset to 0 by imu_recalibrate.
+            uint8_t q = (uint8_t)(gy + ac + mg);
+            if (mg >= IMU_CAL_AUTOSAVE_MAG && gy >= IMU_CAL_AUTOSAVE_GYRO
+                && q > s_saved_cal_q) {
                 uint8_t buf[22];
-                // Only set s_profile_saved when the read-back actually verified —
-                // otherwise leave it false so the next fully-calibrated sample
-                // retries instead of silently giving up (the reported failure).
-                if (read_offsets_raw(buf) && save_cal_to_nvs(buf)) {
+                if (read_offsets_raw(buf) && save_cal_to_nvs(buf, q)) {
+                    s_saved_cal_q   = q;
                     s_profile_saved = true;
-                    sys_log_push("IMU: BNO055 calibration saved + verified (restores on reboot)");
-                    DBG_PRINTLN("[IMU] BNO055 calibration profile saved to NVS");
+                    char l[SYS_LOG_MAX_LEN];
+                    snprintf(l, sizeof(l),
+                             "IMU: cal auto-saved q=%u/9 (mag%u gyro%u accel%u) - restores on reboot",
+                             q, mg, gy, ac);
+                    sys_log_push(l);
+                    DBG_PRINTLN("[IMU] BNO055 calibration profile auto-saved to NVS");
                 } else {
                     sys_log_push("IMU: BNO055 calibration save FAILED — will retry");
                 }

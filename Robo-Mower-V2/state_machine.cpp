@@ -1297,7 +1297,7 @@ static void handle_ble_command(const char *json) {
         }
         float px = gps.valid ? gps.enu_east_m  : pose.x;
         float py = gps.valid ? gps.enu_north_m : pose.y;
-        if (perimeter_record_point(px, py, (int)gps.fix_type, true)) {
+        if (perimeter_record_point(px, py, rtk_gps_accuracy_m((int)gps.fix_type, gps.hdop), true)) {
             request_beep(BEEP_WARNING);
             char msg[48];
             snprintf(msg, sizeof(msg), "pt %d stored", perimeter_recording_point_count());
@@ -1370,6 +1370,41 @@ static void handle_ble_command(const char *json) {
         gf("\"manual_max_speed_ms\"",  cfg.manual_max_speed_ms);
         gf("\"min_turn_radius_m\"",    cfg.min_turn_radius_m);
         gf("\"min_move_duty\"",        cfg.min_move_duty);
+
+        // ── BNO055 calibration restore (carried in the settings file) ───────────
+        // The PWA round-trips the saved calibration as "bnocal" (44 hex chars = 22
+        // offset bytes) + "bnocalq" (quality 0..9). Restore it to NVS and the live
+        // sensor. Independent of the MowerConfig above and of its validation.
+        {
+            const char *p = strstr(json, "\"bnocal\"");
+            if (p && (p = strchr(p, ':')) && (p = strchr(p, '"'))) {
+                p++;  // first hex char
+                auto hexval = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                    return -1;
+                };
+                uint8_t buf[22];
+                int nb = 0;
+                while (nb < 22) {
+                    int hi = hexval(p[0]);
+                    if (hi < 0) break;
+                    int lo = hexval(p[1]);
+                    if (lo < 0) break;
+                    buf[nb++] = (uint8_t)((hi << 4) | lo);
+                    p += 2;
+                }
+                if (nb == 22) {
+                    int q = 0;
+                    const char *pq = strstr(json, "\"bnocalq\"");
+                    if (pq && (pq = strchr(pq, ':'))) q = (int)strtol(pq + 1, nullptr, 10);
+                    if (q < 0) q = 0;
+                    if (q > 9) q = 9;
+                    imu_restore_cal(buf, (uint8_t)q);   // writes NVS + applies live
+                }
+            }
+        }
 
         // Validate critical geometry constraints before saving
         if (cfg.cut_width_m <= cfg.strip_overlap_m + 0.01f) {
@@ -2117,7 +2152,7 @@ void state_machine_update() {
             // chose this position by pressing the button.
             float px = gps.valid ? gps.enu_east_m  : pose.x;
             float py = gps.valid ? gps.enu_north_m : pose.y;
-            if (perimeter_record_point(px, py, (int)gps.fix_type, true)) {
+            if (perimeter_record_point(px, py, rtk_gps_accuracy_m((int)gps.fix_type, gps.hdop), true)) {
                 request_beep(BEEP_WARNING);
                 DBG_PRINTF("[LEARN] Point %d stored (%.3f, %.3f)\n",
                               perimeter_recording_point_count(), px, py);
