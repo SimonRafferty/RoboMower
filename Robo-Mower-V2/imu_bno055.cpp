@@ -269,6 +269,10 @@ bool imu_get_saved_cal(uint8_t out[22], uint8_t *quality) {
     return true;
 }
 
+void imu_reapply_saved_cal() {
+    s_reload_request = true;   // Core-0 task reloads NVS bnocal + setSensorOffsets()
+}
+
 bool imu_restore_cal(const uint8_t buf[22], uint8_t quality) {
     if (quality > 9) quality = 9;
     // Persist (read-back verified) on the calling core — NVS has its own locking.
@@ -355,7 +359,11 @@ static void imu_task(void* pv) {
             if (load_cal_from_nvs(cal)) {
                 s_bno.setSensorOffsets(cal);   // Adafruit switches to CONFIG and back
                 s_profile_loaded_boot = true;
-                sys_log_push("IMU: calibration from file applied to sensor");
+                s_profile_saved       = true;
+                s_saved_cal_q         = load_cal_quality();
+                sys_log_push("IMU: saved calibration applied to sensor (status re-validates with motion)");
+            } else {
+                sys_log_push("IMU: no saved calibration to apply");
             }
         }
 

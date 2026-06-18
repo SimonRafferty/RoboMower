@@ -79,6 +79,13 @@ bool imu_get_saved_cal(uint8_t out[22], uint8_t *quality);
  *  on Core 0. @return true if the NVS write verified. */
 bool imu_restore_cal(const uint8_t buf[22], uint8_t quality);
 
+/** Re-apply the calibration profile already saved in NVS to the live BNO055,
+ *  without a reboot (operator "Apply saved calibration"). The BNO055's reported
+ *  calibration STATUS reads low right after an offset restore until it re-validates
+ *  with motion — the offsets and absolute heading are applied regardless. Logs
+ *  "applied" / "no saved calibration to apply". No-op if no profile is stored. */
+void imu_reapply_saved_cal();
+
 /** Self-test the NVS calibration path WITHOUT touching the BNO055 or needing a
  *  physical recalibration: writes a known 22-byte pattern, reads it back from a
  *  fresh handle, and reports PASS/FAIL to the system log. @return true on PASS. */

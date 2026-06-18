@@ -529,17 +529,24 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
   <section id="tab-diag" class="tab">
     <div id="diag-age">No data — switch to this tab while connected to start polling</div>
     <div class="ctrl-btn-bar" style="margin:6px 0">
-      <button class="ctrl-btn" id="btn-plan-test" disabled
-              title="Dry-run the coverage planner on the stored perimeter without starting AUTO. Result appears as a toast and in the system log">Plan Test</button>
       <button class="ctrl-btn" id="btn-refresh-log" disabled
-              title="Fetch the latest status and system log from the mower (log shows on the Dashboard tab)">Refresh Log</button>
+              title="Fetch the latest status and system log from the mower (shown below)">Refresh Log</button>
       <button class="ctrl-btn" id="btn-recal-imu" disabled
               title="Optional: force a fresh BNO055 compass calibration (clears the stored profile and relearns). The IMU also auto-calibrates as it drives. After pressing, drive slow figure-8/loops.">Calibrate compass</button>
-      <button class="ctrl-btn" id="btn-imu-caltest" disabled
-              title="Test that the compass calibration can be saved to flash, WITHOUT recalibrating. Writes and reads back a test value. Check the log for PASS/FAIL.">Test cal save</button>
       <button class="ctrl-btn" id="btn-imu-savecal" disabled
               title="Save the current compass calibration to flash now (only when fully calibrated). Verified by read-back — check the log to confirm before reassembling.">Save cal now</button>
+      <button class="ctrl-btn" id="btn-apply-cal" disabled
+              title="Re-apply the calibration profile already saved in the mower's flash to the live compass, without a reboot. (Status reads low until it re-validates with a little motion.)">Apply saved cal</button>
+      <button class="ctrl-btn" id="btn-save-cal-file" disabled
+              title="Save the compass calibration currently stored in the mower to a file on disc, as a backup.">Save cal to file</button>
+      <button class="ctrl-btn" id="btn-load-cal-file" disabled
+              title="Load a compass calibration from a file on disc (a cal file or a settings file) and apply it to the mower.">Load cal from file</button>
+      <button class="ctrl-btn" id="btn-copy-log"
+              onclick="window._copySysLog && window._copySysLog(this)"
+              title="Copy all log lines to the clipboard for pasting into a bug report.">Copy log</button>
     </div>
+    <input type="file" id="cal-file-input" accept="application/json,.json" style="display:none">
+    <div id="diag-log" style="margin:6px 0"></div>
     <div id="diag-grid"></div>
   </section>
 
@@ -670,7 +677,12 @@ class BLEManager {
   }
 
   _reassemble(uuid, frag) {
-    if (!this._frags[uuid]) this._frags[uuid] = { parts: [], n: 0 };
+    // Fragment 0 starts a NEW message — reset any stale partial first. Without this,
+    // a single dropped fragment (BLE notify-queue overflow under load) leaves the
+    // per-characteristic buffer polluted forever, so every later message on this
+    // characteristic fails to reassemble. That froze the STATUS/log at the first
+    // fetch (the ack/status/diag all share this characteristic and STATUS is large).
+    if (frag.f === 0 || !this._frags[uuid]) this._frags[uuid] = { parts: [], n: 0 };
     const buf = this._frags[uuid];
     buf.parts[frag.f] = frag.d;
     buf.n = frag.n;
@@ -845,8 +857,8 @@ const Commands = {
   clearObstacles:()     => ({ cmd: 'CLEAR_OBSTACLES' }),
   clearPerimeter:()     => ({ cmd: 'CLEAR_PERIMETER' }),
   recalibrateImu:()     => ({ cmd: 'RECAL_IMU' }),
-  imuCalTest:()         => ({ cmd: 'IMUCALTEST' }),
   imuSaveCal:()         => ({ cmd: 'IMUSAVECAL' }),
+  reloadImuCal:()       => ({ cmd: 'RELOAD_IMU_CAL' }),
   // Protocol v2: absolute WGS-84 lat/lon + per-point accuracy. polygon = [[lat,lon,acc],...]
   sendPerimeter: (polygon) => ({ cmd: 'SEND_PERIMETER', v: 2, polygon })
 };
@@ -1501,6 +1513,9 @@ function buildDashboard(telem) {
     : `<div class="log-box">${
         logEntries.map(e => `<div class="log-entry">${escHtml(e)}</div>`).join('')
       }</div>`;
+  // Mirror the log into the Diagnostics tab panel, so the Refresh Log button there
+  // (which fetches a fresh STATUS) visibly updates the log right next to itself.
+  { const dl = document.getElementById('diag-log'); if (dl) dl.innerHTML = logHtml; }
 
   return `
     <div class="card" style="grid-column:1/-1" title="Current operating state of the mower and overall mowing progress as a percentage of the planned area">
@@ -1565,16 +1580,9 @@ function buildDashboard(telem) {
       <div class="card-sub">Collision baseline: ${d.collBase.toFixed(3)}g</div>
       <div class="card-sub">Uptime: ${Math.floor(d.t/60000)}m ${Math.floor((d.t%60000)/1000)}s</div>
     </div>
-
-    <div class="card" style="grid-column:1/-1" title="Recent system log messages from the firmware (newest at the bottom)">
-      <div class="card-title">System Log
-        <button class="ctrl-btn" style="float:right;padding:2px 10px;font-size:0.72rem"
-                onclick="window._copySysLog && window._copySysLog(this)"
-                title="Copy all log lines to the clipboard for pasting into a bug report">Copy</button>
-      </div>
-      ${logHtml}
-    </div>
   `;
+  // (The system log lives on the Diagnostics tab, next to its Refresh button —
+  //  buildDashboard still computes logHtml above to mirror it into #diag-log.)
 }
 
 // Copy the last-received system log to the clipboard (used by the button above;
@@ -1842,14 +1850,12 @@ async function main() {
     showToast('BLE disconnected', false);
   };
 
-  // ── Diagnostics tab: planner dry-run + log refresh ───
-  document.getElementById('btn-plan-test')?.addEventListener('click', async () => {
-    try { await ble.sendCommand({ cmd: 'PLAN_TEST' }); }
-    catch (e) { showToast(e.message, false); }
-  });
+  // ── Diagnostics tab: log refresh + IMU calibration ───
   document.getElementById('btn-refresh-log')?.addEventListener('click', async () => {
-    try { await ble.sendCommand(Commands.requestStatus()); }
-    catch (e) { showToast(e.message, false); }
+    try {
+      await ble.sendCommand(Commands.requestStatus());
+      showToast('Log refreshed', true);   // STATUS response re-renders the log panel below
+    } catch (e) { showToast(e.message, false); }
   });
   document.getElementById('btn-recal-imu')?.addEventListener('click', async () => {
     if (!ble.connected) { showToast('Not connected', false); return; }
@@ -1858,12 +1864,66 @@ async function main() {
       showToast('Compass recalibration started — drive slow loops in Manual', true);
     } catch (e) { showToast(e.message, false); }
   });
-  document.getElementById('btn-imu-caltest')?.addEventListener('click', async () => {
+  document.getElementById('btn-apply-cal')?.addEventListener('click', async () => {
     if (!ble.connected) { showToast('Not connected', false); return; }
     try {
-      await ble.sendCommand(Commands.imuCalTest());
-      showToast('Cal-save self-test requested — check the log for PASS/FAIL', true);
+      await ble.sendCommand(Commands.reloadImuCal());
+      showToast('Applying saved calibration — check the log', true);
     } catch (e) { showToast(e.message, false); }
+  });
+  // Save the mower's stored calibration (carried in STATUS as cfgCalHex) to a disc file.
+  document.getElementById('btn-save-cal-file')?.addEventListener('click', async () => {
+    if (!cfgCalHex) { showToast('No calibration available — "Save cal now" on the mower first', false); return; }
+    const out = { type: 'robomower-imu-cal', version: 1, savedAt: new Date().toISOString(),
+                  bnocal: cfgCalHex, bnocalq: cfgCalQ };
+    const json = JSON.stringify(out, null, 2);
+    const name = `robomower-calibration-${dateStamp()}.json`;
+    try {
+      if (window.showSaveFilePicker) {
+        const handle = await window.showSaveFilePicker({ suggestedName: name,
+          types: [{ description: 'RoboMower calibration', accept: { 'application/json': ['.json'] } }] });
+        const w = await handle.createWritable(); await w.write(json); await w.close();
+      } else {
+        const blob = new Blob([json], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = name; a.click();
+        URL.revokeObjectURL(url);
+      }
+      showToast('Calibration saved to file', true);
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;   // user cancelled
+      showToast('Save failed: ' + (err.message || err), false);
+    }
+  });
+  // Load a calibration from disc and apply it to the mower (accepts a cal-only file or
+  // a full settings file — both carry the 44-hex bnocal + quality).
+  const calFileInput = document.getElementById('cal-file-input');
+  document.getElementById('btn-load-cal-file')?.addEventListener('click', () => {
+    if (!ble.connected) { showToast('Not connected', false); return; }
+    calFileInput?.click();
+  });
+  calFileInput?.addEventListener('change', async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';                              // allow re-loading the same file
+    if (!file) return;
+    try {
+      const obj = JSON.parse(await file.text());
+      const cal = obj.bnocal ? { bnocal: obj.bnocal, bnocalq: obj.bnocalq }
+                : obj.imu_cal ? obj.imu_cal
+                : (obj.settings && obj.settings.bnocal) ? { bnocal: obj.settings.bnocal, bnocalq: obj.settings.bnocalq }
+                : null;
+      if (!cal || typeof cal.bnocal !== 'string' || cal.bnocal.length !== 44) {
+        throw new Error('no calibration (44-hex bnocal) found in file');
+      }
+      cfgCalHex = cal.bnocal;
+      cfgCalQ   = (cal.bnocalq != null) ? cal.bnocalq : null;
+      const payload = { cmd: 'SET_CONFIG', bnocal: cfgCalHex };
+      if (cfgCalQ != null) payload.bnocalq = cfgCalQ;
+      await ble.sendCommand(payload);               // firmware writes NVS + applies live
+      showToast('Calibration loaded and applied — check the log', true);
+    } catch (err) {
+      showToast('Load cal failed: ' + (err.message || err), false);
+    }
   });
   document.getElementById('btn-imu-savecal')?.addEventListener('click', async () => {
     if (!ble.connected) { showToast('Not connected', false); return; }

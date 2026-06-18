@@ -1177,6 +1177,15 @@ static void handle_ble_command(const char *json) {
         return;
     }
 
+    // ── RELOAD_IMU_CAL — re-apply the saved profile to the live BNO055 ─────────
+    if (strcmp(cmd, "RELOAD_IMU_CAL") == 0) {
+        imu_reapply_saved_cal();   // performed on Core 0; result reported to the log
+        sys_log_push("IMU: apply saved calibration requested");
+        ble_server_send_ack(cmd, true, "applying saved calibration — check log");
+        request_beep(BEEP_CONFIRM);
+        return;
+    }
+
     // ── SEND_PERIMETER ────────────────────────────────────────────────────────
     if (strcmp(cmd, "SEND_PERIMETER") == 0) {
         handle_send_perimeter(json);
