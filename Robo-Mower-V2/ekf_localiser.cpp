@@ -453,8 +453,8 @@ void ekf_update_gps(float gps_east, float gps_north, int fix_type,
                     // reversing (s_v < 0). Forward = +duty = +eRPM = +s_v (verified
                     // in code 2026-06-15), so this does NOT fire during forward
                     // driving. Leaving it s_v-based means that if the BNO heading
-                    // itself flips (e.g. magnetic distortion), the GPS chord can
-                    // still trim the offset to compensate.
+                    // itself is wrong (for any reason), the GPS chord can still
+                    // trim the offset to compensate.
                     if (s_v < -0.03f) z_hdg = wrapAngle(z_hdg + (float)M_PI);
 
                     s_hdg_offset = heading_offset_ema(s_hdg_offset, z_hdg, bno_hdg,

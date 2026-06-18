@@ -127,8 +127,9 @@ static void clear_cal_in_nvs() {
 
 // Read the BNO055's 22 calibration-offset registers DIRECTLY (in CONFIG mode),
 // bypassing Adafruit's getSensorOffsets() — that one only returns data when
-// isFullyCalibrated() is true, which in NDOF requires sys==3. A magnetically-noisy
-// machine never reaches sys==3, so the profile would otherwise never save. The
+// isFullyCalibrated() is true, which in NDOF requires sys==3. The BNO055 often
+// never reaches sys==3 even with gyro/accel/mag all at 3, so the profile would
+// otherwise never save. The
 // CONFIG↔NDOF switch restarts fusion (live calib status briefly drops then
 // re-validates from these offsets). Called once per session when gyro/accel/mag=3.
 static bool read_offsets_raw(uint8_t out[22]) {

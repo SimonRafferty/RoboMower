@@ -3332,8 +3332,9 @@ void state_machine_update() {
         // ── Heading diagnostic (debugging the AUTO heading-flip) ───────────────
         // bno = raw BNO055 fused heading; th = EKF heading (= bno + GPS offset);
         // off = the GPS-trimmed offset (deg). If `th` flips while `bno` stays
-        // steady, the GPS offset-trim drifted; if `bno` itself flips, it's the
-        // magnetometer (motor/blade interference). Temporary — remove once solved.
+        // steady, the GPS offset-trim drifted; if `bno` itself flips, the BNO fused
+        // heading is wrong (axis/sign/fusion — not the magnetic environment).
+        // Temporary — remove once solved.
         {
             static uint32_t s_hdg_log_ms = 0;
             bool driving = (g_state == STATE_MANUAL || g_state == STATE_AUTO_MOWING);
