@@ -222,6 +222,13 @@
 #define CUT_WIDTH_M                0.38f   // [m] — effective cut width per pass (≈ blade dia − overlap)
 #define STRIP_OVERLAP_M            0.10f   // [m] — additional overlap between adjacent strips
 
+// Turn margin — inset the spiral's OUTER ring (ring 0, the mow path) this far in
+// from the recorded perimeter. The perimeter is the steering-centre path; pivoting
+// in place at a corner sweeps the outer body corner ~half a track width beyond it,
+// clipping the wall. This pulls only the MOW PATH in; the breach keep-out still
+// uses the true perimeter. Increase if it clips corners; 0 = ring 0 = perimeter.
+#define TURN_MARGIN_M              0.10f   // [m]
+
 // Cut height range — servo maps linearly between these values (stored in NVS after cal)
 // CUT_HEIGHT_MAX_MM also used as safe height for bog recovery passes.
 #define CUT_HEIGHT_MIN_MM          35      // [mm] — minimum deck height (measured mechanical limit)
@@ -338,9 +345,24 @@
 // the AUTO follower spins in place (one track forward, one reverse) until roughly
 // aligned, then resumes forward pursuit. Lets it reach tight corner nodes that a
 // forward arc would overshoot. Hysteresis (enter > exit) prevents chatter.
-#define PIVOT_ENTER_DEG            55.0f  // [deg] — start pivoting when |heading error| exceeds this
-#define PIVOT_EXIT_DEG            12.0f  // [deg] — stop pivoting once |heading error| drops below this
+// Lowered 2026-06-18 (55->20 / 12->5): the perimeter is recorded by pivoting on the
+// spot at each node and driving straight between, so the follower must do the same —
+// pivot to aim at the next node for ANY real turn, then drive straight. The old 55°
+// threshold arced wide through corners < 55° (ran into a wall) and the near-zero
+// inner-wheel arc target also wound the duty ramp to max. Pivoting both tracks avoids
+// both. Hysteresis (enter > exit) prevents chatter.
+#define PIVOT_ENTER_DEG           20.0f  // [deg] — start pivoting when |heading error| exceeds this
+#define PIVOT_EXIT_DEG             5.0f  // [deg] — stop pivoting once |heading error| drops below this
 #define PIVOT_WHEEL_MS            0.18f  // [m/s] — per-track tangential speed during a pivot
+
+// Forward vs REVERSE selection. When the node is BEHIND (heading error > ~90°) it
+// is shorter to align the BACK and drive backward than to pivot >90° and arc
+// forward (the wide arc swings out, sometimes across the perimeter — e.g. the
+// start point, or a ring-to-ring bridge ~135° round). Hysteresis (enter > exit)
+// around 90° prevents chatter; a behind-target holds the forward error near 180°
+// so it stays in reverse until the next node is ahead.
+#define REV_ENTER_DEG            100.0f  // [deg] — switch to reverse when |heading error| exceeds this
+#define REV_EXIT_DEG             80.0f   // [deg] — switch back to forward once |heading error| drops below this
 
 // Node follower (drive branch): P-controller turns yaw rate from heading error.
 #define NODE_HEADING_KP           1.5f   // [1/s] — yaw rate = KP × heading error (rad)
@@ -362,7 +384,14 @@
 //   OFFSET_TRIM_GAIN      : EMA gain folding each chord estimate into the offset.
 #define HEADING_STRAIGHT_MAX_TURN_RAD 0.20f   // ~11 deg
 #define HEADING_FROM_GPS_MIN_DIST_M   0.30f   // [m]
-#define HEADING_GPS_DIST_SIGMA_K      20.0f
+#define HEADING_GPS_DIST_SIGMA_K      20.0f   // FIRST lock: long/accurate chord (Fixed ~0.3m, Float ~4.2m)
+// ONGOING trim once heading is established: a shorter chord is fine because the
+// slow EMA (TRIM_GAIN) averages out chord noise over many samples. This lets the
+// offset keep tracking in RTK-FLOAT during normal driving (Float ~1.3m, Fixed
+// ~0.3m), so the heading never goes stale / never needs re-locking when Fixed
+// drops out. (Per operator: trim from GPS whenever moving; hold the mag heading
+// when stationary; the initial Fixed lock is kept, never dropped.)
+#define HEADING_GPS_DIST_SIGMA_K_TRIM 6.0f
 #define HEADING_OFFSET_TRIM_GAIN      0.10f   // EMA gain per qualifying chord
 
 // Offset NVS persistence throttle (avoid flash wear; offset drifts very slowly).
@@ -510,6 +539,33 @@
 
 // GPS ceiling is applied continuously (in both ekf_predict and ekf_update_gps)
 // using the measurement noise R from the last GPS fix — no multiplier needed.
+
+// ── GPS cold-start robustness (prevents a bad boot fix locking the EKF) ───────
+// The EKF seeds on the first fix and then gates everything to max(5σ, 5 m). If
+// that first fix is a transient bad RTK-Fixed (e.g. base still re-surveying),
+// the seed sticks and the gate rejects every good fix → "100 m off, creeping".
+//   EKF_SEED_FALLBACK_MS    : seed only on an RTK (Float/Fixed) fix; if none has
+//                             arrived by this long after boot, seed on whatever
+//                             we have so a DGPS-only site is never stuck unseeded.
+//   EKF_GATE_RELAX_MS       : for this long AFTER seeding, any fix snaps (a poor
+//                             seed self-corrects); after it, the gate is restored.
+//   EKF_TRUST_FIX_MAX_AGE_S : an RTK-Fixed fix with corrections fresher than this
+//                             ALWAYS snaps (bypasses the gate) → "if Fixed, use it
+//                             regardless"; recovers from any seed/drift error.
+#define EKF_SEED_FALLBACK_MS         90000   // [ms]
+#define EKF_GATE_RELAX_MS            60000   // [ms]
+#define EKF_TRUST_FIX_MAX_AGE_S       5.0f   // [s] — correction age for a trusted Fixed
+
+// AUTO refuses to start if a real position-error estimate (EPE, when available)
+// exceeds this. Gates start only — uncertainty speed-scaling covers mid-mow.
+#define AUTO_MAX_EPE_M                0.5f    // [m]
+
+// PAUSE→AUTO resume decision: if the EKF pose moved less than this between pause
+// entry and resume, the mower didn't move — continue the cycle in order. If it
+// moved more (likely carried), restart the cycle (dead-reckoned pose no longer
+// trustworthy). NUDGE always continues (the EKF tracked the manual drive).
+#define PAUSE_RESUME_MAX_MOVE_M       0.5f    // [m]
+#define PAUSE_RESUME_MAX_TURN_RAD     0.35f   // [rad] ~20 deg
 
 
 // ══════════════════════════════════════════════════════════════════════════════

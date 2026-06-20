@@ -23,10 +23,18 @@
  *
  * @param poly     Input polygon (>= 3 vertices). Winding is normalised internally.
  * @param inset_m  Inward inset distance in metres (> 0).
+ * @param sharp_corners  false (default) = round joins (concave notches round off,
+ *                 safest for arbitrary gardens). true = MITER joins (limit 2.0):
+ *                 keeps CONVEX corners SHARP — single turn-point nodes — so the
+ *                 node follower pivots once per corner instead of multiple times
+ *                 through a bevelled arc. Use for the spiral mow path, which must
+ *                 match the operator's sparse pivot-at-corner recording. Acute and
+ *                 reflex corners are still squared off at the miter limit.
  * @return Vector of solid (CCW) sub-polygons. Empty if fully collapsed. Caller
  *         applies any minimum-area filtering (e.g. MIN_ZONE_AREA_M2).
  */
-std::vector<Polygon> offsetPolygonClipper(const Polygon &poly, float inset_m);
+std::vector<Polygon> offsetPolygonClipper(const Polygon &poly, float inset_m,
+                                          bool sharp_corners = false);
 
 /**
  * @brief Inset a polygon, returning only the single LARGEST solid sub-polygon.

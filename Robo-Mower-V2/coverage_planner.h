@@ -97,6 +97,29 @@ void coverage_planner_report_obstacle(float x, float y, float approach_heading);
  */
 void coverage_planner_reset_to_nearest(float x, float y);
 
+/**
+ * @brief Resume strictly IN ORDER from the furthest-reached waypoint.
+ *
+ * Sets the cursor to the visited high-water mark — the next un-mown waypoint in
+ * sequence — WITHOUT searching for the nearest. Unlike reset_to_nearest(), this
+ * can never skip inward across rings (which on a spiral abandons whole rings /
+ * arms). Used for every AUTO upset/resume so the spiral is followed in order.
+ */
+void coverage_planner_resume_in_order();
+
+/**
+ * @brief Advance the "visited" high-water mark to @p first_unvisited_idx.
+ *
+ * Called by the state machine each AUTO tick with the absolute index of the
+ * current target waypoint. Monotonic (never moves backward). Waypoints before the
+ * mark are excluded from coverage_planner_reset_to_nearest(), so an upset/recovery
+ * resumes at the nearest UNVISITED waypoint instead of jumping back.
+ */
+void coverage_planner_set_progress(int first_unvisited_idx);
+
+/** Reset the visited high-water mark to 0 (call on a fresh AUTO start, not resume). */
+void coverage_planner_reset_progress();
+
 
 // ── Progress reporting ────────────────────────────────────────────────────────
 

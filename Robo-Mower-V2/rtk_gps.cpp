@@ -76,6 +76,81 @@ static SemaphoreHandle_t s_mutex             = nullptr;
 static GpsFix            s_last_logged_fix   = GPS_FIX_NONE;  // for fix-change log events
 
 
+// ── PQTMEPE (estimated position error) — best-effort, used when available ─────
+// The receiver (Quectel LC29HDA) can stream a real 2-D position-error estimate
+// ($PQTMEPE). The DFRobot wrapper, however, reaches the module only through a
+// register protocol, so whether a streamed PQTMEPE surfaces through transmitAT()
+// is uncertain ("unreliable for streaming"). This is therefore a PROBE: enable
+// it, try to read it, log a verdict, and USE it when it parses. When it does not,
+// everything degrades gracefully to the fix-type sigma (see effective accuracy).
+#define GPS_EPE_STALE_MS         3000   // an EPE older than this is no longer "valid"
+#define GPS_EPE_PROBE_PERIOD_MS  2000   // spacing of probe attempts (transmitAT blocks)
+#define GPS_EPE_PROBE_MAX          20   // declare "unavailable" after this many misses
+static float    s_epe_2d_m        = 0.0f;
+static uint32_t s_epe_ms          = 0;
+static bool     s_epe_seen        = false;  // a $PQTMEPE has parsed at least once
+static uint32_t s_epe_probe_ms    = 0;
+static int      s_epe_probe_count = 0;
+static bool     s_epe_probe_done  = false;  // verdict reached (logged once)
+
+// Parse the 2-D horizontal error from a $PQTMEPE sentence embedded in `s`.
+// LC29H format: $PQTMEPE,<MsgVer>,<EPE_North>,<EPE_East>,<EPE_Down>,<EPE_2D>,<EPE_3D>*CS
+// Field index 5 (after the header) = EPE_2D. (Verify against the LC29H datasheet.)
+static bool parse_pqtmepe(const char *s, float *epe2d) {
+    if (!s) return false;
+    const char *p = strstr(s, "$PQTMEPE");
+    if (!p) return false;
+    int comma = 0;
+    for (const char *q = p; *q && *q != '*' && *q != '\r' && *q != '\n'; q++) {
+        if (*q != ',') continue;
+        if (++comma == 5) {                 // field after the 5th comma = EPE_2D
+            float v = strtof(q + 1, nullptr);
+            if (isfinite(v) && v >= 0.0f && v < 100.0f) {
+                if (epe2d) *epe2d = v;
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+// Throttled, bounded probe run from the GPS task. (Re)asserts PQTMEPE streaming
+// (volatile RAM config — no flash wear) and scans transmitAT()'s reply for a
+// $PQTMEPE sentence. On success refreshes s_epe_*; after GPS_EPE_PROBE_MAX misses
+// it logs "unavailable" once and stops (so the GPS poll rate is unaffected).
+static void gps_epe_probe(uint32_t now) {
+    if (s_epe_probe_done) {
+        if (!s_epe_seen) return;            // verdict was "unavailable" — never probe again
+        if ((uint32_t)(now - s_epe_probe_ms) < GPS_EPE_PROBE_PERIOD_MS) return;  // slow refresh
+    } else if (s_epe_probe_count > 0 &&
+               (uint32_t)(now - s_epe_probe_ms) < GPS_EPE_PROBE_PERIOD_MS) {
+        return;                             // throttle probe attempts
+    }
+    s_epe_probe_ms = now;
+
+    char *resp = s_gps.transmitAT("$PQTMCFGMSGRATE,W,PQTMEPE,1,2*1D\r\n");
+    float epe;
+    if (parse_pqtmepe(resp, &epe)) {
+        s_epe_2d_m = epe;
+        s_epe_ms   = now;
+        if (!s_epe_seen) {
+            s_epe_seen = true;
+            char l[SYS_LOG_MAX_LEN];
+            snprintf(l, sizeof(l),
+                     "GPS: EPE available (h=%.2fm) — using real position error", (double)epe);
+            sys_log_push(l);
+        }
+        s_epe_probe_done = true;
+        return;
+    }
+    if (!s_epe_probe_done && ++s_epe_probe_count >= GPS_EPE_PROBE_MAX) {
+        s_epe_probe_done = true;
+        sys_log_push("GPS: EPE unavailable via module — using fix-type accuracy");
+    }
+}
+
+
 // ── WGS-84 local-tangent-plane projection ─────────────────────────────────────
 // Replaces the old fixed 111319.5 m/deg flat-earth constant with the proper
 // ellipsoidal radii of curvature evaluated at the ORIGIN latitude, so lat/lon ↔
@@ -212,6 +287,11 @@ static void gps_poll_task_fn(void* /*arg*/) {
 
         uint32_t now = static_cast<uint32_t>(millis());
 
+        // ── Best-effort estimated-position-error read (used when available) ──
+        gps_epe_probe(now);
+        bool  epe_ok  = s_epe_seen && (uint32_t)(now - s_epe_ms) < GPS_EPE_STALE_MS;
+        float epe_val = epe_ok ? s_epe_2d_m : 0.0f;
+
         // ── Snapshot current origin state (set only by perimeter upload) ──
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         GpsOrigin origin = s_origin;
@@ -220,7 +300,11 @@ static void gps_poll_task_fn(void* /*arg*/) {
         // ── Auto-seed origin from first RTK fix if no perimeter has been stored ──
         // Allows EKF to converge during manual/test driving before any perimeter
         // is uploaded. Not persisted to NVS — a perimeter upload will override it.
-        if (!origin.set && fix_type >= GPS_FIX_RTK_FIXED) {
+        // Freshness guard: only anchor the origin on an RTK fix whose corrections
+        // are recent, so a stale-correction Fixed (which can be wildly wrong, e.g.
+        // a base still re-surveying) can't seed a bad ENU frame.
+        if (!origin.set && fix_type >= GPS_FIX_RTK_FIXED &&
+            dif_age < EKF_TRUST_FIX_MAX_AGE_S) {
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             if (!s_origin.set) {
                 s_origin.lat_deg = lat_deg;
@@ -257,7 +341,8 @@ static void gps_poll_task_fn(void* /*arg*/) {
             // ekf_update_gps() applies the antenna-to-steering-centre transform
             // internally using the current EKF heading, so pass ant_* not sc_*.
             bool was_seeded = ekf_is_seeded();
-            ekf_update_gps(ant_east, ant_north, (int)fix_type, hdop, dif_age, heading);
+            ekf_update_gps(ant_east, ant_north, (int)fix_type, hdop, dif_age, heading,
+                           epe_val, epe_ok);
             // When the EKF gets its first valid position, push a fresh map so
             // the PWA receives a non-zero pos.x/y (not the boot-time origin 0,0).
             if (!was_seeded && ekf_is_seeded()) {
@@ -279,6 +364,8 @@ static void gps_poll_task_fn(void* /*arg*/) {
         s_measurement.dif_age_s    = dif_age;
         s_measurement.timestamp_ms = now;
         s_measurement.valid        = valid;
+        s_measurement.epe_2d_m     = epe_val;
+        s_measurement.epe_valid    = epe_ok;
         s_last_valid_ms            = now;
         xSemaphoreGive(s_mutex);
 
@@ -333,6 +420,29 @@ void rtk_gps_init() {
     // setModule() is a no-op if already in the correct mode; includes its own delay.
     s_gps.setModule(module_lora);
     DBG_PRINTLN("[GPS] LoRa module mode set");
+
+    // ── Enable the receiver's estimated-position-error output (PQTMEPE) ──────
+    // Best-effort: send the operator's exact command and log the raw reply so the
+    // ack ($PAIR001,...) or an error is visible in the PWA log. The poll-task
+    // probe (gps_epe_probe) then tries to read the value; see the PQTMEPE notes.
+    {
+        char *resp = s_gps.transmitAT("$PQTMCFGMSGRATE,W,PQTMEPE,1,2*1D\r\n");
+        char clean[48];
+        int  n = 0;
+        for (const char *r = resp; r && *r && n < (int)sizeof(clean) - 1; r++) {
+            if (*r >= 32 && *r < 127) clean[n++] = *r;   // strip non-printables for the log
+        }
+        clean[n] = '\0';
+        char l[SYS_LOG_MAX_LEN];
+        snprintf(l, sizeof(l), "GPS: EPE enable reply: %s", n ? clean : "(none)");
+        sys_log_push(l);
+        float epe;
+        if (parse_pqtmepe(resp, &epe)) {   // module may answer with EPE immediately
+            s_epe_2d_m = epe;
+            s_epe_ms   = static_cast<uint32_t>(millis());
+            s_epe_seen = true;
+        }
+    }
 
     // Arm last-valid timer so timeout triggers after GPS_UPDATE_TIMEOUT_MS
     // even if the module has not responded yet
@@ -389,6 +499,17 @@ float rtk_gps_accuracy_m(int fix_type, float hdop) {
     if (sigma < 0.005f) sigma = 0.005f;
     if (sigma > 5.0f)   sigma = 5.0f;
     return sigma;
+}
+
+float rtk_gps_effective_accuracy_m(const GpsMeasurement &m) {
+    // Prefer the receiver's real measured error when fresh; else the fix-type table.
+    if (m.epe_valid) {
+        float e = m.epe_2d_m;
+        if (e < 0.005f) e = 0.005f;
+        if (e > 5.0f)   e = 5.0f;
+        return e;
+    }
+    return rtk_gps_accuracy_m((int)m.fix_type, m.hdop);
 }
 
 GpsOrigin rtk_gps_get_origin() {

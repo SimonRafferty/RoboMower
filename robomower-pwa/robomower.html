@@ -412,6 +412,7 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
           <label>Blade radius m<input    type="number" class="cfg-input" id="cfg-cut_disc_radius_m"   step="0.001" title="Radius of the cutting disc (metres)"></label>
           <label>Cut width m<input       type="number" class="cfg-input" id="cfg-cut_width_m"         step="0.01" title="Effective cut width per mowing pass (metres). Usually slightly less than blade diameter"></label>
           <label>Strip overlap m<input   type="number" class="cfg-input" id="cfg-strip_overlap_m"     step="0.005" title="Overlap between adjacent mowing strips (metres). Prevents uncut lines between passes"></label>
+          <label>Turn margin m<input     type="number" class="cfg-input" id="cfg-turn_margin_m"       step="0.01" min="0" title="Inset of the spiral's outer ring (mow path) from the perimeter (metres), so the body clears corners when pivoting in place. The breach keep-out still uses the true perimeter. Increase if it clips corners (≈ half a track width); 0 = mow up to the perimeter. Default 0.10"></label>
           <label>Blade pole pairs<input  type="number" class="cfg-input" id="cfg-blade_motor_pole_pairs" step="1" min="1" title="Number of magnetic pole PAIRS in the blade motor rotor. Used to convert eRPM to mechanical RPM"></label>
           <label>Blade RPM<input         type="number" class="cfg-input" id="cfg-blade_target_rpm"    step="100" min="0" title="Target mechanical RPM for the blade motor during mowing"></label>
         </div>
@@ -450,7 +451,7 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
         <div class="cfg-derived" id="cfg-derived"></div>
         <div class="cfg-actions">
           <button id="cfg-save-btn" disabled title="Send all config values to the mower. Saved to NVS flash and takes effect immediately">Save to Mower</button>
-          <button id="cfg-reset-btn" title="Discard changes and reload all fields from the mower's current saved config">Reset to Current</button>
+          <button id="cfg-reset-btn" title="Reload all fields from the mower's current saved config (discards unsaved edits)">Load from Mower</button>
           <button id="cfg-save-file-btn" title="Export the current form values to a JSON file on this device (works offline)">Save to File</button>
           <button id="cfg-load-btn" title="Import settings from a JSON file. Missing settings use defaults; unknown settings are ignored. Review, then press Save to Mower to apply.">Load from File</button>
           <input type="file" id="cfg-file-input" accept="application/json,.json" style="display:none">
@@ -490,7 +491,6 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
         <span id="state-badge">INIT</span>
         <button class="mode-btn" id="btn-mode-manual" disabled>Manual</button>
         <button class="mode-btn" id="btn-mode-auto"   disabled>Auto</button>
-        <button class="mode-btn" id="btn-mode-return" disabled>Return</button>
         <button class="ctrl-btn"  id="btn-learn"       disabled>Learn</button>
         <button class="ctrl-btn"  id="btn-store-pt"    disabled>Store Pt</button>
         <button class="ctrl-btn"  id="btn-blade"       disabled>Start Blade</button>
@@ -591,7 +591,7 @@ const STATE_COLOURS = {
   'BOG':            '#ff6600',
   'OBS_AVOID':      '#ff4400',
   'INIT':           '#888888',
-  'RETURN':         '#00aaff',
+  'NUDGE':          '#00ffff',
 };
 
 // ══════════════════════════════════════════════════════
@@ -1028,6 +1028,7 @@ class MapManager {
     this._mowedGroup  = null;
     this._obsGroup    = null;
     this._posMarker   = null;
+    this._gpsMarker   = null;   // black arrow: raw GPS/RTK position + GPS heading
     this._mowPathLayer   = null;   // dashed line: planned mowing path
     this._transitLayer   = null;   // dashed line: transit to mow start
     this._mapData     = null;
@@ -1148,7 +1149,7 @@ class MapManager {
     const first = ring[0];
     this._originMark = L.circleMarker(
       [first.lat, first.lng],
-      { radius: 6, color: '#fff', weight: 2, fillColor: '#ff8c00', fillOpacity: 1, zIndexOffset: 500 }
+      { radius: 6, color: '#fff', weight: 2, fillColor: '#ff8c00', fillOpacity: 1, zIndexOffset: 500, pmIgnore: true }
     ).bindTooltip('Perimeter origin').addTo(this._map);
   }
 
@@ -1236,10 +1237,10 @@ class MapManager {
         const col = acc <= 0.05 ? '#22cc44' : acc <= 0.5 ? '#ffaa00' : '#ff3333';
         L.circle([lat, lon], {
           radius: Math.max(acc, 0.05), color: col, weight: 1,
-          fillColor: col, fillOpacity: 0.12
+          fillColor: col, fillOpacity: 0.12, pmIgnore: true
         }).addTo(this._accGroup);
         L.circleMarker([lat, lon], {
-          radius: 5, color: '#fff', weight: 1.5, fillColor: col, fillOpacity: 1
+          radius: 5, color: '#fff', weight: 1.5, fillColor: col, fillOpacity: 1, pmIgnore: true
         }).bindTooltip(`±${acc.toFixed(2)} m`).addTo(this._accGroup);
       });
       this._accGroup.addTo(this._map);
@@ -1252,11 +1253,11 @@ class MapManager {
       const lls = data.recording.map(p => [p[0], p[1]]);
       lls.forEach((ll, i) => {
         L.circleMarker(ll, {
-          radius: 6, color: '#8833cc', fillColor: '#bb66ff', fillOpacity: 0.8, weight: 2
+          radius: 6, color: '#8833cc', fillColor: '#bb66ff', fillOpacity: 0.8, weight: 2, pmIgnore: true
         }).bindTooltip(`Pt ${i + 1}`).addTo(this._recGroup);
       });
       if (lls.length > 1) {
-        L.polyline(lls, { color: '#8833cc', weight: 2, dashArray: '6,4', opacity: 0.7 })
+        L.polyline(lls, { color: '#8833cc', weight: 2, dashArray: '6,4', opacity: 0.7, pmIgnore: true })
           .addTo(this._recGroup);
       }
       this._recGroup.addTo(this._map);
@@ -1279,7 +1280,7 @@ class MapManager {
         .map(seg => seg.map(p => [p[0], p[1]]));
       if (multiLls.length > 0) {
         this._mowPathLayer = L.polyline(multiLls, {
-          color: '#00cc44', weight: 1.5, dashArray: '6,4', opacity: 0.7
+          color: '#00cc44', weight: 1.5, dashArray: '6,4', opacity: 0.7, pmIgnore: true
         }).addTo(this._map);
       }
     }
@@ -1288,7 +1289,7 @@ class MapManager {
     if (data.transit_path?.length > 1) {
       const lls = data.transit_path.map(p => [p[0], p[1]]);
       this._transitLayer = L.polyline(lls, {
-        color: '#ff8c00', weight: 2, dashArray: '8,6', opacity: 0.8
+        color: '#ff8c00', weight: 2, dashArray: '8,6', opacity: 0.8, pmIgnore: true
       }).addTo(this._map);
     }
   }
@@ -1304,7 +1305,7 @@ class MapManager {
       const wy = g.oy + row * cs;
       const sw = this._enuToLatLon(wx,      wy);
       const ne = this._enuToLatLon(wx + cs, wy + cs);
-      L.rectangle([sw, ne], { color: '#00cc44', weight: 0, fillOpacity: 0.35 })
+      L.rectangle([sw, ne], { color: '#00cc44', weight: 0, fillOpacity: 0.35, pmIgnore: true })
         .addTo(this._mowedGroup);
     }
     this._mowedGroup.addTo(this._map);
@@ -1316,7 +1317,7 @@ class MapManager {
     this._obsGroup = L.layerGroup();
     for (const obs of data.obstacles) {
       const ll = this._enuToLatLon(obs.x, obs.y);
-      L.circle(ll, { radius: 0.3, color: '#ff2233', weight: 2, fillOpacity: 0.5 })
+      L.circle(ll, { radius: 0.3, color: '#ff2233', weight: 2, fillOpacity: 0.5, pmIgnore: true })
         .addTo(this._obsGroup);
     }
     this._obsGroup.addTo(this._map);
@@ -1334,11 +1335,37 @@ class MapManager {
       iconSize: [22, 22], iconAnchor: [11, 11]
     });
     if (!this._posMarker) {
-      this._posMarker = L.marker(ll, { icon, zIndexOffset: 1000 }).addTo(this._map);
+      this._posMarker = L.marker(ll, { icon, zIndexOffset: 1000, pmIgnore: true }).addTo(this._map);
     } else {
       this._posMarker.setLatLng(ll);
       this._posMarker.setIcon(icon);
     }
+  }
+
+  /** Diagnostic second arrow (BLACK): the RAW GPS/RTK steering-centre position and
+   *  GPS-based heading, so the operator can see how far the raw fix is from the
+   *  fused EKF arrow (red) — even when the fix reports Fixed. Drawn just below the
+   *  EKF arrow so both are visible when they coincide. */
+  updateGpsPosition(lat, lon, hdg) {
+    if (!this._map || lat == null || lon == null) return;
+    const ll = [lat, lon];
+    const deg = (hdg || 0) * 180 / Math.PI;
+    const icon = L.divIcon({
+      className: '',
+      html: `<svg width="22" height="22" viewBox="0 0 22 22" style="transform:rotate(${deg}deg);transform-origin:center;display:block"><polygon points="11,1 20,21 11,16 2,21" fill="#000" stroke="#fff" stroke-width="1.5"/></svg>`,
+      iconSize: [22, 22], iconAnchor: [11, 11]
+    });
+    if (!this._gpsMarker) {
+      this._gpsMarker = L.marker(ll, { icon, zIndexOffset: 999, pmIgnore: true }).addTo(this._map);
+    } else {
+      this._gpsMarker.setLatLng(ll);
+      this._gpsMarker.setIcon(icon);
+    }
+  }
+
+  /** Remove the raw-GPS arrow (no/invalid fix). */
+  clearGpsPosition() {
+    if (this._gpsMarker) { this._map.removeLayer(this._gpsMarker); this._gpsMarker = null; }
   }
 
   /** Diagnostic: compute distance from EKF-derived position to first perimeter vertex.
@@ -1433,8 +1460,8 @@ class MapManager {
     pts.forEach(p => {
       const acc = p.length >= 3 ? p[2] : 0.05;
       const col = acc <= 0.05 ? '#22cc44' : acc <= 0.5 ? '#ffaa00' : '#ff3333';
-      L.circle([p[0], p[1]], { radius: Math.max(acc, 0.05), color: col, weight: 1, fillColor: col, fillOpacity: 0.12 }).addTo(this._accGroup);
-      L.circleMarker([p[0], p[1]], { radius: 5, color: '#fff', weight: 1.5, fillColor: col, fillOpacity: 1 }).bindTooltip(`±${acc.toFixed(2)} m`).addTo(this._accGroup);
+      L.circle([p[0], p[1]], { radius: Math.max(acc, 0.05), color: col, weight: 1, fillColor: col, fillOpacity: 0.12, pmIgnore: true }).addTo(this._accGroup);
+      L.circleMarker([p[0], p[1]], { radius: 5, color: '#fff', weight: 1.5, fillColor: col, fillOpacity: 1, pmIgnore: true }).bindTooltip(`±${acc.toFixed(2)} m`).addTo(this._accGroup);
     });
     this._accGroup.addTo(this._map);
     this._map.fitBounds(this._perimLayer.getBounds(), { padding: [20, 20] });
@@ -1827,6 +1854,7 @@ async function main() {
   ble.onConnect    = () => {
     updateBleUi(true);
     mapMgr._updateToolbarState();
+    cfgFormSynced = false;   // a new connection: let the first STATUS populate the form once
     document.getElementById('cfg-save-btn').disabled = false;
     // If diag tab is active on reconnect, start polling
     if (document.getElementById('tab-diag')?.classList.contains('active')) {
@@ -1971,6 +1999,13 @@ async function main() {
       const [plat, plon] = mapMgr._enuToLatLon(d.x, d.y);
       mapMgr.updatePosition(plat, plon, d.hdg);
     }
+    // Black arrow: raw GPS/RTK steering-centre position + GPS heading (diagnostic —
+    // shows GPS vs EKF divergence). Only when there's a real fix; hidden otherwise.
+    if (d.fix > 0 && d.gpsLat != null && d.gpsLon != null && (d.gpsLat !== 0 || d.gpsLon !== 0)) {
+      mapMgr.updateGpsPosition(d.gpsLat, d.gpsLon, d.gpsHdg);
+    } else {
+      mapMgr.clearGpsPosition();
+    }
     mapMgr._logPositionDiagnostic(d.x, d.y, d.lat, d.lon);
     document.getElementById('cut-height-val').textContent = Math.round(d.cutH) + 'mm';
 
@@ -2013,7 +2048,7 @@ async function main() {
       const stateLabels = {
         INIT:'INIT', IDLE:'IDLE', MANUAL:'MANUAL', LEARN_PERIM:'LEARN',
         AUTO:'AUTO', RETRACE:'RETRACE', BOG:'BOG', OBS_AVOID:'OBSTACLE',
-        RETURN:'RETURN', PAUSED:'PAUSED', MOTORS_OFFLINE:'MOT OFF'
+        NUDGE:'NUDGE', PAUSED:'PAUSED', MOTORS_OFFLINE:'MOT OFF'
       };
       badge.textContent = stateLabels[d.state] || d.state || '?';
     }
@@ -2021,7 +2056,7 @@ async function main() {
     // Active mode highlighting on ALL buttons
     document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active-mode'));
     const stMap = {
-      MANUAL:'btn-mode-manual', AUTO:'btn-mode-auto', RETURN:'btn-mode-return',
+      MANUAL:'btn-mode-manual', AUTO:'btn-mode-auto',
       LEARN_PERIM:'btn-learn'
     };
     const activeId = stMap[d.state];
@@ -2109,8 +2144,6 @@ async function main() {
     () => sendCtrlCmd(Commands.setMode('MANUAL')));
   document.getElementById('btn-mode-auto').addEventListener('click',
     () => sendCtrlCmd(Commands.setMode('AUTO')));
-  document.getElementById('btn-mode-return').addEventListener('click',
-    () => sendCtrlCmd(Commands.setMode('AUTO_RETURN')));
   document.getElementById('btn-pause').addEventListener('click',
     () => sendCtrlCmd(Commands.pauseToggle()));
   document.getElementById('btn-blade').addEventListener('click',
@@ -2145,7 +2178,7 @@ async function main() {
     'track_width_m',
     'wheel_radius_m','motor_pole_pairs','gear_ratio',
     'antenna_fwd_m','antenna_right_m',
-    'steer_to_cut_m','cut_disc_radius_m','cut_width_m','strip_overlap_m',
+    'steer_to_cut_m','cut_disc_radius_m','cut_width_m','strip_overlap_m','turn_margin_m',
     'cut_height_min_mm','cut_height_max_mm',
     'blade_motor_pole_pairs','blade_target_rpm',
     'pp_lookahead_base_m','pp_lookahead_k',
@@ -2168,7 +2201,7 @@ async function main() {
     track_width_m: 0.50,
     wheel_radius_m: 0.10, motor_pole_pairs: 7, gear_ratio: 20.0,
     antenna_fwd_m: -0.20, antenna_right_m: 0.00,
-    steer_to_cut_m: 0.0, cut_disc_radius_m: 0.21, cut_width_m: 0.38, strip_overlap_m: 0.02,
+    steer_to_cut_m: 0.0, cut_disc_radius_m: 0.21, cut_width_m: 0.38, strip_overlap_m: 0.02, turn_margin_m: 0.10,
     cut_height_min_mm: 35, cut_height_max_mm: 90,
     blade_motor_pole_pairs: 10, blade_target_rpm: 2800,
     pp_lookahead_base_m: 0.40, pp_lookahead_k: 0.80,
@@ -2187,6 +2220,13 @@ async function main() {
   // through the settings file and "Save to Mower" — backs up the hard-won cal so
   // it survives an NVS wipe / new board. bnocal = 44 hex chars (22 bytes), q = 0..9.
   let cfgCalHex = null, cfgCalQ = null;
+
+  // Populate the editable config form from the mower's STATUS only ONCE (on first
+  // connect) or on an explicit "Refresh from mower". STATUS arrives periodically
+  // and carries the full cfg block, so without this guard every push repainted the
+  // form — silently clobbering manual edits and a just-loaded settings file (and
+  // the BNO cal that rides alongside) a second or two after the user set them.
+  let cfgFormSynced = false;
 
   function cfgUpdateDerived(cfg) {
     const fw        = cfg.footprint_width_m  || 0;
@@ -2225,19 +2265,27 @@ async function main() {
     cfgUpdateDerived(cfg);
   }
 
-  // Update derived values live as inputs change
+  // Update derived values live as inputs change. Editing also "claims" the form so
+  // a periodic STATUS push can't overwrite what the operator is typing.
   document.getElementById('cfg-form').addEventListener('input', () => {
+    cfgFormSynced = true;
     cfgUpdateDerived(cfgReadForm());
   });
 
   // _cfgPopulateFromStatus is called from ble.onStatus (defined above)
   function _cfgPopulateFromStatus(json) {
-    cfgPopulate(json.cfg);
-    // Capture the mower's saved BNO calibration so it can be backed up to file.
-    if (json.cfg && json.cfg.bnocal) {
-      cfgCalHex = json.cfg.bnocal;
-      cfgCalQ   = (json.cfg.bnocalq != null) ? json.cfg.bnocalq : null;
+    // Only sync the editable form the FIRST time (or after an explicit refresh) so
+    // periodic STATUS pushes can't overwrite the operator's edits / loaded file.
+    if (!cfgFormSynced) {
+      cfgPopulate(json.cfg);
+      // Capture the mower's saved BNO calibration so it can be backed up to file.
+      if (json.cfg && json.cfg.bnocal) {
+        cfgCalHex = json.cfg.bnocal;
+        cfgCalQ   = (json.cfg.bnocalq != null) ? json.cfg.bnocalq : null;
+      }
+      cfgFormSynced = true;
     }
+    // Cut-height slider bounds always track the mower (not part of the edit form).
     const sl = document.getElementById('cut-height-slider');
     sl.min = json.cfg.cut_height_min_mm ?? 35;
     sl.max = json.cfg.cut_height_max_mm ?? 90;
@@ -2259,7 +2307,8 @@ async function main() {
   });
 
   document.getElementById('cfg-reset-btn').addEventListener('click', () => {
-    // Re-request status to restore fields from mower
+    // Explicit "refresh from mower": allow the next STATUS to repopulate the form.
+    cfgFormSynced = false;
     if (ble.connected) ble.sendCommand(Commands.requestStatus());
     else showToast('Not connected — showing last received values', false);
   });
@@ -2333,6 +2382,7 @@ async function main() {
         throw new Error('no settings object found');
       }
       const r = applyConfigSettings(settings);
+      cfgFormSynced = true;   // loaded values own the form — don't let STATUS overwrite them
       // Calibration: top-level imu_cal (current format) or legacy inside settings.
       const cal = obj.imu_cal || (settings.bnocal ? { bnocal: settings.bnocal, bnocalq: settings.bnocalq } : null);
       let calNote = '';

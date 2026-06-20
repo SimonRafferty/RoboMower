@@ -226,7 +226,7 @@ static void ble_notify_fragmented(BLECharacteristic *pChar, const String &payloa
 /** State name strings — must match RobotState enum order. */
 static const char *k_state_names[] = {
     "INIT","IDLE","MANUAL","LEARN_PERIM","AUTO","RETRACE",
-    "BOG","OBS_AVOID","RETURN","PAUSED","MOTORS_OFFLINE"
+    "BOG","OBS_AVOID","NUDGE","PAUSED","MOTORS_OFFLINE"
 };
 
 static String build_telemetry_json() {
@@ -271,11 +271,26 @@ static String build_telemetry_json() {
     double pos_lat = 0.0, pos_lon = 0.0;
     rtk_gps_enu_to_latlon(pose.x, pose.y, &pos_lat, &pos_lon);
 
-    char buf[832];   // headroom for IMU calibration + posLat/posLon fields
+    // RAW GPS/RTK steering-centre as lat/lon (same frame as the EKF arrow), so the
+    // PWA can draw a second arrow and the operator can see how far the raw fix
+    // differs from the fused EKF position — even when the fix reports Fixed. Uses
+    // the GPS steering-centre ENU (antenna offset already applied), not the antenna
+    // lat/lon, so any divergence is the EKF smoothing/lag, not the antenna offset.
+    double gps_lat = 0.0, gps_lon = 0.0;
+    if (gps.valid) rtk_gps_enu_to_latlon(gps.enu_east_m, gps.enu_north_m,
+                                         &gps_lat, &gps_lon);
+    // GPS-based heading = last straight-run travel chord (0=N, CW+, rad). Holds the
+    // last value between qualifying straight segments (255/stale is fine — it's a
+    // diagnostic). 0 until the first event.
+    float gps_hdg = 0.0f;
+    { float gth = 0.0f; if (ekf_get_gps_heading_event(nullptr, &gth, nullptr, nullptr)) gps_hdg = gth; }
+
+    char buf[928];   // headroom for IMU calibration + posLat/posLon + raw-GPS fields
     int len = snprintf(buf, sizeof(buf),
         "{\"t\":%lu,\"state\":\"%s\","
         "\"x\":%.3f,\"y\":%.3f,\"hdg\":%.3f,"
         "\"posLat\":%.7f,\"posLon\":%.7f,"
+        "\"gpsLat\":%.7f,\"gpsLon\":%.7f,\"gpsHdg\":%.3f,"
         "\"lat\":%.7f,\"lon\":%.7f,"
         "\"fix\":%d,\"sat\":%d,\"hdop\":%.2f,\"difAge\":%.1f,\"vel\":%.3f,"
         "\"hprog\":%.3f,\"sprog\":%.3f,"
@@ -295,6 +310,7 @@ static String build_telemetry_json() {
         (unsigned long)millis(), sname,
         pose.x, pose.y, pose.heading,
         pos_lat, pos_lon,
+        gps_lat, gps_lon, gps_hdg,
         gps.lat_deg, gps.lon_deg,
         (int)gps.fix_type, (int)gps.sat_count, gps.hdop, gps.dif_age_s, speed,
         coverage_planner_get_headland_progress(),
@@ -619,7 +635,7 @@ static String build_status_json() {
         "\"heading_kp\":%.2f,\"heading_kd\":%.2f,\"manual_max_yaw_rate\":%.2f,"
         "\"wheel_pi_kp\":%.2f,\"wheel_pi_ki\":%.2f,"
         "\"manual_max_duty\":%.2f,\"manual_max_speed_ms\":%.3f,"
-        "\"min_turn_radius_m\":%.3f,\"min_move_duty\":%.3f%s},",
+        "\"min_turn_radius_m\":%.3f,\"min_move_duty\":%.3f,\"turn_margin_m\":%.3f%s},",
         mc.footprint_width_m, mc.footprint_length_m,
         mc.track_width_m,
         mc.wheel_radius_m, (int)mc.motor_pole_pairs, mc.gear_ratio,
@@ -638,7 +654,7 @@ static String build_status_json() {
         mc.heading_kp, mc.heading_kd, mc.manual_max_yaw_rate,
         mc.wheel_pi_kp, mc.wheel_pi_ki,
         mc.manual_max_duty, mc.manual_max_speed_ms,
-        mc.min_turn_radius_m, mc.min_move_duty, calfld);
+        mc.min_turn_radius_m, mc.min_move_duty, mc.turn_margin_m, calfld);
     out += cbuf;
 
     // Append system log array (last N messages, newest last)

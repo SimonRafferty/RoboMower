@@ -39,7 +39,7 @@ enum RobotState {
     STATE_RETRACE,        ///< CUTTING_OVERLOADED recovery: retrace strip at max height
     STATE_BOG_RECOVERY,   ///< CUTTING_STALLED recovery: progressive height raise
     STATE_OBSTACLE_AVOID, ///< Obstacle detected: back up and re-plan
-    STATE_AUTO_RETURN,    ///< Plan complete: return to perimeter start point
+    STATE_AUTO_NUDGE,     ///< AUTO held; operator drives via TX to nudge, then resumes (CH4 3rd pos)
     STATE_PAUSED,         ///< Auto mowing paused by operator (CH7); planner position held
     STATE_MOTORS_OFFLINE, ///< PILZ fired or battery disconnected; ESP32 running on supercap
 };

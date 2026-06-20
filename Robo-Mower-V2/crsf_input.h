@@ -25,7 +25,7 @@
 #define CRSF_CH_STEERING    0   ///< CH1: 172=full left, 992=centre, 1811=full right
 #define CRSF_CH_THROTTLE    1   ///< CH2: 172=full reverse, 992=stop, 1811=full forward
 #define CRSF_CH_CUT_HEIGHT  2   ///< CH3: 172=lowest cut height, 1811=highest
-#define CRSF_CH_MODE        3   ///< CH4: raw<496=MANUAL, 496-1316=AUTO, >1316=AUTO+RETURN
+#define CRSF_CH_MODE        3   ///< CH4: raw<496=MANUAL, 496-1316=AUTO, >1316=NUDGE (TX-driven, AUTO held)
 #define CRSF_CH_LEARN       4   ///< CH5: raw>1316=perimeter learning active
 #define CRSF_CH_ARM         5   ///< CH6: raw>496=ARMED (see config.h CH6_ARMED_THRESHOLD)
 #define CRSF_CH_SPARE7      6   ///< CH7: pause (latching switch) — see config.h CRSF_CH_PAUSE / CH7_PAUSE_THRESHOLD

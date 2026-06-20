@@ -12,7 +12,7 @@
 // NVS storage: same "mower" namespace as nvs_storage.cpp to avoid wasting slots.
 // Key must be ≤ 15 characters.
 static const char *k_nvs_ns  = "mower";
-static const char *k_nvs_key = "mow_cfg_v13"; // bumped 2026-06-17: refresh compile-time defaults to the operator's saved config (no struct change; bump forces the new defaults past any stale v12 blob). v12 added min_move_duty; v11 added footprint W×L box + track_width_m
+static const char *k_nvs_key = "mow_cfg_v14"; // bumped 2026-06-19: added turn_margin_m (ring-0 inset). v13 refreshed defaults; v12 added min_move_duty; v11 added footprint W×L box + track_width_m
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -59,6 +59,7 @@ static const MowerConfig k_defaults = {
     /* manual_max_speed_ms    */ MANUAL_MAX_SPEED_MS,
     /* min_turn_radius_m      */ MIN_TURNING_RADIUS_M,
     /* min_move_duty          */ MIN_MOVE_DUTY,
+    /* turn_margin_m          */ TURN_MARGIN_M,
 };
 
 static MowerConfig s_cfg;
@@ -175,6 +176,11 @@ float mower_config_strip_step_m() {
     MowerConfig mc = mower_config_get();
     float step = mc.cut_width_m - mc.strip_overlap_m;
     return (step > 0.01f) ? step : 0.01f;  // guard against bad config (A8)
+}
+
+float mower_config_turn_margin_m() {
+    MowerConfig mc = mower_config_get();
+    return (mc.turn_margin_m > 0.0f) ? mc.turn_margin_m : 0.0f;  // clamp negatives to off
 }
 
 float mower_config_min_turn_radius_m() {

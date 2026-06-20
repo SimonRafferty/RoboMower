@@ -110,7 +110,7 @@ EdgeTX recognises this frame natively (battery sensor).
 FlightMode) are consumed by EdgeTX internally and are **not** passed to Lua —
 all data needed by the widget must be in this frame.
 
-**Payload: 19 bytes** (15 before firmware 2026-06-10; the Lua widget accepts both)
+**Payload: 23 bytes** (15 before 2026-06-10, 19/20 before 2026-06-19, 22 before the beep-seq byte; the Lua widget accepts all — it length-guards each field)
 
 | Offset | Type | Unit | Description |
 |--------|------|------|-------------|
@@ -126,6 +126,22 @@ all data needed by the widget must be in this frame.
 | 11–14 | uint32 | dm² | Session mowed area (big-endian) |
 | 15–16 | uint16 | V×100 | Battery voltage (big-endian) — duplicated here so the widget does not depend on the EdgeTX `RxBt` sensor |
 | 17–18 | uint16 | deg×10 | Heading 0–359.9° (big-endian) — duplicated here so the widget does not depend on the EdgeTX `Yaw` sensor |
+| 19 | uint8 | bitfield | BNO055 calibration: bits 7:6 sys, 5:4 gyro, 3:2 accel, 1:0 mag (each 0–3) |
+| 20 | uint8 | enum | AUTO-start gate reason (0=OK/not gated; Lua banners it ~2 s) — see below |
+| 21 | uint8 | deg/2 | Next-waypoint bearing, 0–179 = 0–358° (0=N, CW+), **255 = no waypoint**. Lua draws a yellow compass line |
+| 22 | uint8 | counter | Beep sequence — incremented per `request_beep()`. Carried in every frame (not one-shot); the Lua plays the tone (type in flags bits 7:6) when this value advances, so a dropped frame can't lose a beep |
+
+**AUTO-start gate reason (offset 20):**
+
+| Value | Meaning |
+|-------|---------|
+| 0 | Not gated / OK |
+| 1 | No perimeter taught |
+| 2 | No GPS position (EKF unseeded) |
+| 3 | Heading not GPS-established (drive a straight run) |
+| 4 | GPS fix not RTK (need Float/Fixed) |
+| 5 | EPE / Uncertainty too high |
+| 6 | Mower outside perimeter |
 
 **State values (offset 0):**
 
@@ -139,7 +155,7 @@ all data needed by the widget must be in this frame.
 | 5 | RETRACE | Overload recovery |
 | 6 | BOG | Stall recovery |
 | 7 | OBS-AVOID | Obstacle avoidance |
-| 8 | RETURN | Returning to start |
+| 8 | NUDGE | AUTO held; operator drives via TX, then resumes |
 | 9 | PAUSED | Mowing paused |
 | 10 | MOT-OFF | Motors offline |
 
@@ -165,7 +181,7 @@ all data needed by the widget must be in this frame.
 | 5 | Battery WARNING/LOW — Lua shows flashing battery banner (was "obstacle near", never implemented) |
 | 7:6 | Beep request (2-bit field, see below) |
 
-**Beep request (flags bits 7:6) — one-shot, auto-cleared after transmission:**
+**Beep request (flags bits 7:6) — beep TYPE, carried in every frame (no longer one-shot):**
 
 | Bits 7:6 | Value | Meaning |
 |----------|-------|---------|
@@ -173,6 +189,8 @@ all data needed by the widget must be in this frame.
 | `01` | 1 | Confirm (short tone) |
 | `10` | 2 | Warning (attention) |
 | `11` | 3 | Fault (critical) |
+
+The type alone is **not** an edge — pair it with the **beep sequence counter (byte 22)**. `request_beep()` bumps byte 22 per event; the Lua plays the tone of bits 7:6 only when byte 22 changes. This survives dropped frames (the next frame still carries the new sequence) and is handled in the widget's `background()` path so it beeps even when the widget isn't the focused screen — essential for per-corner LEARN confirmation.
 
 **Decoding in Lua:**
 ```lua

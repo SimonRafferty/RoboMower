@@ -22,17 +22,19 @@
 #include "geometry.h"        // for clampf(), wrapAngle()
 #include "heading_fusion.h"  // offset gate + wrap-safe EMA + compose
 #include "imu.h"             // imu_get_heading_fused(), imu_is_fault()
-#include <Preferences.h>     // NVS persistence of the heading offset
+#include "rtk_gps.h"         // GpsFix enum (GPS_FIX_RTK_FIXED) for the trust gate
+#include "sys_log.h"         // PWA-visible recovery log (no field serial)
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <cmath>
 #include <cstring>
 
-static const char* EKF_NVS_NS      = "imu";
-// "hdgoff2": bumped 2026-06-15 to start the GPS-trimmed offset clean (0) while
-// debugging a heading-flip seen in AUTO; abandons any earlier persisted value.
-static const char* EKF_NVS_KEY_OFF = "hdgoff2";
+// Heading offset is NO LONGER persisted to NVS (2026-06-19). The BNO055 heading
+// is treated as RELATIVE (0° at boot — see ekf_predict boot-zero) because its
+// calibration does not survive a power cycle, so a saved offset trimmed in a
+// previous session is meaningless. The offset is re-acquired from the GPS travel
+// chord every session (fast on the first lock, then slow EMA).
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  EKF state (protected by g_ekf_mutex)
@@ -63,15 +65,15 @@ static bool  s_prev_hdg_valid = false;
 static float s_hdg_turn_accum = 0.0f;
 
 /** GPS-trimmed heading offset: s_theta = imu_get_heading_fused() + s_hdg_offset.
- *  Loaded from NVS at ekf_init(); trimmed in ekf_update_gps(); persisted by
- *  ekf_save_heading_offset_if_due(). Survives RESETEKF (mounting/declination). */
+ *  Session-dynamic, NOT persisted: starts at -bno(boot) so heading reads 0° at
+ *  power-up (relative), then the GPS travel chord trims it to absolute. */
 static float s_hdg_offset      = 0.0f;
 /** Previous BNO heading, for per-tick turn accumulation. */
 static float s_prev_bno_hdg    = 0.0f;
 static bool  s_prev_bno_valid  = false;
-/** Last value/time persisted to NVS (throttle). */
-static float s_hdg_offset_saved = 0.0f;
-static uint32_t s_hdg_offset_save_ms = 0;
+/** True until the first valid BNO sample has captured the boot orientation as the
+ *  heading zero (relative-at-boot). Cleared once -bno(boot) is applied. */
+static bool  s_boot_zero_pending = true;
 
 /** False until the first valid GPS update has been used to seed the EKF position.
  *  On boot the EKF starts at (0,0) which may be many metres from the actual ENU
@@ -79,6 +81,12 @@ static uint32_t s_hdg_offset_save_ms = 0;
  *  this one cold-start update so the EKF teleports to the GPS position rather than
  *  rejecting every update until the user physically returns to the origin point. */
 static bool  s_gps_seeded = false;
+
+/** millis() at ekf_init() and at the moment the EKF first seeds — drive the
+ *  cold-start "seed only on RTK / fallback timeout" and "relax the gate for a
+ *  window after seeding" logic in ekf_update_gps(). */
+static uint32_t s_boot_ms = 0;
+static uint32_t s_seed_ms = 0;
 
 /** Per-axis position variance from the last GPS fix (= sigma²).
  *  Set by ekf_update_gps(); held constant in ekf_predict() so reported
@@ -252,28 +260,17 @@ void ekf_init() {
     s_prev_hdg_north = 0.0f;
     s_hdg_turn_accum = 0.0f;
     s_gps_seeded     = false;
+    s_boot_ms        = millis();
+    s_seed_ms        = 0;
 
-    // Load the persisted heading offset (mounting + declination). NOT reset by
-    // RESETEKF — it is a physical constant, only re-trimmed by GPS.
-    //
-    // Guard: the saved offset is only meaningful if the BNO055 booted with its
-    // calibration profile (absolute heading). If no profile loaded, the BNO
-    // heading starts RELATIVE (resets to power-up orientation), so a saved offset
-    // — which was trimmed against an absolute heading — would be wrong. In that
-    // case start at 0 and let the GPS travel chord re-trim it this session.
-    {
-        Preferences p;
-        p.begin(EKF_NVS_NS, /*readOnly=*/true);
-        s_hdg_offset = p.getFloat(EKF_NVS_KEY_OFF, 0.0f);
-        p.end();
-        if (!imu_profile_loaded()) {
-            s_hdg_offset = 0.0f;
-            DBG_PRINTLN("[EKF] No BNO cal profile at boot — heading offset reset to 0 "
-                        "(BNO heading is relative; will re-trim from GPS)");
-        }
-        s_hdg_offset_saved = s_hdg_offset;
-        s_prev_bno_valid   = false;
-    }
+    // Heading offset is session-dynamic and NOT persisted (the BNO055 cal does not
+    // survive a power cycle, so the BNO heading is RELATIVE at boot). Start the
+    // offset at 0 and arm the boot-zero: the first valid BNO sample in
+    // ekf_predict() sets s_hdg_offset = -bno so heading reads 0° regardless of
+    // orientation, then the GPS travel chord trims it to absolute (fast first lock).
+    s_hdg_offset       = 0.0f;
+    s_boot_zero_pending = true;
+    s_prev_bno_valid   = false;
 
     s_heading_established = false;
     s_gps_hdg_seq         = 0;
@@ -303,13 +300,20 @@ void ekf_predict(float v_left, float v_right, float dt) {
         return;
     }
 
-    // ── Heading from BNO absolute fusion + GPS-trimmed offset ────────────────
+    // ── Heading from BNO (relative) + GPS-trimmed offset ─────────────────────
     if (bno_ok) {
         if (s_prev_bno_valid) {
             s_hdg_turn_accum += fabsf(wrapAngle(bno - s_prev_bno_hdg));
         }
         s_prev_bno_hdg   = bno;
         s_prev_bno_valid = true;
+        // Boot-zero: capture the power-up orientation as heading 0° (the BNO is
+        // treated as relative). Only before the GPS has established absolute
+        // heading — after that the GPS-trimmed offset owns the reference.
+        if (s_boot_zero_pending && !s_heading_established) {
+            s_hdg_offset        = wrapAngle(-bno);
+            s_boot_zero_pending = false;
+        }
         s_theta = heading_compose(bno, s_hdg_offset);
     } else {
         // BNO faulted — hold s_theta, do not accrue turn (AUTO pauses). Drop the
@@ -343,7 +347,8 @@ void ekf_predict(float v_left, float v_right, float dt) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void ekf_update_gps(float gps_east, float gps_north, int fix_type,
-                     float hdop, float dif_age_s, float heading_rad) {
+                     float hdop, float dif_age_s, float heading_rad,
+                     float epe_2d_m, bool epe_valid) {
     // ── Transform antenna position to steering-centre position ───────────────
     // The GPS antenna is offset from the steering centre:
     //   sc = antenna - forward_offset * heading_unit - right_offset * right_unit
@@ -356,24 +361,29 @@ void ekf_update_gps(float gps_east, float gps_north, int fix_type,
                                + mc.antenna_right_m * sinf(heading_rad);
 
     // ── Measurement noise R (diagonal, 2×2) ─────────────────────────────────
-    // sigma is computed continuously from three inputs:
+    // Prefer the receiver's REAL position-error estimate (EPE / PQTMEPE) when it
+    // is available — it is measured, not fabricated. Otherwise fall back to the
+    // fix-type sigma table, computed from:
     //   fix_type  — baseline noise floor per fix quality
     //   HDOP      — satellite geometry (1.0 ideal, higher = worse)
     //   dif_age_s — stale NTRIP correction penalty (+5% per second beyond 5 s)
-    // This avoids binary jumps between RTK fixed and float; float at HDOP=1
-    // and fresh corrections gives ~5 cm accuracy, which is nearly as good as fixed.
-    // Base values match the PWA gpsAccLabel formula: acc = base × HDOP × √2
-    // so that ekf_get_position_uncertainty() and the WebUI display the same number.
-    float sigma_base;
-    switch (fix_type) {
-        case 4:  sigma_base = 0.01f;  break;  // RTK fixed  ~1 cm
-        case 5:  sigma_base = 0.15f;  break;  // RTK float  ~15 cm
-        case 2:  sigma_base = 0.50f;  break;  // DGPS       ~50 cm
-        default: sigma_base = 1.00f;  break;  // GPS/none   ~100 cm
-    }
-    float sigma = sigma_base * fmaxf(hdop, 1.0f) * 1.41421356f;  // ×√2 = 2D RMS
-    if (fix_type >= 4 && dif_age_s > 5.0f) {
-        sigma *= (1.0f + (dif_age_s - 5.0f) * 0.05f);
+    // The fallback base values match the PWA gpsAccLabel formula (base×HDOP×√2),
+    // so ekf_get_position_uncertainty() and the WebUI display the same number.
+    float sigma;
+    if (epe_valid) {
+        sigma = epe_2d_m;                       // real 2-D horizontal error (m)
+    } else {
+        float sigma_base;
+        switch (fix_type) {
+            case 4:  sigma_base = 0.01f;  break;  // RTK fixed  ~1 cm
+            case 5:  sigma_base = 0.15f;  break;  // RTK float  ~15 cm
+            case 2:  sigma_base = 0.50f;  break;  // DGPS       ~50 cm
+            default: sigma_base = 1.00f;  break;  // GPS/none   ~100 cm
+        }
+        sigma = sigma_base * fmaxf(hdop, 1.0f) * 1.41421356f;  // ×√2 = 2D RMS
+        if (fix_type >= 4 && dif_age_s > 5.0f) {
+            sigma *= (1.0f + (dif_age_s - 5.0f) * 0.05f);
+        }
     }
     sigma = clampf(sigma, 0.005f, 5.0f);
     float r_val = sigma * sigma;
@@ -386,51 +396,92 @@ void ekf_update_gps(float gps_east, float gps_north, int fix_type,
 
     xSemaphoreTake(g_ekf_mutex, portMAX_DELAY);
 
-    // ── Innovation gate ───────────────────────────────────────────────────────
-    // 5 m minimum: catches genuine multipath / NTRIP jumps while allowing the
-    // EKF to recover if dead-reckoning has drifted several metres from GPS
-    // (e.g. after a cold-start with a stale heading, or a long GPS outage).
+    // ── Innovation gate (cold-start hardened) ─────────────────────────────────
+    // The old gate rejected every fix > max(5σ, 5 m) from the state after the
+    // first cold-start seed. If that seed was a transient bad RTK-Fixed (e.g. the
+    // base still re-surveying), the EKF locked onto it and could never recover —
+    // the "Fixed but 100 m off, creeping" failure. New rules:
+    //   • Seed only on a real RTK fix (Float/Fixed), or after a fallback timeout
+    //     so a DGPS-only site is never stuck unseeded.
+    //   • A fresh RTK-FIXED fix ALWAYS snaps (it is cm-accurate — trust it over a
+    //     possibly-bad EKF state). This is "if RTK Fixed, use it regardless".
+    //   • For a window after seeding, ANY fix snaps so a poor seed self-corrects.
+    //   • Otherwise the gate still rejects large jumps on degraded/stale fixes.
     float innov_e    = sc_east  - s_x;
     float innov_n    = sc_north - s_y;
     float innov_norm = sqrtf(innov_e*innov_e + innov_n*innov_n);
     float gate_m     = fmaxf(5.0f * sigma, 5.0f);
 
+    bool trust_fix = (fix_type == GPS_FIX_RTK_FIXED) &&
+                     (dif_age_s < EKF_TRUST_FIX_MAX_AGE_S);
+
+    bool just_seeded = false;
     if (!s_gps_seeded) {
+        bool rtk      = (fix_type == GPS_FIX_RTK_FIXED);   // Fixed only (Float can be ~2m off under trees)
+        bool fallback = (uint32_t)(millis() - s_boot_ms) > EKF_SEED_FALLBACK_MS;
+        if (!rtk && !fallback) {
+            // Wait for an RTK-Fixed fix (or the fallback timeout) before seeding so a
+            // junk first fix doesn't anchor the whole session.
+            xSemaphoreGive(g_ekf_mutex);
+            return;
+        }
         s_gps_seeded = true;
-        DBG_PRINTF("[EKF] GPS cold-start seed: (%.2f, %.2f) m  sigma=%.3fm\n",
-                   sc_east, sc_north, sigma);
-        // Fall through — cold start bypasses gate, snaps below
-    } else if (innov_norm > gate_m) {
-        DBG_PRINTF("[EKF] GPS innovation %.2fm > gate %.2fm (sigma=%.3fm) — skipping\n",
-                      innov_norm, gate_m, sigma);
-        xSemaphoreGive(g_ekf_mutex);
-        return;
+        s_seed_ms    = millis();
+        just_seeded  = true;   // the seeding fix always snaps below, even via fallback
+        char lbuf[SYS_LOG_MAX_LEN];
+        snprintf(lbuf, sizeof(lbuf),
+                 "EKF: seeded at E%.1f N%.1f (fix %d, sigma %.2fm%s)",
+                 (double)sc_east, (double)sc_north, fix_type, (double)sigma,
+                 rtk ? "" : ", fallback");
+        sys_log_push(lbuf);
+        // Fall through — first seed snaps below.
+    } else {
+        bool relax_window = (uint32_t)(millis() - s_seed_ms) < EKF_GATE_RELAX_MS;
+        if (innov_norm > gate_m && !trust_fix && !relax_window) {
+            DBG_PRINTF("[EKF] GPS innovation %.2fm > gate %.2fm (sigma=%.3fm) — skipping\n",
+                          innov_norm, gate_m, sigma);
+            xSemaphoreGive(g_ekf_mutex);
+            return;
+        }
+        if (innov_norm > gate_m) {
+            // We ARE accepting a large jump (fresh RTK-Fixed or settle window) —
+            // surface it in the PWA log so a re-sync after a bad seed is visible.
+            char lbuf[SYS_LOG_MAX_LEN];
+            snprintf(lbuf, sizeof(lbuf),
+                     "EKF: GPS jump %.0fm accepted (%s) - re-syncing",
+                     (double)innov_norm, trust_fix ? "fresh RTK" : "settle window");
+            sys_log_push(lbuf);
+        }
     }
 
-    // ── Position snap ─────────────────────────────────────────────────────────
-    // GPS provides absolute position at 1 Hz; wheel odometry dead-reckons
-    // between fixes.  Snap directly rather than blending — GPS is more accurate
-    // than odometry over any interval that matters for a lawnmower.
-    s_x = sc_east;
-    s_y = sc_north;
+    // ── Position snap — RTK-FIXED only (Float dead-reckons) ─────────────────────
+    // Float fixes under tree cover can be ~2 m off, so only a FRESH RTK-Fixed fix
+    // (or the very first seeding fix) snaps the position. Otherwise the EKF holds
+    // its dead-reckoned estimate (wheel odometry + BNO heading from ekf_predict)
+    // until Fixed returns — far better than chasing a 2 m Float jump.
+    if (just_seeded || trust_fix) {
+        s_x = sc_east;
+        s_y = sc_north;
 
-    // ── GPS ceiling: force position covariance to GPS accuracy ───────────────
-    // Zero all cross-terms involving position so ekf_predict() cannot build
-    // them beyond the position diagonal (which would violate PSD).
-    s_gps_p_ceil  = r_val;
-    s_P[0][0] = r_val;  s_P[1][1] = r_val;
-    s_P[0][1] = s_P[1][0] = 0.0f;
-    s_P[0][2] = s_P[2][0] = 0.0f;
-    s_P[0][3] = s_P[3][0] = 0.0f;
-    s_P[1][2] = s_P[2][1] = 0.0f;
-    s_P[1][3] = s_P[3][1] = 0.0f;
+        // ── GPS ceiling: force position covariance to GPS accuracy ───────────────
+        // Zero all cross-terms involving position so ekf_predict() cannot build
+        // them beyond the position diagonal (which would violate PSD).
+        s_gps_p_ceil  = r_val;
+        s_P[0][0] = r_val;  s_P[1][1] = r_val;
+        s_P[0][1] = s_P[1][0] = 0.0f;
+        s_P[0][2] = s_P[2][0] = 0.0f;
+        s_P[0][3] = s_P[3][0] = 0.0f;
+        s_P[1][2] = s_P[2][1] = 0.0f;
+        s_P[1][3] = s_P[3][1] = 0.0f;
+    }
 
-    // ── GPS heading-offset trim ──────────────────────────────────────────────
-    // GPS travel direction is the only absolute heading truth. On a STRAIGHT,
-    // MEASURABLE RTK segment the chord IS the heading, so trim the offset toward
-    // (chord − BNO heading) by a slow EMA. Otherwise hold the offset (robust to
-    // GPS outages). No blend into s_theta — heading comes from the BNO.
-    if (fix_type >= 4) {
+    // ── GPS heading-offset trim — RTK-FIXED only ─────────────────────────────
+    // GPS travel direction is the only absolute heading truth, but a Float chord is
+    // measured between positions that can each be ~2 m off, so its direction is junk
+    // and would CORRUPT the offset (the "lost the heading, drive straight to re-lock"
+    // symptom). Trim only on a fresh Fixed chord; between, the heading is held as
+    // BNO + the last good offset (BNO is absolute). First lock therefore needs Fixed.
+    if (trust_fix) {
         if (s_prev_hdg_valid) {
             float dE   = sc_east  - s_prev_hdg_east;
             float dN   = sc_north - s_prev_hdg_north;
@@ -446,7 +497,12 @@ void ekf_update_gps(float gps_east, float gps_north, int fix_type,
                            s_hdg_turn_accum, dist, sigma,
                            HEADING_STRAIGHT_MAX_TURN_RAD,
                            HEADING_FROM_GPS_MIN_DIST_M,
-                           HEADING_GPS_DIST_SIGMA_K)) {
+                           // FIRST lock needs a long/accurate chord (Fixed-favouring);
+                           // once established, a shorter chord trims continuously so
+                           // the offset keeps tracking in RTK-Float while moving (the
+                           // slow EMA averages chord noise) — heading never goes stale.
+                           s_heading_established ? HEADING_GPS_DIST_SIGMA_K_TRIM
+                                                 : HEADING_GPS_DIST_SIGMA_K)) {
                 float z_hdg = atan2f(dE, dN);   // travel dir, 0=N, CW+
                 if (isfinite(z_hdg)) {
                     // Reverse correction: chassis FRONT is 180° opposite when
@@ -457,8 +513,12 @@ void ekf_update_gps(float gps_east, float gps_north, int fix_type,
                     // trim the offset to compensate.
                     if (s_v < -0.03f) z_hdg = wrapAngle(z_hdg + (float)M_PI);
 
-                    s_hdg_offset = heading_offset_ema(s_hdg_offset, z_hdg, bno_hdg,
-                                                      HEADING_OFFSET_TRIM_GAIN);
+                    // Fast first lock: snap the offset to the GPS chord on the very
+                    // first qualifying segment (gain 1.0 → heading absolute in one
+                    // straight run), then refine slowly. This is what makes the
+                    // relative-at-boot heading converge fast to true North.
+                    float gain = s_heading_established ? HEADING_OFFSET_TRIM_GAIN : 1.0f;
+                    s_hdg_offset = heading_offset_ema(s_hdg_offset, z_hdg, bno_hdg, gain);
                     s_heading_established = true;
 
                     // Publish FRONT-facing heading event for odo_calib.
@@ -552,29 +612,12 @@ float ekf_get_heading_offset() {
 }
 
 void ekf_save_heading_offset_if_due() {
-    // Called only from the single 10 Hz EKF hook (Core 1), so the throttle
-    // timestamp s_hdg_offset_save_ms needs no mutex; s_hdg_offset itself is
-    // copied under the mutex below.
-    if (g_ekf_mutex == nullptr) return;
-    xSemaphoreTake(g_ekf_mutex, portMAX_DELAY);
-    float off   = s_hdg_offset;
-    float saved = s_hdg_offset_saved;
-    xSemaphoreGive(g_ekf_mutex);
-
-    uint32_t now = millis();
-    bool time_ok   = (now - s_hdg_offset_save_ms) > HEADING_OFFSET_SAVE_MIN_INTERVAL_MS;
-    bool change_ok = fabsf(wrapAngle(off - saved)) > HEADING_OFFSET_SAVE_MIN_CHANGE_RAD;
-    if (time_ok && change_ok) {
-        Preferences p;
-        p.begin(EKF_NVS_NS, /*readOnly=*/false);
-        p.putFloat(EKF_NVS_KEY_OFF, off);
-        p.end();
-        s_hdg_offset_save_ms = now;
-        xSemaphoreTake(g_ekf_mutex, portMAX_DELAY);
-        s_hdg_offset_saved = off;
-        xSemaphoreGive(g_ekf_mutex);
-        DBG_PRINTF("[EKF] heading offset saved: %.4f rad\n", off);
-    }
+    // Intentionally a no-op (2026-06-19). The heading offset is no longer
+    // persisted to NVS: the BNO055 heading is relative at boot (its calibration
+    // does not survive a power cycle), so a saved offset from a previous session
+    // is meaningless and would mislead the relative-at-boot + GPS-trim scheme. The
+    // offset is re-acquired from the GPS travel chord every session. The call site
+    // (10 Hz hook) is kept so re-enabling persistence later is a one-function change.
 }
 
 void ekf_reset_covariance() {

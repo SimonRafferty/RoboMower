@@ -82,11 +82,22 @@ struct TelemetryData {
     uint32_t session_mowed_dm2;///< Mowed area this session in dm² (coverage_planner)
     uint8_t  calib_status;     ///< BNO055 calibration: bits 7:6 sys, 5:4 gyro,
                                ///< 3:2 accel, 1:0 mag (each 0–3). 0x80 byte 19.
+    uint8_t  auto_deny_code;   ///< AUTO-start gate reason (0=none/OK), 0x80 byte 20.
+                               ///< 1=no perimeter 2=no position 3=heading not set
+                               ///< 4=fix not RTK 5=EPE/uncertainty too high 6=outside perimeter.
+                               ///< The Lua widget banners this for ~2 s.
+    uint8_t  wp_bearing_half;  ///< Bearing to next AUTO waypoint, deg/2 (0–179 =
+                               ///< 0–358°, 0=N CW+), 255=no waypoint. 0x80 byte 21.
+                               ///< The Lua widget draws it as a yellow compass line.
 
-    // ── Beep request (one-shot, packed into flags bits 7:6) ──────────────────
-    uint8_t  beep_request;     ///< 0=none 1=confirm 2=warning 3=fault
-                               ///< Set via request_beep(). Automatically cleared
-                               ///< after the next MOWER_STATUS frame is sent.
+    // ── Beep request (type in flags bits 7:6 + sequence counter, byte 22) ─────
+    // The type is carried in EVERY MOWER_STATUS frame (no longer a one-shot bit);
+    // beep_seq is bumped by request_beep() on each event. The Lua plays a tone
+    // when beep_seq advances, so a single dropped frame can't lose a beep — the
+    // next frame still carries the new sequence. Both fields are owned by the
+    // telemetry module (preserved across crsf_telemetry_update snapshots).
+    uint8_t  beep_request;     ///< 0=none 1=confirm 2=warning 3=fault (latest event)
+    uint8_t  beep_seq;         ///< increments per request_beep(); 0x80 byte 22
 };
 
 
@@ -130,14 +141,15 @@ void crsf_telemetry_update(const TelemetryData &data);
 void crsf_telemetry_service();
 
 /**
- * Request an audible beep on the TX16S via the next MOWER_STATUS frame.
+ * Request an audible beep on the TX16S.
  *
- * Uses raise-only semantics: a higher-severity request is never overwritten
- * by a lower one within the same telemetry cycle. The request is automatically
- * cleared after the MOWER_STATUS frame containing it has been transmitted.
+ * Records the beep type (carried in MOWER_STATUS flags bits 7:6 of every frame)
+ * and increments a sequence counter (byte 22). The Lua widget plays the tone
+ * when the sequence advances, so delivery survives dropped frames — each call
+ * produces exactly one beep on the TX. Latest call wins the type.
  *
  * Thread-safe — protected by the same mutex as crsf_telemetry_update().
  *
- * @param type  One of BEEP_NONE, BEEP_CONFIRM, BEEP_WARNING, BEEP_FAULT.
+ * @param type  One of BEEP_CONFIRM, BEEP_WARNING, BEEP_FAULT (BEEP_NONE ignored).
  */
 void request_beep(uint8_t type);

@@ -52,6 +52,8 @@ struct GpsMeasurement {
     float    dif_age_s;     ///< Seconds since last RTK/DGPS correction received (getDifTime())
     uint32_t timestamp_ms;  ///< millis() at which the NMEA sentence was parsed
     bool     valid;         ///< True if origin is set and fix_type != GPS_FIX_NONE
+    float    epe_2d_m;      ///< Receiver 2-D horizontal position error (m) from PQTMEPE; only meaningful if epe_valid
+    bool     epe_valid;     ///< True if epe_2d_m is a fresh, parsed estimate (else use the fix-type sigma)
 };
 
 
@@ -98,6 +100,16 @@ GpsMeasurement rtk_gps_get_measurement();
  * coarse fixed table. Clamped to [0.005, 5.0] m.
  */
 float rtk_gps_accuracy_m(int fix_type, float hdop);
+
+/**
+ * @brief Best available horizontal-accuracy estimate (2D RMS, metres).
+ *
+ * Prefers the receiver's real position-error estimate (EPE / PQTMEPE) when fresh;
+ * otherwise falls back to rtk_gps_accuracy_m(fix,hdop). Use this for displayed
+ * accuracy and perimeter-corner tagging so a genuine degraded fix reads its true
+ * error instead of a fabricated fix-type value.
+ */
+float rtk_gps_effective_accuracy_m(const GpsMeasurement &m);
 
 
 /**

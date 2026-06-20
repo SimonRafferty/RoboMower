@@ -23,6 +23,7 @@
 #include "mower_config.h"
 #include "clipper_offset.h"
 #include "rtk_gps.h"
+#include "sys_log.h"   // float-inset diagnostics visible in the PWA log (no field serial)
 #include <cmath>
 #include <cfloat>
 #include <cstring>
@@ -67,6 +68,11 @@ static float s_rec_x[MAX_PERIMETER_POINTS];
 /** Raw recording buffer — y coordinates (ENU north, metres). */
 static float s_rec_y[MAX_PERIMETER_POINTS];
 
+/** Raw recording buffer — per-corner GPS accuracy estimate (m) at record time.
+ *  Each corner keeps its OWN fix accuracy so the map shows true per-corner
+ *  confidence (a single Float corner no longer tags the whole perimeter). */
+static float s_rec_acc[MAX_PERIMETER_POINTS];
+
 /** Number of waypoints accumulated in the current recording. */
 static int s_rec_count = 0;
 
@@ -99,6 +105,12 @@ static Polygon s_working_area;
 // provenance (migrated legacy / PWA-drawn perimeters).
 static constexpr float PERIM_LEGACY_ACC_M = 0.05f;
 
+// A recorded corner is "low confidence" (RTK-Float or worse) when its accuracy
+// estimate is at/above this. Above RTK-Fixed even at high HDOP (0.01·hdop·√2 ≈
+// 0.056 m at HDOP 4), below RTK-Float's ~0.21 m — so Fixed corners are never
+// moved while Float corners are pulled inward by their uncertainty radius.
+static constexpr float PERIM_FLOAT_INSET_MIN_ACC = 0.08f;
+
 /** Scratch buffers for lat/lon (de)serialisation — reused at boot and on save. */
 static double s_ll_lat[MAX_PERIMETER_POINTS];
 static double s_ll_lon[MAX_PERIMETER_POINTS];
@@ -106,6 +118,13 @@ static float  s_ll_acc[MAX_PERIMETER_POINTS];
 
 /** Worst-case (max) accuracy over the active perimeter points (m); 0 = perfect. */
 static float  s_perim_acc_max = 0.0f;
+
+/** True if the perimeter was recorded/drawn CLOCKWISE. The polygon is always
+ *  STORED counter-clockwise (the Clipper offsets and breach math rely on that),
+ *  so the spiral planner reverses its ring traversal when this is set, making the
+ *  mow loop run the same rotational sense the operator walked. Persisted (NVS key
+ *  "mow_cw") so it survives reboot. */
+static bool   s_mow_cw = false;
 
 /** Number of points currently held in the canonical lat/lon store (s_ll_*). */
 static int    s_ll_count = 0;
@@ -123,18 +142,22 @@ static float  s_rec_acc_worst = 0.0f;
  * in-memory worst-case accuracy used by the breach margin. No-op (returns false)
  * if no origin is set or the polygon is out of range.
  */
-bool perimeter_save_canonical(const Polygon &enu_poly, float acc) {
+bool perimeter_save_canonical(const Polygon &enu_poly, const float *acc_per_point) {
     GpsOrigin org = rtk_gps_get_origin();
     int m = (int)enu_poly.pts.size();
     if (!org.set || m < 3 || m > MAX_PERIMETER_POINTS) return false;
+    float acc_max = 0.0f;
     for (int i = 0; i < m; i++) {
         double la, lo;
         rtk_gps_enu_to_latlon(enu_poly.pts[i].x, enu_poly.pts[i].y, &la, &lo);
         s_ll_lat[i] = la;
         s_ll_lon[i] = lo;
-        s_ll_acc[i] = acc;
+        float a = (acc_per_point && acc_per_point[i] > 0.0f) ? acc_per_point[i]
+                                                             : PERIM_LEGACY_ACC_M;
+        s_ll_acc[i] = a;
+        if (a > acc_max) acc_max = a;
     }
-    s_perim_acc_max = acc;
+    s_perim_acc_max = acc_max;   // breach margin uses the worst per-point value
     s_ll_count      = m;
     return nvs_save_perimeter_ll(s_ll_lat, s_ll_lon, s_ll_acc, m);
 }
@@ -214,6 +237,69 @@ static void clear_in_memory_state() {
     s_working_area.pts.clear();
 }
 
+/**
+ * @brief Pull low-confidence (RTK-Float) corners inward toward the centroid.
+ *
+ * A corner pressed while the fix was RTK-Float is uncertain by ~0.21 m, so the
+ * recorded point may sit that far OUTSIDE the true wall line — driving to it
+ * pushes the body into the wall. For each such vertex we draw a line to the
+ * polygon centroid and move the point to where it crosses the uncertainty circle
+ * (i.e. inward by the point's own accuracy radius). Fixed corners (acc below
+ * PERIM_FLOAT_INSET_MIN_ACC) are left untouched.
+ *
+ * The move is clamped to half the distance to the centroid (a vertex can never
+ * reach/cross it), and the whole operation is reverted if it would make the
+ * polygon self-intersect (possible on a small or deeply concave perimeter) — the
+ * breach watchdog still protects in that rare case.
+ *
+ * @param poly Polygon to modify in place (vertices are NOT reordered).
+ * @param acc  Per-vertex accuracy (m), index-aligned with poly.pts.
+ * @param n    Number of valid entries in @p acc.
+ */
+static void inset_low_confidence_points(Polygon &poly, const float *acc, int n) {
+    int m = (int)poly.pts.size();
+    if (m < 3 || !acc || n < m) return;
+
+    // Area-weighted centroid (shoelace) — robust to the closing-duplicate vertex.
+    double cx = 0.0, cy = 0.0, a2 = 0.0;
+    for (int i = 0; i < m; i++) {
+        int j = (i + 1) % m;
+        double cr = (double)poly.pts[i].x * poly.pts[j].y
+                  - (double)poly.pts[j].x * poly.pts[i].y;
+        a2 += cr;
+        cx += (poly.pts[i].x + poly.pts[j].x) * cr;
+        cy += (poly.pts[i].y + poly.pts[j].y) * cr;
+    }
+    Point c = (fabsf((float)a2) < 1e-6f)
+                  ? poly.pts[0]
+                  : Point((float)(cx / (3.0 * a2)), (float)(cy / (3.0 * a2)));
+
+    Polygon before = poly;   // for revert-on-self-intersect
+    int moved = 0;
+    for (int i = 0; i < m; i++) {
+        if (acc[i] < PERIM_FLOAT_INSET_MIN_ACC) continue;   // Fixed → leave as-is
+        float dx = c.x - poly.pts[i].x;
+        float dy = c.y - poly.pts[i].y;
+        float d  = sqrtf(dx * dx + dy * dy);
+        if (d < 1e-3f) continue;                            // already at centroid
+        float move = acc[i];
+        if (move > 0.5f * d) move = 0.5f * d;               // never cross centroid
+        poly.pts[i].x += dx / d * move;
+        poly.pts[i].y += dy / d * move;
+        moved++;
+    }
+
+    if (moved > 0 && isSelfIntersecting(poly)) {
+        poly = before;
+        sys_log_push("PERIM: float-inset self-intersect - kept raw corners");
+    } else if (moved > 0) {
+        char line[SYS_LOG_MAX_LEN];
+        snprintf(line, sizeof(line),
+                 "PERIM: float-inset pulled %d low-confidence corner(s) inward", moved);
+        sys_log_push(line);
+    }
+}
+
 
 // ── Module lifecycle ──────────────────────────────────────────────────────────
 
@@ -223,6 +309,7 @@ void perimeter_init() {
     s_rec_count     = 0;
     s_perim_acc_max = 0.0f;
     s_ll_count      = 0;
+    s_mow_cw        = nvs_get_float("mow_cw", 0.0f) > 0.5f;   // recorded walk sense
 
     // The ENU origin is restored in rtk_gps_init() (runs before this in setup()),
     // so it is available here for lat/lon ↔ ENU conversion.
@@ -264,7 +351,7 @@ void perimeter_init() {
         }
         if (origin.set) {
             perim.ensureCCW();
-            if (perimeter_save_canonical(perim, PERIM_LEGACY_ACC_M)) {
+            if (perimeter_save_canonical(perim, nullptr)) {   // legacy default accuracy
                 DBG_PRINTF("[PERIM] Migrated %d-pt legacy ENU perimeter to lat/lon storage\n",
                               (int)perim.pts.size());
             }
@@ -273,6 +360,14 @@ void perimeter_init() {
             s_perim_acc_max = PERIM_LEGACY_ACC_M;
         }
     }
+
+    // Pull low-confidence (RTK-Float) corners inward by their uncertainty radius so
+    // the mow path + breach stay clear of the uncertainty circle. Re-derived from
+    // the RAW canonical store on every boot, so an existing Float perimeter is
+    // corrected WITHOUT re-recording. Done BEFORE ensureCCW so s_ll_acc stays
+    // index-aligned with perim. (Legacy/no-accuracy perimeters tag 0.05 m < the
+    // threshold → no-op. The canonical store keeps the raw corners for the map.)
+    inset_low_confidence_points(perim, s_ll_acc, s_ll_count);
 
     // ── Derive nav boundary + working area from the origin-consistent ENU
     //    perimeter (always recompute so they can never be origin-stale). ──
@@ -343,8 +438,9 @@ bool perimeter_record_point(float x, float y, float acc_m, bool force) {
     }
     if (s_rec_count >= MAX_PERIMETER_POINTS)        return false;
 
-    s_rec_x[s_rec_count] = x;
-    s_rec_y[s_rec_count] = y;
+    s_rec_x[s_rec_count]   = x;
+    s_rec_y[s_rec_count]   = y;
+    s_rec_acc[s_rec_count] = acc_m;   // this corner's own fix accuracy
     s_rec_count++;
     s_rec_last_x = x;
     s_rec_last_y = y;
@@ -395,18 +491,21 @@ static void perimeter_close_track()
 
     int retained = best_j - best_i + 1;
 
-    // Shift retained segment to the front of the buffer.
+    // Shift retained segment to the front of the buffer (keep per-corner accuracy
+    // aligned with its coordinates).
     if (best_i > 0) {
-        memmove(s_rec_x, s_rec_x + best_i, retained * sizeof(float));
-        memmove(s_rec_y, s_rec_y + best_i, retained * sizeof(float));
+        memmove(s_rec_x,   s_rec_x   + best_i, retained * sizeof(float));
+        memmove(s_rec_y,   s_rec_y   + best_i, retained * sizeof(float));
+        memmove(s_rec_acc, s_rec_acc + best_i, retained * sizeof(float));
     }
     s_rec_count = retained;
 
     // Close the polygon: append a copy of the first point.
     // Guard: MAX_PERIMETER_POINTS must have room (retained < MAX_PERIMETER_POINTS).
     if (s_rec_count < MAX_PERIMETER_POINTS) {
-        s_rec_x[s_rec_count] = s_rec_x[0];
-        s_rec_y[s_rec_count] = s_rec_y[0];
+        s_rec_x[s_rec_count]   = s_rec_x[0];
+        s_rec_y[s_rec_count]   = s_rec_y[0];
+        s_rec_acc[s_rec_count] = s_rec_acc[0];
         s_rec_count++;
     }
 
@@ -432,6 +531,10 @@ bool perimeter_finish_recording(char *error_msg) {
 
     // Build polygon from recording buffer
     Polygon poly = build_polygon_from_recording();
+    // Capture the operator's walk direction BEFORE forcing CCW (negative signed
+    // area = clockwise walk). The spiral planner reverses traversal when CW so the
+    // mow loop runs the same rotational sense the operator walked.
+    perimeter_set_mow_clockwise(poly.area() < 0.0f);
     poly.ensureCCW();
 
     // ── Validation check 2: minimum area ──────────────────────────────────
@@ -463,6 +566,39 @@ bool perimeter_finish_recording(char *error_msg) {
                    s_rec_count, (int)poly.pts.size(), poly.area());
     }
 
+    // ── Per-vertex accuracy + inset low-confidence corners ─────────────────
+    // Tag each FINAL vertex with the accuracy of the nearest recorded corner
+    // (robust to ensureCCW reversal, the appended closing point and self-
+    // intersection cleanup; a synthetic vertex with no nearby corner falls back
+    // to the session worst-case). Built from the RAW vertices (before the inset
+    // moves them) so the array stays index-aligned with poly afterwards.
+    static float poly_acc[MAX_PERIMETER_POINTS];
+    {
+        const float acc_fallback = s_rec_acc_worst > 0.0f ? s_rec_acc_worst
+                                                          : PERIM_LEGACY_ACC_M;
+        const float MATCH_MAX_D2 = 0.25f;   // (0.5 m)² — beyond this it's synthetic
+        int np = (int)poly.pts.size();
+        for (int i = 0; i < np && i < MAX_PERIMETER_POINTS; i++) {
+            float bestd = FLT_MAX;
+            int   bestk = -1;
+            for (int k = 0; k < s_rec_count; k++) {
+                float dx = poly.pts[i].x - s_rec_x[k];
+                float dy = poly.pts[i].y - s_rec_y[k];
+                float d  = dx * dx + dy * dy;
+                if (d < bestd) { bestd = d; bestk = k; }
+            }
+            poly_acc[i] = (bestk >= 0 && bestd <= MATCH_MAX_D2) ? s_rec_acc[bestk]
+                                                                : acc_fallback;
+        }
+    }
+    // Keep the RAW recorded corners for the canonical store (so the map still shows
+    // where you walked, with the uncertainty circles), then pull low-confidence
+    // (RTK-Float) corners inward by their uncertainty radius on the NAVIGABLE copy
+    // so the mow path + breach stay clear of the circle. The inset is re-derived
+    // identically from the raw canonical store on every boot (perimeter_init).
+    Polygon raw_poly = poly;
+    inset_low_confidence_points(poly, poly_acc, (int)poly.pts.size());
+
     // ── Validation check 4: NAV inset produces valid polygon ───────────────
     Polygon nav = insetPolygonClipper(poly, mower_config_nav_inset_m());
     if (nav.pts.empty() || nav.area() <= 0.0f) {
@@ -485,12 +621,11 @@ bool perimeter_finish_recording(char *error_msg) {
         strncpy(error_msg, "NVS write failed for perimeter", 64);
         return false;
     }
-    // Canonical lat/lon store (origin-independent). Worst-case fix accuracy from
-    // this session feeds the confidence-aware breach margin. A failure here is
-    // non-fatal: the ENU perimeter above still navigates; perimeter_init() will
-    // migrate it on the next boot.
-    if (!perimeter_save_canonical(poly,
-            s_rec_acc_worst > 0.0f ? s_rec_acc_worst : PERIM_LEGACY_ACC_M)) {
+    // Canonical lat/lon store (origin-independent) holds the RAW recorded corners +
+    // per-corner accuracy — the source of truth and what the PWA map draws. The
+    // Float-inset is re-derived from it on every boot. A failure here is non-fatal:
+    // the inset ENU perimeter above still navigates this session.
+    if (!perimeter_save_canonical(raw_poly, poly_acc)) {
         DBG_PRINTLN("[PERIM] WARNING: canonical lat/lon save failed (ENU perimeter still saved)");
     }
     if (!nvs_save_nav_boundary(nav)) {
@@ -594,6 +729,15 @@ Polygon perimeter_get_working_area() {
 
 float perimeter_get_accuracy_m() {
     return s_perim_acc_max;
+}
+
+bool perimeter_mow_clockwise() {
+    return s_mow_cw;
+}
+
+void perimeter_set_mow_clockwise(bool cw) {
+    s_mow_cw = cw;
+    nvs_set_float("mow_cw", cw ? 1.0f : 0.0f);   // persist across reboot
 }
 
 void perimeter_clear() {

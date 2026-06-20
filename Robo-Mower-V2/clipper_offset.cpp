@@ -27,7 +27,8 @@ static constexpr double CLIP_ARC_TOL_M = 0.05;   // round-join arc accuracy
 // under the follower's waypoint buffer.
 static constexpr double CLIP_SIMPLIFY_M = 0.08;
 
-std::vector<Polygon> offsetPolygonClipper(const Polygon &poly, float inset_m) {
+std::vector<Polygon> offsetPolygonClipper(const Polygon &poly, float inset_m,
+                                          bool sharp_corners) {
     std::vector<Polygon> out;
     if (poly.pts.size() < 3 || inset_m <= 0.0f) return out;
 
@@ -41,12 +42,17 @@ std::vector<Polygon> offsetPolygonClipper(const Polygon &poly, float inset_m) {
     Paths64 subject;
     subject.push_back(in);
 
-    // ── Inward offset (negative delta) with round joins ──────────────────────
-    // EndType::Polygon = closed region; JoinType::Round = the standard inward
-    // offset rule (bounded arc at reflex corners, no spike).
+    // ── Inward offset (negative delta) ───────────────────────────────────────
+    // EndType::Polygon = closed region. Round joins bevel every corner into a
+    // short arc — fine for display insets, but on the spiral mow path it turns
+    // each recorded sharp pivot into several >PIVOT_ENTER_DEG sub-turns, so the
+    // node follower pivots repeatedly through one corner (jerky, target flips).
+    // Miter joins keep convex corners SHARP (single turn-point) to match the
+    // operator's sparse pivot recording; the limit squares off acute/reflex ones.
     Paths64 sol = InflatePaths(subject, -(double)inset_m * CLIP_SCALE,
-                               JoinType::Round, EndType::Polygon,
-                               2.0 /*miter limit, unused for round*/,
+                               sharp_corners ? JoinType::Miter : JoinType::Round,
+                               EndType::Polygon,
+                               2.0 /*miter limit (×delta) — keeps >=60° corners sharp*/,
                                CLIP_ARC_TOL_M * CLIP_SCALE);
 
     // ── Clipper Paths64 → Polygons ───────────────────────────────────────────

@@ -42,6 +42,7 @@
 #include "obstacle_map.h"
 #include "geometry.h"
 #include "clipper_offset.h"
+#include "perimeter.h"   // perimeter_mow_clockwise() — mow direction = walk direction
 
 #include <Arduino.h>
 #include <vector>
@@ -91,6 +92,14 @@ static int g_headland_wp_end_idx = 0;
 // g_total_wp_count: total waypoints in the plan (== g_waypoints.size()).
 static int g_total_wp_count      = 0;
 
+// g_progress_hwm: "visited" high-water mark — waypoints [0, hwm) are considered
+// done (mowed or deliberately skipped). After an upset/recovery the resume target
+// is the nearest waypoint in [hwm, end) ONLY, so the mower never jumps BACK to an
+// already-visited point and oscillates (the spiral is ordered, so progress is
+// monotonic). Reset to 0 on a fresh AUTO start; advanced by the state machine as
+// it passes waypoints; survives the re-plan that happens on resume.
+static int g_progress_hwm        = 0;
+
 // Unreachable zone log — retained for API/diagnostic compatibility. The spiral
 // covers everything an inset can reach, so this is left empty.
 struct UnreachableZone {
@@ -100,6 +109,12 @@ struct UnreachableZone {
 };
 static UnreachableZone g_unreachable[MAX_UNREACHABLE_ZONES];
 static int             g_unreachable_count = 0;
+
+// g_mow_reverse: traverse each ring in REVERSE (clockwise) when the perimeter was
+// recorded/drawn clockwise, so the mow loop runs the same rotational sense the
+// operator walked. Set from perimeter_mow_clockwise() at the start of each plan.
+// (The polygon is stored CCW; this only flips the emit order, not the geometry.)
+static bool            g_mow_reverse = false;
 
 
 // ── Ring helper ────────────────────────────────────────────────────────────────
@@ -145,8 +160,16 @@ static Point addRingWaypoints(const Polygon &ring, Point seed,
     }
 
     for (int k = 0; k <= n; k++) {
-        int ci = (start + k)     % n;
-        int ni = (start + k + 1) % n;
+        // Forward (CCW) traversal by default; reversed (CW) when the perimeter was
+        // recorded clockwise, so the mow direction matches the operator's walk.
+        int ci, ni;
+        if (g_mow_reverse) {
+            ci = ((start - k)     % n + n) % n;
+            ni = ((start - k - 1) % n + n) % n;
+        } else {
+            ci = (start + k)     % n;
+            ni = (start + k + 1) % n;
+        }
         float dx = ring.pts[ni].x - ring.pts[ci].x;
         float dy = ring.pts[ni].y - ring.pts[ci].y;
 
@@ -171,6 +194,7 @@ void coverage_planner_init() {
     g_headland_wp_end_idx = 0;
     g_total_wp_count      = 0;
     g_unreachable_count   = 0;
+    g_progress_hwm        = 0;
 }
 
 
@@ -181,6 +205,10 @@ bool coverage_planner_plan(const Polygon &perimeter,
                            const Polygon &workingArea) {
     (void)navBoundary;   // spiral & breach derive directly from the perimeter now
     (void)workingArea;   // working area / headland split is no longer used
+
+    // Mow loop follows the operator's recorded walk direction (CW → reverse the
+    // CCW stored traversal). Latched for this whole plan.
+    g_mow_reverse = perimeter_mow_clockwise();
 
     // ── Validate ────────────────────────────────────────────────────────────
     if (perimeter.pts.size() < 3) {
@@ -230,12 +258,35 @@ bool coverage_planner_plan(const Polygon &perimeter,
     // not-yet-spiralled child regions, so each lobe is completed before the next.
     const float BRIDGE_MAX = 3.0f * step;   // hops longer than this break instead of bridge
 
-    std::vector<Polygon> stack;
-    Polygon outer = perimeter;
-    outer.ensureCCW();
-    stack.push_back(outer);
+    // Ring 0 = the perimeter inset by the configurable TURN MARGIN, so the body
+    // clears corners while pivoting (the recorded perimeter is the steering-centre
+    // path; a sharp in-place turn at a corner sweeps the outer body corner ~half a
+    // track width beyond it). The BREACH limit (safety.cpp) still uses the true
+    // perimeter — this pulls only the MOW PATH in, never the keep-out. turn_margin
+    // = 0 keeps the original "ring 0 IS the perimeter" behaviour.
+    const float turn_margin = mower_config_turn_margin_m();
 
-    Point seed     = outer.pts.empty() ? Point(0.0f, 0.0f) : outer.pts[0];
+    std::vector<Polygon> stack;
+    {
+        std::vector<Polygon> ring0;
+        if (turn_margin > 0.001f) ring0 = offsetPolygonClipper(perimeter, turn_margin, /*sharp=*/true);
+        bool useInset = false;
+        for (auto &r : ring0)
+            if (r.pts.size() >= 3 && fabsf(r.area()) >= SPIRAL_RING_MIN_AREA_M2) { useInset = true; break; }
+        if (!useInset) {                 // no margin set, or inset collapsed a tiny garden
+            ring0.clear();
+            Polygon p = perimeter; p.ensureCCW();
+            ring0.push_back(p);
+        }
+        for (auto &r : ring0) {
+            if (r.pts.size() >= 3 && fabsf(r.area()) >= SPIRAL_RING_MIN_AREA_M2) {
+                r.ensureCCW();
+                stack.push_back(r);
+            }
+        }
+    }
+
+    Point seed     = perimeter.pts.empty() ? Point(0.0f, 0.0f) : perimeter.pts[0];
     Point prevEnd  = seed;
     bool  havePrev = false;
     int   rings    = 0;
@@ -278,8 +329,10 @@ bool coverage_planner_plan(const Polygon &perimeter,
         havePrev = true;
         rings++;
 
-        // Inset this ring by one step → child ring(s) further in.
-        std::vector<Polygon> kids = offsetPolygonClipper(ring, step);
+        // Inset this ring by one step → child ring(s) further in. Sharp (miter)
+        // joins keep each ring's corners as single pivot nodes — consistent with
+        // the sparse pivot-at-corner follower, instead of bevelled multi-pivot arcs.
+        std::vector<Polygon> kids = offsetPolygonClipper(ring, step, /*sharp=*/true);
         int pushed = 0;
         for (auto &c : kids) {
             if (c.pts.size() >= 3 && fabsf(c.area()) >= SPIRAL_RING_MIN_AREA_M2) {
@@ -348,18 +401,20 @@ void coverage_planner_report_obstacle(float x, float y, float approach_heading) 
 void coverage_planner_reset_to_nearest(float x, float y) {
     if (g_total_wp_count == 0) return;
 
-    // Search the ENTIRE waypoint list for the nearest point. g_wp_index is NOT a
-    // reliable "progress" cursor here: load_waypoints_from_planner() drains the planner
-    // via get_next(), leaving g_wp_index == g_total_wp_count. Searching only from
-    // g_wp_index (the old behaviour) scanned an empty range, left the index at the end,
-    // and made the caller's subsequent reload return 0 waypoints — silently ending
-    // AUTO. The state machine's own s_wp_index is the authoritative progress tracker,
-    // so resuming at the globally-nearest waypoint and re-handing the tail
-    // [nearest .. end] is the correct recovery.
-    float best_dist = 1e9f;
-    int   best_idx  = 0;
+    // Resume at the nearest UNVISITED waypoint — search only [g_progress_hwm, end).
+    // Searching the entire list (old behaviour) let the mower jump BACK to an
+    // already-mowed waypoint after an upset in a dense-waypoint area, then flip
+    // between two close points ("continually changing direction"). Restricting to
+    // unvisited keeps the ordered spiral monotonic. Committing the high-water mark
+    // forward to the chosen point means a later upset can't pick anything behind it.
+    int start = g_progress_hwm;
+    if (start < 0)                 start = 0;
+    if (start >= g_total_wp_count) start = g_total_wp_count - 1;  // all visited → last
 
-    for (int i = 0; i < g_total_wp_count; i++) {
+    float best_dist = 1e9f;
+    int   best_idx  = start;
+
+    for (int i = start; i < g_total_wp_count; i++) {
         float dx = g_waypoints[i].x - x;
         float dy = g_waypoints[i].y - y;
         float d  = sqrtf(dx * dx + dy * dy);
@@ -369,7 +424,31 @@ void coverage_planner_reset_to_nearest(float x, float y) {
         }
     }
 
-    g_wp_index = best_idx;
+    g_wp_index     = best_idx;
+    g_progress_hwm = best_idx;   // never resume before the chosen restart point
+}
+
+void coverage_planner_resume_in_order() {
+    // Strict in-order resume: continue from the furthest-reached waypoint (the
+    // high-water mark). No nearest search, so it can never skip inward across
+    // rings. If the operator physically moved the mower, it drives back to the
+    // sequence point — predictable, never abandons coverage.
+    g_wp_index = g_progress_hwm;
+    if (g_wp_index < 0)                g_wp_index = 0;
+    if (g_wp_index > g_total_wp_count) g_wp_index = g_total_wp_count;
+}
+
+// ── coverage_planner progress high-water mark ────────────────────────────────
+
+void coverage_planner_set_progress(int first_unvisited_idx) {
+    // Advance the high-water mark to the first not-yet-reached waypoint (absolute
+    // index). Monotonic: never moves backward. Clamped to the plan size.
+    if (first_unvisited_idx > g_progress_hwm) g_progress_hwm = first_unvisited_idx;
+    if (g_progress_hwm > g_total_wp_count)    g_progress_hwm = g_total_wp_count;
+}
+
+void coverage_planner_reset_progress() {
+    g_progress_hwm = 0;   // fresh AUTO start: nothing visited yet
 }
 
 

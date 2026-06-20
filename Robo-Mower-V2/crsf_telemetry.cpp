@@ -294,10 +294,15 @@ static void sendAttitude(const TelemetryData &d)
  *   [18] (19) uint8_t  heading LSB     }   depend on EdgeTX sensor discovery —
  *                                          RxBt/Yaw sensors can silently vanish)
  *   [19] (20) uint8_t  calib            sys<<6 | gyro<<4 | accel<<2 | mag (each 0–3)
+ *   [20] (21) uint8_t  autoDeny         AUTO-start gate reason (0=OK): 1=no perim,
+ *                                       2=no pos, 3=heading, 4=fix, 5=EPE, 6=outside
+ *   [21] (22) uint8_t  wpBearing        next-waypoint bearing deg/2 (0–179), 255=none
+ *   [22] (23) uint8_t  beepSeq          beep sequence counter (Lua beeps when it
+ *                                       advances; type still in flags bits 7:6)
  */
 static void sendMowerStatus(const TelemetryData &d)
 {
-    uint8_t payload[20];
+    uint8_t payload[23];
 
     payload[0] = d.state;
     payload[1] = d.hprog;
@@ -323,7 +328,10 @@ static void sendMowerStatus(const TelemetryData &d)
     while (hdg >= 360.0f) hdg -= 360.0f;
     pack16be(&payload[17], (uint16_t)(hdg * 10.0f));
 
-    payload[19] = d.calib_status;   // BNO055 calibration (sys/gyro/accel/mag)
+    payload[19] = d.calib_status;    // BNO055 calibration (sys/gyro/accel/mag)
+    payload[20] = d.auto_deny_code;  // AUTO-start gate reason (0 = OK / not gated)
+    payload[21] = d.wp_bearing_half; // next-waypoint bearing deg/2 (255 = none)
+    payload[22] = d.beep_seq;        // beep sequence (Lua beeps when it advances)
     sendFrame(0x80, payload, sizeof(payload));
 }
 
@@ -342,12 +350,13 @@ void crsf_telemetry_init()
 void crsf_telemetry_update(const TelemetryData &data)
 {
     if (xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
-        uint8_t pending_beep = s_data.beep_request;  // preserve pending beep
+        // Beep state is owned by this module (request_beep), not the state-machine
+        // snapshot — preserve it across the copy so a beep is never lost or reset.
+        uint8_t keep_req = s_data.beep_request;
+        uint8_t keep_seq = s_data.beep_seq;
         s_data = data;
-        // Raise-only: don't let the incoming snapshot downgrade a pending beep
-        if (pending_beep > s_data.beep_request) {
-            s_data.beep_request = pending_beep;
-        }
+        s_data.beep_request = keep_req;
+        s_data.beep_seq     = keep_seq;
         xSemaphoreGive(s_mutex);
     }
 }
@@ -383,25 +392,22 @@ void crsf_telemetry_service()
         default:    break;  // unreachable with defined s_frame_order
     }
 
-    // Auto-clear beep request after MOWER_STATUS has been transmitted.
-    // One-shot: the beep is sent exactly once, then reset to BEEP_NONE.
-    if (type == 0x80 && local.beep_request != BEEP_NONE) {
-        if (xSemaphoreTake(s_mutex, 0) == pdTRUE) {
-            s_data.beep_request = BEEP_NONE;
-            xSemaphoreGive(s_mutex);
-        }
-        // If mutex unavailable, the beep is sent again next rotation — acceptable
-    }
+    // Beep is NOT cleared here: the type (flags bits 7:6) and beep_seq (byte 22)
+    // are carried in every MOWER_STATUS frame, and the Lua plays a tone only when
+    // beep_seq advances. This makes delivery robust to dropped/missed frames —
+    // the previous one-shot clear meant a single missed frame lost the beep.
 }
 
 void request_beep(uint8_t type)
 {
-    if (type > BEEP_FAULT) return;  // ignore invalid values
+    if (type == BEEP_NONE || type > BEEP_FAULT) return;  // ignore none/invalid
     if (xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
-        // Raise-only: never downgrade a pending request within one cycle
-        if (type > s_data.beep_request) {
-            s_data.beep_request = type;
-        }
+        // Latest event wins; bump the sequence so the Lua treats this as a new,
+        // distinct beep even if the previous one was the same type. The type is
+        // carried in every frame and the seq survives dropped frames, so the
+        // beep is reliably delivered (the old one-shot bit was easily missed).
+        s_data.beep_request = type;
+        s_data.beep_seq++;
         xSemaphoreGive(s_mutex);
     }
 }

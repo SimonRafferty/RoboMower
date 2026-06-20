@@ -8,7 +8,7 @@
 -- ║    Requires EdgeTX 2.7 or later                                      ║
 -- ║                                                                      ║
 -- ║  CRSF TELEMETRY                                                      ║
--- ║    0x80  MOWER_STATUS — 20-byte custom payload (see spec)            ║
+-- ║    0x80  MOWER_STATUS — 23-byte custom payload (see spec)            ║
 -- ║    GPS / Battery / Attitude / FlightMode are consumed by EdgeTX      ║
 -- ║    internally and do NOT arrive via crossfireTelemetryPop().         ║
 -- ║    Heading and speed are read via getValue() (EdgeTX native sensors).║
@@ -243,7 +243,7 @@ end
 --  COMPASS / MOWER GRAPHIC
 -- ═══════════════════════════════════════════════════════════════════════
 
-local function draw_compass(heading, speed_kmh, ekf_mm, fix_type, is_bog, is_collision)
+local function draw_compass(heading, speed_kmh, ekf_mm, fix_type, is_bog, is_collision, wp_bearing)
 
     -- Ring: fill outer disc, punch out inner disc with background colour
     lcd.drawFilledCircle(CX, CY, OUTER_R,     C_RING)
@@ -295,6 +295,21 @@ local function draw_compass(heading, speed_kmh, ekf_mm, fix_type, is_bog, is_col
         lcd.drawLine(CX, CY, CX, CY - line_len, FSOLID, C_CYAN)
         lcd.drawLine(CX - 3, CY - line_len + 6, CX, CY - line_len, FSOLID, C_CYAN)
         lcd.drawLine(CX + 3, CY - line_len + 6, CX, CY - line_len, FSOLID, C_CYAN)
+    end
+
+    -- Next-waypoint direction (yellow radial line + arrowhead). Drawn behind the
+    -- mower rect so it appears to radiate from the mower toward the target node.
+    -- wp_bearing is the absolute bearing (deg, 0=N CW+); < 0 means "no waypoint".
+    if wp_bearing and wp_bearing >= 0 then
+        local C_YEL  = lcd.RGB(255, 240, 0)
+        local rel    = wp_bearing - heading
+        local wx, wy = rot_xy(CX, CY, INNER_R - 4, rel)
+        lcd.drawLine(CX, CY, wx, wy, FSOLID, C_YEL)
+        local wx2, wy2 = rot_xy(CX, CY, INNER_R - 4, rel + 1.5)  -- thicken slightly
+        lcd.drawLine(CX, CY, wx2, wy2, FSOLID, C_YEL)
+        local hx1, hy1 = rot_xy(CX, CY, INNER_R - 13, rel - 5)
+        local hx2, hy2 = rot_xy(CX, CY, INNER_R - 13, rel + 5)
+        filled_tri(wx, wy, hx1, hy1, hx2, hy2, C_YEL)
     end
 
     -- Mower rect and uncertainty circle
@@ -494,10 +509,13 @@ local function create(zone, opts)
         blade_load = 0,
         fix_type   = 0,
         flags      = 0,
-        prev_flags = 0,   -- used to detect rising edge on beep bits 7:6
+        beep_seq   = nil,   -- last-seen beep sequence (0x80 byte 22); nil until first frame
         direct_decode = false,  -- true once extended 0x80 payload (>=19 B) seen
         calib         = 0,      -- packed BNO calibration byte (0x80 offset 19)
         have_calib    = false,  -- true once a >=20 B payload has been seen
+        deny_code      = 0,     -- AUTO-start gate reason (0x80 offset 20); 0 = OK
+        deny_show_until = 0,    -- getTime() tick until which to banner the reason
+        wp_bearing     = -1,    -- next-waypoint bearing deg (0x80 offset 21); -1 = none
         state_str  = "INIT",
         ekf_mm     = 9999,  -- EKF position uncertainty mm, from MOWER_STATUS offsets 9-10
         voltage    = 0.0,
@@ -510,6 +528,17 @@ end
 local function update(widget, opts)
 end
 
+-- AUTO-start gate reason (MOWER_STATUS offset 20) → banner text.
+-- KEEP IN SYNC with auto_entry_block_code() in state_machine.cpp.
+local AUTO_DENY_TEXT = {
+    [1] = "AUTO: No perimeter taught",
+    [2] = "AUTO: No GPS position",
+    [3] = "AUTO: Heading not set - drive straight",
+    [4] = "AUTO: Need RTK fix (Float/Fixed)",
+    [5] = "AUTO: EPE / Uncertainty too high",
+    [6] = "AUTO: Mower outside perimeter",
+}
+
 -- State enum → name lookup (matches MOWER_STATUS offset 0 values)
 local STATE_NAMES = {
     [0]  = "INIT",
@@ -520,7 +549,7 @@ local STATE_NAMES = {
     [5]  = "RETRACE",
     [6]  = "BOG",
     [7]  = "OBS-AVOID",
-    [8]  = "RETURN",
+    [8]  = "NUDGE",
     [9]  = "PAUSED",
     [10] = "MOT-OFF",
 }
@@ -568,6 +597,39 @@ local function parse_telemetry(widget)
             if #data >= 20 then
                 widget.calib      = data[20] or 0
                 widget.have_calib = true
+            end
+            -- AUTO-start gate reason (firmware >= 2026-06-19): 0 = OK / not gated.
+            -- Banner the reason for ~2 s so the operator can fix it and continue.
+            -- data[21] = offset 20.
+            if #data >= 21 then
+                local dc = data[21] or 0
+                widget.deny_code = dc
+                if dc ~= 0 then
+                    widget.deny_show_until = getTime() + 200   -- 2.0 s (10 ms ticks)
+                end
+            end
+            -- Next-waypoint bearing for the compass (firmware >= 2026-06-19):
+            -- data[22] = offset 21, bearing/2 in degrees (0..179 = 0..358), 255 = none.
+            if #data >= 22 then
+                local wb = data[22] or 255
+                if wb >= 255 then widget.wp_bearing = -1
+                else widget.wp_bearing = (wb * 2) % 360 end
+            end
+            -- Beep (firmware >= 2026-06-19): robust sequence counter. The firmware
+            -- bumps beep_seq (data[23]) per event and carries the type in flags
+            -- bits 7:6 in EVERY frame, so a dropped frame can't lose the beep.
+            -- Played HERE (parse runs in background() too) so the per-corner LEARN
+            -- beep fires even when this widget isn't the focused screen. Edge on
+            -- seq change; the first frame just syncs (no spurious beep on connect).
+            if #data >= 23 then
+                local seq = data[23] or 0
+                if widget.beep_seq == nil then
+                    widget.beep_seq = seq
+                elseif seq ~= widget.beep_seq then
+                    widget.beep_seq = seq
+                    local btype = bit32.band(bit32.rshift(data[7] or 0, 6), 0x03)
+                    if btype ~= 0 then play_beep(btype) end
+                end
             end
         end
         cmd, data = crossfireTelemetryPop()
@@ -623,19 +685,13 @@ local function refresh(widget, event, touchState)
     local is_bog   = bit32.band(flags, 0x04) ~= 0 or widget.state_str == "BOG"
     local is_coll  = widget.state_str == "OBS-AVOID"
 
-    -- Beep request: bits 7:6 of flags (0=none, 1=confirm, 2=warning, 3=fault)
-    -- Trigger only on rising edge so a sustained flag doesn't loop.
-    local beep_now = bit32.band(bit32.rshift(flags, 6), 0x03)
-    local beep_was = bit32.band(bit32.rshift(widget.prev_flags, 6), 0x03)
-    if beep_now ~= 0 and beep_now ~= beep_was then
-        play_beep(beep_now)
-    end
-    widget.prev_flags = flags
+    -- (Beep handling moved into parse_telemetry — runs in background() too, so the
+    --  per-corner LEARN beep fires even when this widget isn't the focused screen.)
 
     lcd.drawFilledRectangle(0, 0, SCR_W, SCR_H, C_BG)
     draw_header(widget.state_str, armed, blade_on, widget.tx_voltage)
     draw_left_panel(ft, ekf_mm, batt_pct, widget.blade_load, widget.cut_mm)
-    draw_compass(widget.heading, widget.speed_kmh, ekf_mm, ft, is_bog, is_coll)
+    draw_compass(widget.heading, widget.speed_kmh, ekf_mm, ft, is_bog, is_coll, widget.wp_bearing)
     draw_right_panel(widget.state_str)
     draw_vesc_bar(widget.state_str, blade_on, is_bog)
     draw_dividers()
@@ -651,6 +707,16 @@ local function refresh(widget, event, touchState)
                 string.format("BATTERY LOW  %.1fV  -  RETURN?", widget.voltage or 0),
                 FXS + FCENT + C_WHITE)
         end
+    end
+
+    -- AUTO-start gate banner: when the operator selects AUTO but a gate blocks it,
+    -- the firmware sends the reason; show it for ~2 s so they can fix it and retry.
+    if widget.deny_code ~= 0 and getTime() < widget.deny_show_until then
+        local txt = AUTO_DENY_TEXT[widget.deny_code] or "AUTO blocked"
+        local by  = CY - 16
+        lcd.drawFilledRectangle(0, by, SCR_W, 32, C_RED)
+        lcd.drawRectangle(0, by, SCR_W, 32, C_WHITE)
+        lcd.drawText(SCR_W / 2, by + 8, txt, bor(FS, FCENT, C_WHITE))
     end
 end
 

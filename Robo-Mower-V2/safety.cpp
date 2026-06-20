@@ -252,11 +252,21 @@ static void safety_task(void * /*pv*/)
         // perimeter, i.e. distance-to-perimeter-edge < -PERIMETER_BREACH_DIST_M.
         // (One polygon, so it covers all regions incl. pinched-off side arms.)
         if (s_in_auto_mode && s_perimeter_set) {
-            bool checked = false;
-            float dist = 0.0f;
+            bool  checked   = false;
+            float dist      = 0.0f;     // EKF steering-centre signed distance to edge
+            float gps_dist  = 0.0f;     // raw RTK steering-centre signed distance to edge
+            bool  gps_valid = false;
+            // Read the GPS measurement BEFORE taking the nav mutex (rtk_gps has its own
+            // lock). enu_east_m/enu_north_m are the STEERING CENTRE — same frame as the
+            // perimeter (the steering-centre limit).
+            GpsMeasurement gmeas = rtk_gps_get_measurement();
             if (xSemaphoreTake(s_nav_mutex, 0) == pdTRUE) {
                 Pose2D pose = ekf_get_pose();
                 dist = distanceToNearestEdge(s_perimeter, pose.x, pose.y);
+                if (gmeas.valid) {
+                    gps_dist  = distanceToNearestEdge(s_perimeter, gmeas.enu_east_m, gmeas.enu_north_m);
+                    gps_valid = true;
+                }
                 checked = true;
                 xSemaphoreGive(s_nav_mutex);
             }
@@ -270,7 +280,15 @@ static void safety_task(void * /*pv*/)
             if (eff_breach_dist < 0.10f) eff_breach_dist = 0.10f;
             const float breach_thresh = -eff_breach_dist;
             static bool s_perim_breach_warned = false;
-            if (checked && (dist < breach_thresh)) {
+            // Trip on the EKF position always; trip on the RAW RTK position ONLY when
+            // it is RTK-FIXED. Float fixes can be ~2 m off under tree cover, so a raw
+            // Float position would false-trip the breach and stop AUTO. In Float the
+            // EKF (dead-reckoned from odometry + Fixed snaps) is the trustworthy
+            // signal; raw GPS contributes only when Fixed (a lagging-EKF backstop).
+            bool gps_fixed = gps_valid && (gmeas.fix_type == GPS_FIX_RTK_FIXED);
+            bool breached = (checked   && dist     < breach_thresh) ||
+                            (gps_fixed && gps_dist < breach_thresh);
+            if (breached) {
                 // Hard-stop motors every 50 ms tick while breach persists.
                 // Emergency frames go to the front of the VESC TX queue so they
                 // arrive before any motion command the state machine may have queued.

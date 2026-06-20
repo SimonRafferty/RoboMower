@@ -187,16 +187,37 @@ Polygon perimeter_get_working_area();
 float perimeter_get_accuracy_m();
 
 /**
+ * @brief True if the perimeter was recorded/drawn CLOCKWISE.
+ *
+ * The polygon is always stored counter-clockwise (Clipper offsets and breach
+ * math depend on it), so the spiral planner reverses its ring traversal when
+ * this is set — making the mow loop run the same rotational sense the operator
+ * walked. Persisted in NVS ("mow_cw") so it survives reboot.
+ */
+bool perimeter_mow_clockwise();
+
+/**
+ * @brief Record (and persist) the perimeter's walk/draw direction.
+ *
+ * @param cw true if recorded/drawn clockwise (negative signed area before CCW
+ *           normalisation). Called by LEARN finish and PWA SEND_PERIMETER.
+ */
+void perimeter_set_mow_clockwise(bool cw);
+
+/**
  * @brief Persist an ENU polygon as the canonical lat/lon perimeter ("perim2").
  *
  * Converts each ENU vertex to absolute lat/lon via the current GPS origin and
- * writes the origin-independent perimeter store, tagging every point with the
- * given accuracy (m). Used by SEND_PERIMETER (PWA upload) so the uploaded
- * perimeter survives reboot without origin drift. No-op if no origin is set.
+ * writes the origin-independent perimeter store. @p acc_per_point gives the GPS
+ * accuracy (m) for each vertex (so the map shows real per-corner confidence —
+ * e.g. one Float corner under a tree no longer poisons the whole ring). Pass
+ * nullptr to tag every point with the legacy default. The breach watchdog uses
+ * the worst (max) of the per-point values. No-op if no origin is set.
  *
+ * @param acc_per_point Array of enu_poly.pts.size() accuracies, or nullptr.
  * @return true on success.
  */
-bool perimeter_save_canonical(const Polygon &enu_poly, float acc);
+bool perimeter_save_canonical(const Polygon &enu_poly, const float *acc_per_point);
 
 /**
  * @brief Persist absolute lat/lon perimeter points with PER-POINT accuracy.

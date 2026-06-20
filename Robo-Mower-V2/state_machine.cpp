@@ -65,6 +65,9 @@ static CRGB s_leds[1 + LED_EXTERNAL_COUNT];
 
 // ── Forward declarations ──────────────────────────────────────────────────────
 static bool mower_inside_perimeter();
+static bool auto_entry_allowed(const GpsMeasurement &gps);     // all AUTO-start gates
+static const char *auto_entry_block_reason(const GpsMeasurement &gps);  // nullptr = OK
+static void deny_auto_entry(const char *who);
 
 // ── Module-level state ────────────────────────────────────────────────────────
 static volatile RobotState g_state = STATE_INIT;
@@ -178,6 +181,10 @@ static bool pauseSwitchActive() {
 static Waypoint   s_wp_buf[1000];   // large static buffer — coverage planner fills via get_next
 static int        s_wp_count = 0;
 static int        s_wp_index = 0;
+// Absolute planner index of s_wp_buf[0] (= planner cursor at the moment of load).
+// abs index of the current target = s_wp_load_offset + s_wp_index — fed back to the
+// planner's visited high-water mark so a resume targets only unvisited waypoints.
+static int        s_wp_load_offset = 0;
 
 // ── LEARN_PERIMETER state locals ──────────────────────────────────────────────
 static bool s_ch5_prev = false;   // previous CH5 active state for edge detection
@@ -198,8 +205,13 @@ static bool     s_obstacle_backup_done = false;
 static bool     s_obstacle_reset_done  = false;
 static CollisionDirection s_lastCollisionDir = COLLISION_DIR_UNKNOWN;
 
-// ── AUTO_RETURN state locals ───────────────────────────────────────────────────
-static Waypoint s_return_wp;  // single waypoint: perimeter.pts[0]
+// ── PAUSE resume movement check ───────────────────────────────────────────────
+// EKF pose snapshot taken on PAUSED entry; compared on resume to decide whether to
+// continue the AUTO cycle (didn't move) or restart it (carried). See config.h
+// PAUSE_RESUME_MAX_MOVE_M / PAUSE_RESUME_MAX_TURN_RAD.
+static float s_pause_x   = 0.0f;
+static float s_pause_y   = 0.0f;
+static float s_pause_hdg = 0.0f;
 
 // ── RETRACE state locals ──────────────────────────────────────────────────────
 static float s_retrace_strip_end_x = 0.0f;
@@ -211,7 +223,7 @@ static float s_retrace_strip_end_y = 0.0f;
 static const char *sm_state_name(RobotState s) {
     static const char *k_names[] = {
         "INIT","IDLE","MANUAL","LEARN","AUTO",
-        "RETRACE","BOG","OBS-AVOID","RETURN","PAUSED","MOT-OFF"
+        "RETRACE","BOG","OBS-AVOID","NUDGE","PAUSED","MOT-OFF"
     };
     int i = (int)s;
     return (i >= 0 && i < 11) ? k_names[i] : "?";
@@ -290,7 +302,7 @@ static bool    s_ch7_on   = false;   // pause
 // Wrappers matching the original API — now read latched state
 static inline bool ch4_is_manual(uint16_t)      { return s_ch4_pos == 0; }
 static inline bool ch4_is_auto(uint16_t)        { return s_ch4_pos == 1; }
-static inline bool ch4_is_auto_return(uint16_t) { return s_ch4_pos == 2; }
+static inline bool ch4_is_nudge(uint16_t) { return s_ch4_pos == 2; }
 static inline bool ch5_is_learning(uint16_t)    { return s_ch5_on; }
 static inline bool ch6_is_armed(uint16_t)       { return s_ch6_on; }
 static inline bool ch7_is_pause(uint16_t)       { return s_ch7_on; }
@@ -420,6 +432,10 @@ static void applyBatteryWarningOverlay() {
 
 /** Drain the coverage planner into s_wp_buf[]. Returns number of waypoints. */
 static int load_waypoints_from_planner() {
+    // Capture the planner cursor BEFORE draining: this is the absolute index of the
+    // first waypoint we load (0 for a fresh plan, or the reset-to-nearest point on
+    // resume). Used to map s_wp_index → absolute index for the visited high-water mark.
+    s_wp_load_offset = coverage_planner_get_waypoint_index();
     int count = 0;
     Waypoint wp;
     while (count < (int)(sizeof(s_wp_buf) / sizeof(s_wp_buf[0])) &&
@@ -427,6 +443,41 @@ static int load_waypoints_from_planner() {
         s_wp_buf[count++] = wp;
     }
     return count;
+}
+
+// Update the operator baseline cut height from the RC CH3 stick, but only when the
+// stick physically moves (a resting CH3 must not override the PWA slider). Shared by
+// MANUAL and AUTO so the baseline can be trimmed live in either mode; in AUTO the
+// auto-recovery deck moves sit on top of this baseline and restore it on exit.
+static void apply_rc_cut_height(const CRSFChannels &rc) {
+    static uint16_t s_ch3_height_prev = 0xFFFF;  // 0xFFFF = uninitialised
+    uint16_t ch3_raw = rc.ch[CRSF_CH_CUT_HEIGHT];
+    if (s_ch3_height_prev == 0xFFFF) {
+        s_ch3_height_prev = ch3_raw;   // record resting position, do not apply
+        return;
+    }
+    uint16_t delta = (ch3_raw > s_ch3_height_prev) ? (ch3_raw - s_ch3_height_prev)
+                                                   : (s_ch3_height_prev - ch3_raw);
+    if (delta < CH3_HEIGHT_MOVE_THRESHOLD) return;
+    s_ch3_height_prev = ch3_raw;
+    float ch3_norm     = crsf_us_to_norm(ch3_raw);
+    float height_range = (float)(mower_config_get().cut_height_max_mm
+                               - mower_config_get().cut_height_min_mm);
+    s_desired_cut_height_mm = (float)mower_config_get().cut_height_min_mm
+                            + (ch3_norm + 1.0f) * 0.5f * height_range;
+    s_desired_cut_height_mm = clampf(s_desired_cut_height_mm,
+                                     (float)mower_config_get().cut_height_min_mm,
+                                     (float)mower_config_get().cut_height_max_mm);
+}
+
+// True when the heading is trustworthy enough to persist the BNO055 calibration:
+// either the sensors are calibrated, OR a profile is already loaded AND the GPS
+// travel-chord has confirmed the heading. After an offset restore the BNO status
+// byte reads low for a while even though the heading is already absolute — this
+// stops that quirk from blocking a re-save of an already-good, GPS-confirmed profile.
+static bool heading_ok_to_save_cal() {
+    return imu_heading_is_confident() ||
+           (imu_profile_loaded() && ekf_heading_is_established());
 }
 
 
@@ -551,7 +602,7 @@ void state_machine_handle_serial(const char *raw_cmd) {
 
         const char *state_names[] = {
             "INIT","IDLE","MANUAL","LEARN_PERIMETER","AUTO_MOWING",
-            "RETRACE","BOG_RECOVERY","OBSTACLE_AVOID","AUTO_RETURN",
+            "RETRACE","BOG_RECOVERY","OBSTACLE_AVOID","AUTO_NUDGE",
             "PAUSED","MOTORS_OFFLINE"
         };
         const char *bat_names[] = {"OK","WARNING","LOW"};
@@ -584,8 +635,8 @@ void state_machine_handle_serial(const char *raw_cmd) {
         return;
     }
     if (strcasecmp(cmd, "IMUSAVECAL") == 0) {
-        if (!imu_heading_is_confident()) {
-            DBG_PRINTLN("[IMU] save refused — gyro/accel/mag not all 3 (drive slow loops first)");
+        if (!heading_ok_to_save_cal()) {
+            DBG_PRINTLN("[IMU] save refused — heading not GPS-set (drive a straight run until the TX compass reads true North)");
         } else {
             imu_request_save();
             DBG_PRINTLN("[IMU] calibration save requested — check log for verified result");
@@ -734,8 +785,16 @@ void state_machine_handle_serial(const char *raw_cmd) {
             transition_to(STATE_PAUSED);
             DBG_PRINTLN("[SM] PAUSE command — entering STATE_PAUSED.");
         } else if (g_state == STATE_PAUSED) {
-            transition_to(STATE_AUTO_MOWING);
-            DBG_PRINTLN("[SM] PAUSE command — resuming AUTO_MOWING.");
+            GpsMeasurement gm = rtk_gps_get_measurement();
+            const char *reason = auto_entry_block_reason(gm);
+            if (reason) {
+                char l[SYS_LOG_MAX_LEN];
+                snprintf(l, sizeof(l), "PAUSE: resume denied - %s", reason);
+                sys_log_push(l);
+            } else {
+                transition_to(STATE_AUTO_MOWING);
+                DBG_PRINTLN("[SM] PAUSE command — resuming AUTO_MOWING.");
+            }
         } else {
             DBG_PRINTLN("[SM] PAUSE command ignored (only active in AUTO_MOWING or PAUSED).");
         }
@@ -766,7 +825,7 @@ static void emit_telemetry() {
 
     const char *state_names[] = {
         "INIT","IDLE","MANUAL","LEARN_PERIM","AUTO","RETRACE",
-        "BOG","OBS_AVOID","RETURN","PAUSED","MOTORS_OFFLINE"
+        "BOG","OBS_AVOID","NUDGE","PAUSED","MOTORS_OFFLINE"
     };
     const char *bat_names[] = {"OK","WARNING","LOW"};
     const char *cut_names[] = {"NORMAL","OVERLOADED","STALLED","OBS_SUSP","BLADE_FAULT"};
@@ -975,6 +1034,9 @@ static void handle_send_perimeter(const char *json) {
         rtk_gps_latlon_to_enu(la[i], lo[i], &e, &no);
         poly.pts.push_back({e, no});
     }
+    // Capture the drawn winding before CCW normalisation so the mow loop follows
+    // the direction the perimeter was drawn (mirrors the LEARN walk-direction).
+    perimeter_set_mow_clockwise(poly.area() < 0.0f);
     poly.ensureCCW();
 
     // Auto-clean spurs / self-intersecting loops drawn in the PWA editor.
@@ -1008,7 +1070,11 @@ static void handle_send_perimeter(const char *json) {
     } else {
         float worst = 0.0f;
         for (int i = 0; i < n; i++) if (ac[i] > worst) worst = ac[i];
-        ok = perimeter_save_canonical(poly, worst > 0.0f ? worst : 0.05f);
+        if (worst <= 0.0f) worst = 0.05f;
+        // Cleaned geometry no longer maps 1:1 to the uploaded points — tag every
+        // vertex with the worst-case accuracy (conservative breach margin).
+        std::vector<float> acc_all((size_t)poly.pts.size(), worst);
+        ok = perimeter_save_canonical(poly, acc_all.data());
     }
     if (!ok) { ble_server_send_ack("SEND_PERIMETER", false, "nvs save failed"); return; }
 
@@ -1049,33 +1115,22 @@ static void handle_ble_command(const char *json) {
             if (!perimeter_is_valid()) {
                 ble_server_send_ack(cmd, false, "no perimeter");
             } else {
-                float px = 0.0f, py = 0.0f;
-                if (!get_best_position(px, py)) {
-                    ble_server_send_ack(cmd, false, "no GPS fix");
+                // Same AUTO-start gates as the RC path: position, GPS-established
+                // heading, RTK fix (Float/Fixed), EPE in tolerance, inside perimeter.
+                GpsMeasurement gm = rtk_gps_get_measurement();
+                const char *reason = auto_entry_block_reason(gm);
+                if (reason) {
+                    ble_server_send_ack(cmd, false, reason);
                 } else {
-                    const Polygon &perim = perimeter_get_perimeter();
-                    // distanceToNearestEdge: positive=inside, negative=outside.
-                    // Allow 0.5 m outside tolerance for GPS noise near boundary.
-                    // The nav boundary breach watchdog is the real safety net during mowing.
-                    float d = distanceToNearestEdge(perim, px, py);
-                    if (d < -0.5f) {
-                        char msg[64];
-                        snprintf(msg, sizeof(msg), "outside perim %.1fm (E%.1f N%.1f)",
-                                 -d, px, py);
-                        ble_server_send_ack(cmd, false, msg);
-                    } else {
-                        transition_to(STATE_AUTO_MOWING);
-                        ble_server_send_ack(cmd, true, "transitioning to AUTO");
-                    }
+                    transition_to(STATE_AUTO_MOWING);
+                    ble_server_send_ack(cmd, true, "transitioning to AUTO");
                 }
             }
         } else if (strcmp(mode, "MANUAL") == 0) {
             transition_to(STATE_MANUAL);
             ble_server_send_ack(cmd, true, "transitioning to MANUAL");
-        } else if (strcmp(mode, "AUTO_RETURN") == 0) {
-            transition_to(STATE_AUTO_RETURN);
-            ble_server_send_ack(cmd, true, "transitioning to AUTO_RETURN");
         } else {
+            // AUTO_RETURN removed — replaced by the TX-driven AUTO-nudge (CH4 3rd pos).
             ble_server_send_ack(cmd, false, "unknown mode");
         }
         return;
@@ -1150,7 +1205,7 @@ static void handle_ble_command(const char *json) {
     // ── RECAL_IMU ─────────────────────────────────────────────────────────────
     if (strcmp(cmd, "RECAL_IMU") == 0) {
         imu_recalibrate();
-        sys_log_push("IMU: compass recalibration started (drive slow loops in Manual)");
+        sys_log_push("IMU: heading reset — drive a straight run until the TX compass reads true North");
         request_beep(BEEP_CONFIRM);
         return;
     }
@@ -1165,8 +1220,8 @@ static void handle_ble_command(const char *json) {
 
     // ── IMUSAVECAL — save the current calibration now (read-back verified) ─────
     if (strcmp(cmd, "IMUSAVECAL") == 0) {
-        if (!imu_heading_is_confident()) {
-            ble_server_send_ack(cmd, false, "not fully calibrated — drive slow loops first");
+        if (!heading_ok_to_save_cal()) {
+            ble_server_send_ack(cmd, false, "heading not GPS-set — drive a straight run until the TX compass reads true North");
             request_beep(BEEP_WARNING);
             return;
         }
@@ -1306,7 +1361,7 @@ static void handle_ble_command(const char *json) {
         }
         float px = gps.valid ? gps.enu_east_m  : pose.x;
         float py = gps.valid ? gps.enu_north_m : pose.y;
-        if (perimeter_record_point(px, py, rtk_gps_accuracy_m((int)gps.fix_type, gps.hdop), true)) {
+        if (perimeter_record_point(px, py, rtk_gps_effective_accuracy_m(gps), true)) {
             request_beep(BEEP_WARNING);
             char msg[48];
             snprintf(msg, sizeof(msg), "pt %d stored", perimeter_recording_point_count());
@@ -1379,6 +1434,7 @@ static void handle_ble_command(const char *json) {
         gf("\"manual_max_speed_ms\"",  cfg.manual_max_speed_ms);
         gf("\"min_turn_radius_m\"",    cfg.min_turn_radius_m);
         gf("\"min_move_duty\"",        cfg.min_move_duty);
+        gf("\"turn_margin_m\"",        cfg.turn_margin_m);
 
         // ── BNO055 calibration restore (carried in the settings file) ───────────
         // The PWA round-trips the saved calibration as "bnocal" (44 hex chars = 22
@@ -1565,15 +1621,76 @@ static bool mower_inside_perimeter() {
  */
 static bool s_auto_deny_latch = false;
 
+// ── AUTO-start gates (2026-06-19) ─────────────────────────────────────────────
+// AUTO may start only when ALL hold: a perimeter is taught, a position fix
+// exists, the heading is GPS-established (absolute — the BNO is relative at
+// boot), the GPS fix is RTK (Float or Fixed), the receiver EPE (when available)
+// is within tolerance, and the mower is inside the perimeter. The heading flag
+// latches, so a pause/resume does not require re-establishing it.
+//
+// Reason codes are sent to the TX16S (MOWER_STATUS byte 20) so the Lua widget can
+// banner the reason for ~2 s. KEEP IN SYNC with the Lua and telemetry.md.
+enum {
+    AUTO_DENY_NONE     = 0,
+    AUTO_DENY_NO_PERIM = 1,   // no perimeter taught
+    AUTO_DENY_NO_POS   = 2,   // no GPS position / EKF unseeded
+    AUTO_DENY_HEADING  = 3,   // heading not GPS-established
+    AUTO_DENY_FIX      = 4,   // GPS fix not RTK (need Float/Fixed)
+    AUTO_DENY_EPE      = 5,   // EPE estimate too high
+    AUTO_DENY_OUTSIDE  = 6,   // mower outside perimeter
+};
+
+static uint8_t auto_entry_block_code(const GpsMeasurement &gps) {
+    if (!perimeter_is_valid())                          return AUTO_DENY_NO_PERIM;
+    float px = 0.0f, py = 0.0f;
+    if (!get_best_position(px, py))                     return AUTO_DENY_NO_POS;
+    if (!ekf_heading_is_established())                  return AUTO_DENY_HEADING;
+    if (gps.fix_type < GPS_FIX_RTK_FIXED)               return AUTO_DENY_FIX;
+    if (gps.epe_valid && gps.epe_2d_m > AUTO_MAX_EPE_M) return AUTO_DENY_EPE;
+    if (!mower_inside_perimeter())                      return AUTO_DENY_OUTSIDE;
+    return AUTO_DENY_NONE;
+}
+
+static const char *auto_deny_code_str(uint8_t code) {
+    switch (code) {
+        case AUTO_DENY_NO_PERIM: return "no perimeter";
+        case AUTO_DENY_NO_POS:   return "no position";
+        case AUTO_DENY_HEADING:  return "heading not set";
+        case AUTO_DENY_FIX:      return "GPS fix not RTK (need Float/Fixed)";
+        case AUTO_DENY_EPE:      return "EPE / Uncertainty too high";
+        case AUTO_DENY_OUTSIDE:  return "outside perimeter";
+        default:                 return nullptr;
+    }
+}
+
+static const char *auto_entry_block_reason(const GpsMeasurement &gps) {
+    return auto_deny_code_str(auto_entry_block_code(gps));
+}
+
+static bool auto_entry_allowed(const GpsMeasurement &gps) {
+    return auto_entry_block_code(gps) == AUTO_DENY_NONE;
+}
+
 static void deny_auto_entry(const char *who) {
     if (s_auto_deny_latch) return;
     s_auto_deny_latch = true;
 
     char line[SYS_LOG_MAX_LEN];
+    GpsMeasurement gm = rtk_gps_get_measurement();
     float px = 0.0f, py = 0.0f;
     if (!get_best_position(px, py)) {
         snprintf(line, sizeof(line),
                  "%s: AUTO denied - NO POSITION (GPS invalid, EKF unseeded)", who);
+    } else if (!ekf_heading_is_established()) {
+        snprintf(line, sizeof(line),
+                 "%s: AUTO denied - heading not set (drive a straight run until TX compass reads N)", who);
+    } else if (gm.fix_type < GPS_FIX_RTK_FIXED) {
+        snprintf(line, sizeof(line),
+                 "%s: AUTO denied - GPS fix not RTK (need Float/Fixed)", who);
+    } else if (gm.epe_valid && gm.epe_2d_m > AUTO_MAX_EPE_M) {
+        snprintf(line, sizeof(line),
+                 "%s: AUTO denied - EPE %.2fm > %.2fm", who,
+                 (double)gm.epe_2d_m, (double)AUTO_MAX_EPE_M);
     } else {
         float d = distanceToNearestEdge(perimeter_get_perimeter(), px, py);
         snprintf(line, sizeof(line),
@@ -1776,7 +1893,9 @@ void state_machine_update() {
     // When BLE is connected, the phone is the control source — stay in MANUAL.
     if (crsf_is_failsafe() && !ble_server_is_connected()
         && (millis() - s_ble_drive_ms) > BLE_DRIVE_TIMEOUT_MS) {
-        if (g_state == STATE_MANUAL || g_state == STATE_LEARN_PERIMETER) {
+        // NUDGE is operator-driving (TX), so a lost TX must stop it like MANUAL.
+        if (g_state == STATE_MANUAL || g_state == STATE_LEARN_PERIMETER ||
+            g_state == STATE_AUTO_NUDGE) {
             vesc_set_current(VESC_ID_LEFT,  0);
             vesc_set_current(VESC_ID_RIGHT, 0);
             vesc_set_current(VESC_ID_BLADE, 0);
@@ -1979,16 +2098,10 @@ void state_machine_update() {
         // CH4 == AUTO
         if (ch4_is_auto(ch4)) {
             if (perimeter_is_valid()) {
-                // GPS fix quality is not gated — uncertainty-aware navigation handles it.
-                if (gps.fix_type < GPS_FIX_RTK_FIXED) {
-                    DBG_PRINTF("[IDLE] AUTO starting with reduced GPS fix (%d) — "
-                               "perimeter margin will be wider\n", (int)gps.fix_type);
-                }
-                if (mower_inside_perimeter()) {
+                if (auto_entry_allowed(gps)) {
                     transition_to(STATE_AUTO_MOWING);
                 } else {
-                    DBG_PRINTLN("[IDLE] AUTO blocked — mower outside perimeter");
-                    deny_auto_entry("IDLE");   // beeps + logs reason once per engagement
+                    deny_auto_entry("IDLE");   // beeps + logs the specific reason once
                 }
             } else {
                 // No perimeter: trigger look-around once per session to indicate
@@ -2016,32 +2129,8 @@ void state_machine_update() {
 
         showLedsWithGps(COL_GREEN);
 
-        // Cut height from CH3: only update s_desired_cut_height_mm when the
-        // stick physically moves.  A resting CH3 (even at minimum) must not
-        // override the WebUI slider — the two sources coexist, with the RC
-        // taking over only when the operator deliberately moves the stick.
-        {
-            static uint16_t s_ch3_height_prev = 0xFFFF;  // 0xFFFF = uninitialised
-            uint16_t ch3_raw = rc.ch[CRSF_CH_CUT_HEIGHT];
-            if (s_ch3_height_prev == 0xFFFF) {
-                s_ch3_height_prev = ch3_raw;  // record resting position, do not apply
-            } else {
-                uint16_t delta = (ch3_raw > s_ch3_height_prev)
-                               ? (ch3_raw - s_ch3_height_prev)
-                               : (s_ch3_height_prev - ch3_raw);
-                if (delta >= CH3_HEIGHT_MOVE_THRESHOLD) {
-                    s_ch3_height_prev = ch3_raw;
-                    float ch3_norm    = crsf_us_to_norm(ch3_raw);
-                    float height_range = (float)(mower_config_get().cut_height_max_mm
-                                               - mower_config_get().cut_height_min_mm);
-                    s_desired_cut_height_mm = (float)mower_config_get().cut_height_min_mm
-                                           + (ch3_norm + 1.0f) * 0.5f * height_range;
-                    s_desired_cut_height_mm = clampf(s_desired_cut_height_mm,
-                                                     (float)mower_config_get().cut_height_min_mm,
-                                                     (float)mower_config_get().cut_height_max_mm);
-                }
-            }
-        }
+        // Operator baseline cut height from the RC CH3 stick (shared with AUTO).
+        apply_rc_cut_height(rc);
         servo_set_height_mm(s_desired_cut_height_mm);
 
         // Blade control: armed = blade on (ramp up), disarmed = blade off (ramp down)
@@ -2073,18 +2162,12 @@ void state_machine_update() {
         // CH4 == AUTO
         if (ch4_is_auto(ch4)) {
             if (perimeter_is_valid()) {
-                // GPS fix quality is not gated — uncertainty-aware navigation handles it.
-                if (gps.fix_type < GPS_FIX_RTK_FIXED) {
-                    DBG_PRINTF("[MANUAL] AUTO starting with reduced GPS fix (%d) — "
-                               "perimeter margin will be wider\n", (int)gps.fix_type);
-                }
-                if (mower_inside_perimeter()) {
+                if (auto_entry_allowed(gps)) {
                     vesc_set_current(VESC_ID_LEFT,  0);
                     vesc_set_current(VESC_ID_RIGHT, 0);
                     transition_to(STATE_AUTO_MOWING);
                 } else {
-                    DBG_PRINTLN("[MANUAL] AUTO blocked — mower outside perimeter");
-                    deny_auto_entry("MANUAL");  // beeps + logs reason once per engagement
+                    deny_auto_entry("MANUAL");  // beeps + logs the specific reason once
                 }
             } else {
                 // No perimeter: trigger look-around once per session, then go to IDLE
@@ -2124,8 +2207,8 @@ void state_machine_update() {
             s_blade_commanded = false;
             s_blade_ramp_erpm = 0.0f;
 
-            // Save current GPS position as the return-to-home target.
-            // This is persisted so RETURN mode comes back here after any reboot.
+            // Save current GPS position (legacy home point; the autonomous return
+            // mode was removed — kept harmlessly in case it's reused later).
             GpsMeasurement gps_home = rtk_gps_get_measurement();
             if (gps_home.valid) {
                 s_home_x = gps_home.enu_east_m;
@@ -2161,7 +2244,7 @@ void state_machine_update() {
             // chose this position by pressing the button.
             float px = gps.valid ? gps.enu_east_m  : pose.x;
             float py = gps.valid ? gps.enu_north_m : pose.y;
-            if (perimeter_record_point(px, py, rtk_gps_accuracy_m((int)gps.fix_type, gps.hdop), true)) {
+            if (perimeter_record_point(px, py, rtk_gps_effective_accuracy_m(gps), true)) {
                 request_beep(BEEP_WARNING);
                 DBG_PRINTF("[LEARN] Point %d stored (%.3f, %.3f)\n",
                               perimeter_recording_point_count(), px, py);
@@ -2210,27 +2293,50 @@ void state_machine_update() {
             s_auto_entry_ms    = millis();
             s_auto_entry_x     = pose.x;
             s_auto_entry_y     = pose.y;
-            // When resuming from PAUSED, the coverage planner already has a
-            // valid plan (or was re-generated by MOTORS_OFFLINE resume logic).
-            // Skip re-planning; just reload waypoints from where we left off.
-            bool resuming = (g_prev_state == STATE_PAUSED);
+            // Decide resume vs fresh start. Re-plan either way (same perimeter ->
+            // same plan; guarantees the planner holds waypoints to re-anchor into).
+            //  • From AUTO-NUDGE: the operator drove manually and the EKF tracked it,
+            //    so the pose is valid — CONTINUE the plan in order.
+            //  • From PAUSED: keep the plan IF the mower didn't move during the pause
+            //    (compare pose to the snapshot taken on pause entry). If it moved
+            //    significantly (likely carried), RESTART the cycle — the dead-reckoned
+            //    pose can no longer be trusted.
+            //  • Otherwise: fresh start.
+            bool from_nudge = (g_prev_state == STATE_AUTO_NUDGE);
+            bool from_pause = (g_prev_state == STATE_PAUSED);
+            bool moved_in_pause = false;
+            if (from_pause) {
+                float dpx = pose.x - s_pause_x, dpy = pose.y - s_pause_y;
+                float dpos = sqrtf(dpx * dpx + dpy * dpy);
+                float dhdg = fabsf(wrapAngle(pose.heading - s_pause_hdg));
+                moved_in_pause = (dpos > PAUSE_RESUME_MAX_MOVE_M) ||
+                                 (dhdg > PAUSE_RESUME_MAX_TURN_RAD);
+                char l[SYS_LOG_MAX_LEN];
+                snprintf(l, sizeof(l),
+                         "AUTO resume: moved %.2fm %.0fdeg in pause -> %s",
+                         (double)dpos, (double)(dhdg * 57.29578f),
+                         moved_in_pause ? "RESTART cycle" : "continue");
+                sys_log_push(l);
+            }
+            bool resuming = from_nudge || (from_pause && !moved_in_pause);
 
-            if (!resuming) {
-                // Plan the full coverage path
-                bool plan_ok = coverage_planner_plan(
-                    perimeter_get_perimeter(),
-                    perimeter_get_nav_boundary(),
-                    perimeter_get_working_area());
-
-                if (!plan_ok) {
-                    DBG_PRINTLN("[AUTO] Coverage planning failed — returning to IDLE.");
-                    sys_log_push("AUTO: coverage plan FAILED -> IDLE");
-                    request_beep(BEEP_FAULT);   // audible fault on TX16S
-                    transition_to(STATE_IDLE);
-                    break;
-                }
-                // Reset collision baseline settle distance (fresh session only)
-                node_follower_reset_session_distance();
+            bool plan_ok = coverage_planner_plan(
+                perimeter_get_perimeter(),
+                perimeter_get_nav_boundary(),
+                perimeter_get_working_area());
+            if (!plan_ok) {
+                DBG_PRINTLN("[AUTO] Coverage planning failed — returning to IDLE.");
+                sys_log_push("AUTO: coverage plan FAILED -> IDLE");
+                request_beep(BEEP_FAULT);   // audible fault on TX16S
+                transition_to(STATE_IDLE);
+                break;
+            }
+            if (resuming) {
+                coverage_planner_resume_in_order();  // strict in-order: never jump/skip rings
+                sys_log_push("AUTO: resumed - continuing in order from last waypoint");
+            } else {
+                node_follower_reset_session_distance();   // fresh session only
+                coverage_planner_reset_progress();        // clear visited high-water mark
             }
 
             // Load all waypoints into local buffer for node follower
@@ -2252,6 +2358,22 @@ void state_machine_update() {
                 char line[SYS_LOG_MAX_LEN];
                 snprintf(line, sizeof(line), "AUTO: plan ok, %d waypoints (resume=%d)",
                          s_wp_count, (int)resuming);
+                sys_log_push(line);
+            }
+            // Diagnostic: where does the path START vs where the mower actually is?
+            // s_wp_load_offset is the ABSOLUTE planner index of the first target —
+            // it MUST be 0 on a fresh start (drives to the recording-start corner).
+            // A non-zero value, or a large pose→target distance, pinpoints a
+            // "halfway start" / position-offset (no behaviour change, just logging).
+            {
+                char line[SYS_LOG_MAX_LEN];
+                float t0x = (s_wp_count > 0) ? s_wp_buf[0].x : pose.x;
+                float t0y = (s_wp_count > 0) ? s_wp_buf[0].y : pose.y;
+                float dxr = t0x - pose.x, dyr = t0y - pose.y;
+                snprintf(line, sizeof(line),
+                    "AUTO start: tgt abs#%d/%d, %.1fm from pose (%.1f,%.1f)->(%.1f,%.1f)",
+                    s_wp_load_offset, coverage_planner_get_waypoint_count(),
+                    sqrtf(dxr * dxr + dyr * dyr), pose.x, pose.y, t0x, t0y);
                 sys_log_push(line);
             }
             // Dump the planned path geometry to the system log on every AUTO start,
@@ -2304,9 +2426,30 @@ void state_machine_update() {
                 transition_to(STATE_MANUAL);
                 break;
             }
+            // CH4 → 3rd position: AUTO-NUDGE. Hand the tracks to the TX so the
+            // operator can nudge the mower (e.g. away from an obstacle) WITHOUT
+            // abandoning the cycle — the plan/cursor and heading are preserved and
+            // AUTO resumes on switching back. Stop drive now; the nudge handler
+            // takes over driving next tick.
+            if (ch4_is_nudge(ch4)) {
+                vesc_set_current(VESC_ID_LEFT,  0);
+                vesc_set_current(VESC_ID_RIGHT, 0);
+                safety_set_auto_mode(false);
+                DBG_PRINTLN("[AUTO] CH4→NUDGE: holding plan, TX drives.");
+                sys_log_push("AUTO: NUDGE - manual drive, plan held");
+                transition_to(STATE_AUTO_NUDGE);
+                break;
+            }
         }
 
         showLedsWithGps(COL_RED);
+
+        // Operator can trim the baseline cut height live in AUTO (RC CH3 stick;
+        // BLE SET_CUT_HEIGHT also updates s_desired_cut_height_mm). Apply it as the
+        // deck baseline each tick — the auto-recovery states (RETRACE/bog) own the
+        // deck while active and restore this baseline on exit, so the two coexist.
+        apply_rc_cut_height(rc);
+        servo_set_height_mm(s_desired_cut_height_mm);
 
         // Update cutting monitor — use ramp ERPM as target so BLADE_FAULT
         // detection is accurate during blade spin-up (VESC-internal ~2 s RPM ramp).
@@ -2514,12 +2657,10 @@ void state_machine_update() {
             safety_set_auto_mode(false);
             collisionSaveBaselineForced();
 
-            uint16_t ch4 = rc.ch[CRSF_CH_MODE];
-            if (ch4_is_auto_return(ch4)) {
-                transition_to(STATE_AUTO_RETURN);
-            } else {
-                transition_to(STATE_IDLE);
-            }
+            // Plan complete → IDLE (autonomous return-to-home removed; the CH4 3rd
+            // position is now the manual-nudge mode, handled mid-cycle above).
+            sys_log_push("AUTO: plan complete -> IDLE");
+            transition_to(STATE_IDLE);
             break;
         }
 
@@ -2619,6 +2760,12 @@ void state_machine_update() {
                 }
             }
 
+            // Report progress to the planner's visited high-water mark so a later
+            // upset/recovery resumes at the nearest UNVISITED waypoint (never jumps
+            // back into already-mowed, densely-spaced points and oscillates). The
+            // current target's absolute planner index is s_wp_load_offset + s_wp_index.
+            coverage_planner_set_progress(s_wp_load_offset + s_wp_index);
+
             // ── AUTO nav diagnostics (~1 Hz, surfaced in the PWA System Log) ──
             {
                 static uint32_t s_nav_log_ms = 0;
@@ -2644,20 +2791,21 @@ void state_machine_update() {
                 }
             }
 
-            // Cross-track error check: if |XTE| > 0.5 m for > 2 s → reset to nearest
+            // Cross-track error check: if |XTE| > 0.5 m for > 2 s the follower is
+            // stuck/off-line on the current segment. Strict in-order recovery: skip
+            // to the NEXT waypoint in sequence only (re-aims the follower) — never
+            // jump to the globally-nearest, which on a spiral abandons whole rings.
             float xte = fabsf(node_follower_get_cross_track_error());
             if (xte > 0.5f) {
                 if (s_cross_track_exceed_ms == 0) s_cross_track_exceed_ms = millis();
                 if (millis() - s_cross_track_exceed_ms > 2000) {
-                    DBG_PRINTLN("[AUTO] Cross-track error > 0.5 m for >2s — resetting to nearest wp.");
-                    coverage_planner_reset_to_nearest(pose.x, pose.y);
-                    s_wp_count = load_waypoints_from_planner();
-                    s_wp_index = 0;
+                    if (s_wp_index < s_wp_count) s_wp_index++;   // advance one, in order
                     s_cross_track_exceed_ms = 0;
                     {
                         char line[SYS_LOG_MAX_LEN];
                         snprintf(line, sizeof(line),
-                                 "AUTO xte>0.5m 2s -> reset to nearest (%d wp)", s_wp_count);
+                                 "AUTO xte>0.5m 2s -> skip to next waypoint i=%d/%d",
+                                 s_wp_index, s_wp_count);
                         sys_log_push(line);
                     }
                 }
@@ -2749,9 +2897,9 @@ void state_machine_update() {
             DBG_PRINTLN(result == BLADE_RECOVERY_COMPLETE
                 ? "[BLADE-REC] Complete — resuming AUTO_MOWING."
                 : "[BLADE-REC] Gave up — resuming AUTO_MOWING (patch logged).");
-            // The recovery backed up / re-cut, so the old waypoint index is stale —
-            // re-plan from the current position and reload waypoints.
-            coverage_planner_reset_to_nearest(pose.x, pose.y);
+            // Resume strictly in order from the furthest-reached waypoint (never
+            // jump to nearest, which on a spiral abandons whole rings).
+            coverage_planner_resume_in_order();
             s_wp_count = load_waypoints_from_planner();
             s_wp_index = 0;
             s_blade_commanded = true;   // already armed — keep it so
@@ -2810,8 +2958,8 @@ void state_machine_update() {
             DBG_PRINTLN(result == BOG_RECOVERED
                 ? "[BOG] Recovered — resuming AUTO_MOWING."
                 : "[BOG] Gave up — resuming AUTO_MOWING (obstacle logged).");
-            // Reset plan to nearest waypoint
-            coverage_planner_reset_to_nearest(pose.x, pose.y);
+            // Resume strictly in order from the furthest-reached waypoint.
+            coverage_planner_resume_in_order();
             s_wp_count = load_waypoints_from_planner();
             s_wp_index = 0;
             s_blade_commanded = true;
@@ -2833,7 +2981,7 @@ void state_machine_update() {
     case STATE_OBSTACLE_AVOID: {
         // ── RC override: any non-AUTO mode switch position exits immediately ──
         // This is the critical safety path — the operator must always be able
-        // to halt the mower by flipping CH4 to MANUAL/RETURN or via failsafe.
+        // to halt the mower by flipping CH4 to MANUAL/NUDGE or via failsafe.
         {
             bool rc_wants_stop = !rc.failsafe && !ch4_is_auto(rc.ch[CRSF_CH_MODE]);
             bool rc_failsafe   =  rc.failsafe && !ble_server_is_connected();
@@ -2897,8 +3045,8 @@ void state_machine_update() {
         }
 
         if (s_obstacle_backup_done && !s_obstacle_reset_done) {
-            // 4. Reset planner to nearest unvisited waypoint
-            coverage_planner_reset_to_nearest(pose.x, pose.y);
+            // 4. Resume strictly in order from the furthest-reached waypoint.
+            coverage_planner_resume_in_order();
             s_wp_count = load_waypoints_from_planner();
             s_wp_index = 0;
             s_obstacle_reset_done = true;
@@ -2909,72 +3057,56 @@ void state_machine_update() {
         break;
     }
 
-    // ── STATE_AUTO_RETURN ─────────────────────────────────────────────────────
-    case STATE_AUTO_RETURN: {
+    // ── STATE_AUTO_NUDGE ──────────────────────────────────────────────────────
+    // AUTO is held: the operator drives the tracks via the TX sticks to nudge the
+    // mower (e.g. away from an obstacle, or to correct a dead-reckoning error)
+    // WITHOUT abandoning the cycle. The plan and waypoint cursor are preserved; the
+    // EKF tracks the manual drive, so switching CH4 back to AUTO resumes from where
+    // it left off. Blade follows the arm switch. Replaces the old return-to-home.
+    case STATE_AUTO_NUDGE: {
         if (g_state_entry) {
-            // Use the saved home position (GPS ENU at perimeter-recording start).
-            // perimeter.pts[0] is unreliable: ensureCCW() may reverse the array,
-            // and perimeter_close_track() reorders the start/end points.
-            if (s_home_x == 0.0f && s_home_y == 0.0f) {
-                // No home saved — fall back to first perimeter point
-                Polygon perim = perimeter_get_perimeter();
-                if (perim.pts.empty()) {
-                    transition_to(STATE_IDLE);
-                    break;
-                }
-                s_return_wp.x = perim.pts[0].x;
-                s_return_wp.y = perim.pts[0].y;
-                DBG_PRINTLN("[RETURN] No home saved — using perimeter.pts[0].");
-            } else {
-                s_return_wp.x = s_home_x;
-                s_return_wp.y = s_home_y;
-                DBG_PRINTF("[RETURN] Returning to home (%.3f, %.3f).\n", s_home_x, s_home_y);
-            }
-            s_return_wp.heading  = 0.0f;
-            s_return_wp.mowing   = false;
-            s_return_wp.headland = false;
-
-            // Reset duty ramp so we don't carry stale duty from mowing into RETURN.
-            wheel_duty_ramp_reset();
-            safety_set_auto_mode(false);
+            // Mirror MANUAL entry so drive_manual()'s heading-hold starts cleanly.
+            s_heading_active = false;
+            s_drive_duty_l   = 0.0f;
+            s_drive_duty_r   = 0.0f;
+            heading_controller_reset();
+            safety_set_auto_mode(false);   // no autonomous motion / breach while nudging
+            DBG_PRINTLN("[NUDGE] Entered — TX drives, AUTO plan held.");
         }
 
-        // ── Mode-switch override ──────────────────────────────────────────
+        // ── Mode-switch: back to AUTO resumes; MANUAL drops to IDLE ──────────
         {
             uint16_t ch4 = rc.ch[CRSF_CH_MODE];
-            if (ch4_is_manual(ch4)) {
-                vesc_set_current(VESC_ID_LEFT,  0);
-                vesc_set_current(VESC_ID_RIGHT, 0);
-                DBG_PRINTLN("[RETURN] CH4→MANUAL — exiting to IDLE.");
-                transition_to(STATE_IDLE);
-                break;
-            }
             if (ch4_is_auto(ch4)) {
                 vesc_set_current(VESC_ID_LEFT,  0);
                 vesc_set_current(VESC_ID_RIGHT, 0);
-                DBG_PRINTLN("[RETURN] CH4→AUTO — exiting to IDLE.");
+                DBG_PRINTLN("[NUDGE] CH4→AUTO — resuming mow from held plan.");
+                transition_to(STATE_AUTO_MOWING);   // entry sees from_nudge → continues
+                break;
+            }
+            if (ch4_is_manual(ch4)) {
+                vesc_set_current(VESC_ID_LEFT,  0);
+                vesc_set_current(VESC_ID_RIGHT, 0);
+                vesc_set_current(VESC_ID_BLADE, 0);
+                s_blade_commanded = false;
+                s_blade_ramp_erpm = 0.0f;
+                DBG_PRINTLN("[NUDGE] CH4→MANUAL — exiting to IDLE.");
                 transition_to(STATE_IDLE);
                 break;
             }
         }
 
-        showLedsWithGps(COL_RED);
-
-        // Follow path to return waypoint via the node follower
-        {
-            WheelCmd cmd = node_follower_compute(pose, speed,
-                                                 &s_return_wp, 1, 0,
-                                                 (float)mower_config_get().cut_height_max_mm);
-            node_follower_to_vesc_duty(cmd);
+        // Blade follows the arm switch (same as MANUAL/AUTO — RC-controlled).
+        if (s_last_armed && !s_blade_commanded) {
+            s_blade_commanded = true;
+        } else if (!s_last_armed && s_blade_commanded) {
+            s_blade_commanded = false;
         }
 
-        // Arrived?
-        if (node_follower_waypoint_reached(pose, s_return_wp)) {
-            vesc_set_current(VESC_ID_LEFT,  0);
-            vesc_set_current(VESC_ID_RIGHT, 0);
-            DBG_PRINTLN("[RETURN] Arrived at start point → STATE_IDLE.");
-            transition_to(STATE_IDLE);
-        }
+        showLedsWithGps(COL_CYAN);   // distinct colour: nudging, AUTO held
+
+        // Operator drives the tracks (TX sticks), exactly as in MANUAL.
+        drive_manual(rc, pose, sm_dt);
         break;
     }
 
@@ -2982,6 +3114,11 @@ void state_machine_update() {
     case STATE_PAUSED: {
         if (g_state_entry) {
             // Motors were already zeroed before transitioning here.
+            // Snapshot the pose so the AUTO resume can tell whether the mower was
+            // moved during the pause (continue the cycle) or carried (restart it).
+            s_pause_x   = pose.x;
+            s_pause_y   = pose.y;
+            s_pause_hdg = pose.heading;
             servo_set_height_mm(mower_config_get().cut_height_max_mm);
             if (s_pause_event_latch) {
                 DBG_PRINTLN("[PAUSED] Safety event pause — cycle pause switch to acknowledge.");
@@ -3040,17 +3177,19 @@ void state_machine_update() {
             }
 
             if (ch4_is_auto(ch4p)) {
-                // Validate that the perimeter is still valid and mower is inside it
+                // Resume only if the perimeter is still valid AND all AUTO-start
+                // gates pass (heading established — latched, so normally yes; RTK
+                // fix; EPE ok; inside perimeter). Heading not requiring re-establish
+                // means a routine pause/resume just continues.
                 if (!perimeter_is_valid()) {
                     DBG_PRINTLN("[PAUSED] No valid perimeter — returning to IDLE.");
                     transition_to(STATE_IDLE);
-                } else if (!mower_inside_perimeter()) {
-                    DBG_PRINTLN("[PAUSED] Mower outside perimeter — returning to IDLE.");
-                    transition_to(STATE_IDLE);
-                } else {
+                } else if (auto_entry_allowed(gps)) {
                     DBG_PRINTLN("[PAUSED] Pause released — resuming AUTO_MOWING.");
                     safety_set_auto_mode(true);
                     transition_to(STATE_AUTO_MOWING);
+                } else {
+                    deny_auto_entry("PAUSED");  // logs the specific reason; stays paused
                 }
             } else {
                 DBG_PRINTLN("[PAUSED] Pause released, mode not AUTO — returning to IDLE.");
@@ -3232,7 +3371,7 @@ void state_machine_update() {
         s_crsf_telem_last_ms = millis();
         static const char *s_mode_names[] = {
             "INIT","IDLE","MANUAL","LEARN","AUTO",
-            "RETRACE","BOG","OBS-AVOID","RETURN","PAUSED","MOT-OFF"
+            "RETRACE","BOG","OBS-AVOID","NUDGE","PAUSED","MOT-OFF"
         };
 
         TelemetryData td;
@@ -3278,6 +3417,33 @@ void state_machine_update() {
         td.blade_load_pct = (uint8_t)(cutting_monitor_get_rpm_load_fraction() * 100.0f);  // RPM-based (Feature 2)
         td.fix_type       = (uint8_t)gps.fix_type;
         td.calib_status   = imu_get_calib_status();
+
+        // AUTO-start gate reason for the TX16S banner: report it only while the
+        // operator is requesting AUTO (CH4) from a state where AUTO can start but
+        // a gate is blocking it. 0 once AUTO runs or CH4 leaves AUTO (banner clears).
+        if (s_ch4_pos == 1 && (g_state == STATE_IDLE ||
+                               g_state == STATE_MANUAL ||
+                               g_state == STATE_PAUSED)) {
+            td.auto_deny_code = auto_entry_block_code(gps);
+        } else {
+            td.auto_deny_code = 0;
+        }
+
+        // Bearing to the next AUTO waypoint for the TX compass (yellow line).
+        // deg/2 in 0..179 (0=N, CW+); 255 = no waypoint being driven.
+        if (g_state == STATE_AUTO_MOWING && s_wp_index < s_wp_count) {
+            float dE = s_wp_buf[s_wp_index].x - pose.x;
+            float dN = s_wp_buf[s_wp_index].y - pose.y;
+            if (dE * dE + dN * dN > 1e-4f) {
+                float brg = atan2f(dE, dN) * (180.0f / (float)M_PI);  // 0=N, CW+
+                if (brg < 0.0f) brg += 360.0f;
+                td.wp_bearing_half = (uint8_t)((int)(brg * 0.5f + 0.5f) % 180);
+            } else {
+                td.wp_bearing_half = 255;   // essentially on top of the waypoint
+            }
+        } else {
+            td.wp_bearing_half = 255;
+        }
         td.flags          = (s_last_armed && g_state != STATE_PAUSED
                              && g_state != STATE_MOTORS_OFFLINE ? 0x01 : 0)
                           // Bit 0x02 = blade actually commanded — NOT just

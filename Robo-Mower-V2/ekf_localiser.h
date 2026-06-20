@@ -139,9 +139,14 @@ void ekf_predict(float v_left, float v_right, float dt);
  * @param dif_age_s   Seconds since last RTCM/NTRIP correction was applied.
  *                    Increases sigma when corrections are stale.
  * @param heading_rad Current EKF heading (rad), used for antenna offset rotation.
+ * @param epe_2d_m    Receiver-reported 2-D horizontal position error (m), when
+ *                    available (PQTMEPE). Preferred over the fix-type sigma table.
+ * @param epe_valid   True if @p epe_2d_m is a fresh, valid estimate; else the
+ *                    fix-type/HDOP sigma is used (graceful fallback).
  */
 void ekf_update_gps(float gps_east, float gps_north, int fix_type,
-                     float hdop, float dif_age_s, float heading_rad);
+                     float hdop, float dif_age_s, float heading_rad,
+                     float epe_2d_m, bool epe_valid);
 
 
 /**

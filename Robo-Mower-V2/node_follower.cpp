@@ -31,6 +31,7 @@ static bool     g_slip_detected      = false;
 static uint32_t g_stall_start_ms     = 0;
 static uint32_t g_slip_start_ms      = 0;
 static bool     g_pivoting           = false;   ///< spinning in place to align
+static bool     g_reversing          = false;   ///< driving backward to a behind-node (hysteresis)
 static float    g_session_distance_m = 0.0f;    ///< distance driven this AUTO session
 
 
@@ -136,6 +137,7 @@ void node_follower_init() {
     g_stall_start_ms     = 0;
     g_slip_start_ms      = 0;
     g_pivoting           = false;
+    g_reversing          = false;
     g_session_distance_m = 0.0f;
     wheel_duty_ramp_reset();
 }
@@ -199,8 +201,28 @@ WheelCmd node_follower_compute(const Pose2D &pose, float current_speed,
     float bearing = atan2f(dx, dy);                     // 0=North, CW+
     float hdg_err = wrapAngle(bearing - pose.heading);  // +ve = node is CW (right)
 
+    // ── Forward vs REVERSE selection ──────────────────────────────────────────
+    // When the node is BEHIND (|heading error| > ~90°) it's shorter to align the
+    // BACK and drive backward than to pivot >90° and arc forward (the wide arc
+    // swings out, sometimes across the perimeter). Hysteresis around 90° prevents
+    // chatter; a behind-node holds hdg_err near 180° so it stays in reverse until
+    // the next node is ahead. steer_err is the alignment error for whichever END
+    // leads (front when forward, back when reversing) — always ≤90° once chosen.
+    {
+        const float rev_enter = REV_ENTER_DEG * (float)M_PI / 180.0f;
+        const float rev_exit  = REV_EXIT_DEG  * (float)M_PI / 180.0f;
+        bool was_reversing = g_reversing;
+        if (!g_reversing && fabsf(hdg_err) > rev_enter)      g_reversing = true;
+        else if (g_reversing && fabsf(hdg_err) < rev_exit)   g_reversing = false;
+        if (g_reversing && !was_reversing) sys_log_push("NF reverse to behind node");
+        else if (!g_reversing && was_reversing) sys_log_push("NF forward");
+    }
+    // Alignment error and travel direction: reverse aligns the BACK (heading+π).
+    float steer_err = g_reversing ? wrapAngle(hdg_err - (float)M_PI) : hdg_err;
+    float dir_sign  = g_reversing ? -1.0f : 1.0f;   // -1 = drive backward
+
     // ── Pivot-on-the-spot (tracked-vehicle tank turn) ─────────────────────────
-    // When the heading error exceeds PIVOT_ENTER_DEG, spin in place (one track
+    // When the alignment error exceeds PIVOT_ENTER_DEG, spin in place (one track
     // forward, one reverse) until it drops below PIVOT_EXIT_DEG, then drive.
     // Hysteresis stops chatter. The differential-odometry EKF tracks heading
     // through the spin, so this closes the loop on the alignment.
@@ -209,18 +231,19 @@ WheelCmd node_follower_compute(const Pose2D &pose, float current_speed,
         const float exit_rad  = PIVOT_EXIT_DEG  * (float)M_PI / 180.0f;
 
         bool was_pivoting = g_pivoting;
-        if (!g_pivoting && fabsf(hdg_err) > enter_rad)      g_pivoting = true;
-        else if (g_pivoting && fabsf(hdg_err) < exit_rad)   g_pivoting = false;
+        if (!g_pivoting && fabsf(steer_err) > enter_rad)      g_pivoting = true;
+        else if (g_pivoting && fabsf(steer_err) < exit_rad)   g_pivoting = false;
 
         if (g_pivoting) {
             if (!was_pivoting) {
                 char l[48];
-                snprintf(l, sizeof(l), "NF pivot start %+.0f deg",
-                         (double)(hdg_err * 180.0f / (float)M_PI));
+                snprintf(l, sizeof(l), "NF pivot start %+.0f deg%s",
+                         (double)(steer_err * 180.0f / (float)M_PI),
+                         g_reversing ? " (rev)" : "");
                 sys_log_push(l);
             }
-            // +hdg_err → turn right (CW): left track forward, right track reverse.
-            float dir = (hdg_err >= 0.0f) ? 1.0f : -1.0f;
+            // +steer_err → turn right (CW): left track forward, right track reverse.
+            float dir = (steer_err >= 0.0f) ? 1.0f : -1.0f;
             float vl  =  dir * PIVOT_WHEEL_MS;
             float vr  = -dir * PIVOT_WHEEL_MS;
             // Spinning in place is not forward motion — clear stall/slip timers.
@@ -257,8 +280,15 @@ WheelCmd node_follower_compute(const Pose2D &pose, float current_speed,
 #endif
     v_cmd = max(v_cmd, mc.min_creep_speed_ms);
 
-    // Yaw rate proportional to heading error, capped. omega>0 = turn right (CW).
-    float omega = clampf(NODE_HEADING_KP * hdg_err, -NODE_YAW_RATE_MAX, NODE_YAW_RATE_MAX);
+    // Reversing to a behind-node: cap the magnitude (no fast blind reverse) and
+    // apply the direction. v_cmd is now signed (negative = backward); the body-twist
+    // differential mix below is direction-agnostic, so the same formula steers the
+    // leading end (front when forward, back when reversing) toward the node.
+    if (g_reversing && v_cmd > mc.max_mowing_speed_ms) v_cmd = mc.max_mowing_speed_ms;
+    v_cmd *= dir_sign;
+
+    // Yaw rate proportional to the alignment error, capped. omega>0 = turn right (CW).
+    float omega = clampf(NODE_HEADING_KP * steer_err, -NODE_YAW_RATE_MAX, NODE_YAW_RATE_MAX);
 
     // Differential mix: half the differential speed onto each wheel.
     // +omega (CW/right) → left (outer) wheel faster, right (inner) slower.
@@ -305,6 +335,7 @@ void node_follower_reset_stall() {
     g_stall_start_ms = 0; g_stall_detected = false;
     g_slip_start_ms  = 0; g_slip_detected  = false;
     g_pivoting       = false;
+    g_reversing      = false;
 }
 
 bool node_follower_is_pivoting() { return g_pivoting; }

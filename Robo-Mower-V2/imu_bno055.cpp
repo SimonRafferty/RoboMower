@@ -250,9 +250,10 @@ bool imu_heading_is_confident() {
 
 void imu_recalibrate() {
     clear_cal_in_nvs();
-    s_profile_saved = false;
-    s_saved_cal_q   = 0;      // forget the old quality so the next good cal is captured
-    s_force_recal   = true;   // task re-enters NDOF to drop the live profile
+    s_profile_saved       = false;
+    s_profile_loaded_boot = false;  // no trustworthy profile is active during a recal
+    s_saved_cal_q         = 0;      // forget the old quality so the next good cal is captured
+    s_force_recal         = true;   // task re-enters NDOF to drop the live profile
 }
 
 bool imu_profile_loaded() {

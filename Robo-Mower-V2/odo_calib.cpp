@@ -8,7 +8,10 @@
 //        d_odo  = Σ |½(vL+vR)| · dt        — odometry path length (scaled m)
 //        s_diff = Σ  (vL − vR)  · dt        — differential integral (scaled m)
 //    • The EKF emits a "heading event" (monotonic seq + travel heading + ENU
-//      position) every time it gets a clean straight RTK segment > 0.30 m.
+//      position) every time it gets a clean straight RTK-FIXED segment > 0.30 m.
+//      (The EKF only trims heading / publishes events on RTK-Fixed — Float fixes
+//      can be ~2 m off under tree cover — so this calibration is FIXED-ONLY too:
+//      both `scale` and `track_m` are referenced solely against Fixed positions.)
 //      When a NEW event arrives we look at the interval just completed:
 //        Δθ = wrap(θ_now − θ_prev),  d_gps = |ENU_now − ENU_prev|
 //        – nearly straight (|Δθ|<10°): accumulate d_gps / d_odo; once ≥ 3 m,

@@ -90,6 +90,11 @@ struct MowerConfig {
     // Appended at the end (keeps the positional NVS layout of all fields above
     // intact). NVS key bumped to mow_cfg_v12 for this addition.
     float    min_move_duty;               // static-friction kickstart: min |duty| when a wheel move is commanded [0–1]; 0 = off
+
+    // ── Coverage geometry ─────────────────────────────────────────────────────
+    // Appended (NVS key bumped to mow_cfg_v14). Inset of the spiral's outer ring
+    // (mow path) from the perimeter so the body clears corners while pivoting.
+    float    turn_margin_m;               // ring-0 inset from perimeter [m]; 0 = ring 0 = perimeter
 };
 
 
@@ -137,6 +142,9 @@ float mower_config_headland_m();
 
 /** Strip advance per pass = cut_width_m − strip_overlap_m. */
 float mower_config_strip_step_m();
+
+/** Turn margin: inset of the spiral's outer ring (mow path) from the perimeter [m]. */
+float mower_config_turn_margin_m();
 
 /** Forward reach of blade beyond steering centre = max(0, steer_to_cut + disc_radius). */
 float mower_config_blade_fwd_reach_m();
