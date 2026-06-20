@@ -49,7 +49,7 @@ All controls assume a RadioMaster TX16S in Mode 2 (throttle on the left stick). 
 | **CH1** | Steering | Left stick L/R | Left = turn left, Right = turn right |
 | **CH2** | Throttle | Right stick U/D | Up = forward, Down = reverse |
 | **CH3** | Cut height | Knob or slider | Low = minimum height, High = maximum height |
-| **CH4** | Mode | 3-position switch | **Down** = MANUAL · **Centre** = AUTO · **Up** = AUTO+RETURN |
+| **CH4** | Mode | 3-position switch | **Down** = MANUAL · **Centre** = AUTO · **Up** = NUDGE (hand sticks back, AUTO held) |
 | **CH5** | Learn (perimeter record) | 2-position switch | Up (active) = recording on, Down = off |
 | **CH6** | Arm (blade enable) | 2-position switch | Up = ARMED (blade allowed), Down = DISARMED |
 | **CH7** | Pause / Soft E-stop | Momentary or latching button | Press/hold = pause all motion |
@@ -60,8 +60,10 @@ All controls assume a RadioMaster TX16S in Mode 2 (throttle on the left stick). 
 | CH4 position | State machine mode | What happens |
 |--------------|--------------------|-------------|
 | Down | MANUAL | Operator drives with sticks; blade runs if CH6 armed |
-| Centre | AUTO | Autonomous mowing (requires valid perimeter) |
-| Up | AUTO + RETURN | Stops mowing and navigates back to the start point |
+| Centre | AUTO | Autonomous mowing (requires valid perimeter + GPS-established heading) |
+| Up | NUDGE | AUTO is **held** — you drive the tracks with the sticks to nudge the mower (off an obstacle, or to correct a drift) **without ending the run**. Flip back to Centre and it resumes the mow exactly where it left off. The blade still follows CH6. (This replaced the old "return to start", which wasn't used.) |
+
+> **Accidental mode switch:** if you flick AUTO → MANUAL by mistake and put it back to AUTO within ~4 seconds, it resumes the cycle where it left off rather than starting over. After 4 s, MANUAL → AUTO is treated as a fresh start.
 
 ### Telemetry on the TX16S
 
@@ -70,7 +72,7 @@ The mower transmits five CRSF telemetry frames back to the transmitter:
 - **GPS** — position and speed (visible on EdgeTX GPS screen)
 - **Battery** — voltage and estimated remaining %
 - **Attitude** — heading
-- **Mower Status (0x80)** — custom frame with headland/strip progress, blade load, fix quality, obstacles, area mowed. Read with a Lua widget.
+- **Mower Status (0x80)** — custom frame with mowing progress, blade load, fix quality, AUTO-deny reason, next-waypoint bearing, area mowed. Read with a Lua widget.
 
 ---
 
@@ -102,8 +104,7 @@ The WebUI is a single HTML file (`robomower-pwa/robomower.html`). Open it in **C
 | Button | Function | Notes |
 |--------|----------|-------|
 | **Manual** | Switch to MANUAL state | RC must be off |
-| **Auto** | Switch to AUTO_MOWING state | Requires valid perimeter; mower must be inside it |
-| **Return** | Switch to AUTO_RETURN | Navigates to perimeter start point |
+| **Auto** | Switch to AUTO_MOWING state | Requires valid perimeter + GPS-established heading; mower must be inside it |
 | **Learn** | Toggle perimeter learning on/off | See §5 |
 | **Store Pt** | Record current GPS position as a waypoint | Only active during Learn mode |
 | **Start Blade / Stop Blade** | Toggle blade arm | RC must be off. Only works in MANUAL or IDLE |
@@ -129,7 +130,9 @@ Sliders send commands continuously while held. The mower coasts to a stop within
 | **Centre on GPS** | Pan the map to the mower's last known position |
 | **Satellite** | Toggle between street map and satellite imagery |
 
-You can draw and edit the perimeter directly on the map using the leaflet-geoman draw tools (pencil icon on the map). After editing, tap **Send to Mower** to upload it.
+You can draw and edit the perimeter directly on the map using the leaflet-geoman draw tools (pencil icon on the map). After editing, tap **Send to Mower** to upload it. Only the perimeter points are editable — the cut path and the GPS accuracy circles are display-only.
+
+The map shows **two arrows**: a **red** one for the mower's fused (EKF) position and heading, and a **black** one for the raw GPS/RTK position and travel heading. When the fix is good they sit on top of each other; if the black one wanders off, that's the raw GPS being noisy (e.g. RTK "Float" under trees) and the red one is holding position on odometry — which is the intended behaviour. Each recorded perimeter corner also carries a small confidence circle sized to the GPS accuracy when it was taught.
 
 ---
 
@@ -178,8 +181,10 @@ If the save fails (too few points, self-intersection, polygon too small), the LE
 For precise corners or when driving continuously is difficult:
 
 1. Enter LEARN mode as above (CH5 active).
-2. Position the mower at each corner, then press the **CH8** momentary button to store that point.
+2. Position the mower at each corner, then press the **CH8** momentary button to store that point. **The transmitter beeps once for each point recorded** — wait for the beep before moving on, so you don't double-record or miss a corner. Corners can be as little as 0.1 m apart.
 3. When finished, flip CH5 off to close and save.
+
+Each corner is tagged with the GPS accuracy at the moment you pressed CH8, so it's worth getting an **RTK-Fixed** solution (green LED) at each corner. A corner taught under tree cover in "Float" is automatically pulled slightly inward (toward the garden centre, by its uncertainty) so the mower keeps clear of the boundary there — the rest of the perimeter is unaffected.
 
 ### Method C — Draw on the WebUI map
 
@@ -191,12 +196,9 @@ You can also combine methods: record a rough perimeter by driving, tap **Load fr
 
 ### After saving
 
-The firmware automatically computes:
-- **Navigation boundary** — inset from perimeter (keeps chassis inside)
-- **Working area** — inset further (where mowing strips are planned)
-- **Mowing plan** — boustrophedon strips at the optimal angle
+The firmware automatically computes the **mowing plan**: a concentric inward spiral that follows the perimeter, then steps inward one cut-width per ring to the centre. If the garden pinches into separate areas, each is spiralled in turn. (A navigation boundary and working area are also derived and shown, but the spiral and the safety boundary work directly from the perimeter.)
 
-The WebUI map shows all three layers after a successful upload or load.
+The WebUI map shows the perimeter and the planned path after a successful upload or load.
 
 ---
 
@@ -205,12 +207,12 @@ The WebUI map shows all three layers after a successful upload or load.
 ### Via RC
 
 1. Mower in **IDLE** state (blue single blink).
-2. Confirm GPS is green (RTK fix). If amber, the mow can still start but boundary accuracy will be slightly lower near the perimeter.
+2. **Establish heading first.** The mower starts up with no absolute heading — it learns it from the GPS travel direction. Get an **RTK-Fixed** solution (green LED) and drive a short straight run in MANUAL; the TX compass swings to true North and then stays locked (you won't need to do it again unless you reset). AUTO will refuse to start until the heading is established (the TX banners the reason).
 3. Set **CH4 = AUTO**.
 4. Set **CH6 = ARMED** (blade on).
 5. The mower enters AUTO_MOWING: LED = **orange double blink**.
 
-The mowing plan runs headland passes first (perimeter loops), then boustrophedon strips covering the interior.
+The plan follows the perimeter, then spirals inward to the centre. If part of the garden is under tree cover and the fix drops to "Float", the mower keeps going on dead-reckoning (it does **not** chase the noisy Float position) and snaps back to GPS when a clean Fixed returns. To reach a node behind it (e.g. across a bridge between rings), it reverses rather than swinging a wide arc.
 
 ### Via WebUI
 
@@ -221,9 +223,9 @@ The mowing plan runs headland passes first (perimeter loops), then boustrophedon
 ### During mowing
 
 - **Orange double blink** = mowing, all well.
-- **Yellow double blink** = RTK degraded to float — navigation continues but with wider perimeter margin.
-- The Dashboard shows headland progress (%), strip progress (%), blade load, and EKF position uncertainty.
-- The Map tab shows the planned route and which strips have been mowed.
+- **Yellow double blink** = RTK degraded to float — navigation continues on dead-reckoning until Fixed returns.
+- The Dashboard shows progress (%), blade load, and EKF position uncertainty.
+- The Map tab shows the planned route and which areas have been mowed, plus the red (EKF) and black (raw GPS) position arrows.
 
 ### Changing cut height mid-mow
 
@@ -232,11 +234,11 @@ The mowing plan runs headland passes first (perimeter loops), then boustrophedon
 
 ### Completion
 
-When all strips are finished, the mower enters **AUTO_RETURN** and navigates back to the perimeter start point, then enters **IDLE**. The blade stops automatically.
+When the spiral reaches the centre and the plan is finished, the mower stops, disarms the blade, and returns to **IDLE**. (There is no autonomous "drive back to start" — collect it from where it finishes, or drive it back in MANUAL.)
 
-You can also command a manual return at any time:
-- **RC**: Flip CH4 to UP (AUTO+RETURN)
-- **WebUI**: Tap **Return**
+### Nudging mid-mow
+
+If the mower needs a hand — too close to an obstacle, or a dead-reckoning drift to correct — flip **CH4 to UP (NUDGE)**. AUTO is held and you drive the tracks with the sticks. Flip back to **AUTO (Centre)** and it resumes the mow exactly where it left off (the plan and heading are preserved; the GPS keeps tracking your nudge, so it picks up correctly). The blade stays under CH6 throughout.
 
 ---
 
@@ -281,7 +283,7 @@ The LED shows **purple fast flash** while paused.
 
 1. Release the CH7 button, flip the GPIO6 switch open, or tap **Pause** again in the WebUI.
 2. Set CH4 = AUTO (or tap **Auto** in WebUI).
-3. The mower verifies the perimeter is still valid and the mower is inside it, then resumes from exactly where it stopped.
+3. The mower checks whether it **moved** while paused (it compares position before and after). If it didn't move, it **resumes from exactly where it stopped**. If it was carried somewhere (it moved significantly), it **restarts the cycle**, since its dead-reckoned position can no longer be trusted. The heading is kept either way — no need to re-establish it.
 
 ### Resuming — event-triggered pause
 
@@ -352,15 +354,15 @@ During AUTO_MOWING, the firmware automatically raises the deck if bog recovery o
 
 ### Voltage monitoring
 
-Battery voltage is read directly from the left drive VESC (CAN ID 1) via STATUS_5 packets — no external voltage divider hardware is needed. The pack is 13S LiPo (nominal 48 V).
+Battery voltage is read from the **blade VESC (CAN ID 3)** via STATUS_5 packets (bytes 4–5) — no external voltage divider hardware is needed. The pack is 13S LiPo (nominal 48 V).
 
 | Voltage | State | Action |
 |---------|-------|--------|
 | > 45.5 V | OK | Normal operation |
-| 42.9–45.5 V | WARNING | Amber LED overlay on the current state. Mowing continues. |
-| < 42.9 V | LOW | Blade motor stops immediately (locked out until power cycle). Drive motors continue if mowing — mower returns to start, then stops. |
+| 42.9–45.5 V | WARNING | Notification only: TX warning beep (repeats), flashing battery banner on the widget/phone, amber LED overlay. Mowing continues. |
+| < 42.9 V | LOW | Notification only (as above, more urgent). The VESCs reduce power internally as the pack sags; **the decision to stop or finish the run is left to you.** |
 
-The low-voltage blade lockout is permanent until the mower is power-cycled. It cannot be reset by software. This prevents accidental restart on a deeply discharged pack.
+There is deliberately **no** automatic blade lockout or drive-home on low battery — the VESCs manage the sagging voltage themselves, and a sudden autonomous stop/return mid-mow was more nuisance than help. Watch the warnings and bring it in when you're ready.
 
 ### Mid-session battery swap
 
@@ -387,7 +389,7 @@ Both the onboard NeoPixel (GPIO 48) and the external LED strip (GPIO 7) show the
 | LEARN (RTK float/autonomous) | Amber | Fast flash | Recording perimeter — reduced accuracy |
 | AUTO_MOWING (RTK fixed) | Orange | Double blink | Mowing, all well |
 | AUTO_MOWING (RTK float) | Yellow | Double blink | Mowing, GPS slightly degraded |
-| AUTO_RETURN | Cyan/Blue | Alternating (500ms each) | Returning to start point |
+| NUDGE | Cyan | Solid (with GPS overlay) | AUTO held; you're driving the tracks to nudge it |
 | RETRACE | Yellow | Fast flash | Blade overloaded — retrace in progress |
 | BOG_RECOVERY | Yellow | Slow pulse | Mower stalled/slipping — recovering |
 | OBSTACLE_AVOID | Orange | Fast flash | IMU collision detected — avoiding |
@@ -460,7 +462,7 @@ Offset of the RTK antenna from the steering centre. Positive forward = antenna i
 | Steer to cut | 0.0 m | Signed distance: steering centre → blade disc centre |
 | Blade radius | 0.21 m | Radius of cutting disc |
 | Cut width | 0.38 m | Effective cut width per pass |
-| Strip overlap | 0.02 m | Overlap between adjacent strips (must be < cut width) |
+| Strip overlap | 0.02 m | Overlap between adjacent spiral rings (must be < cut width); ring spacing = cut width − overlap |
 | Blade pole pairs | 10 | Blade motor pole pairs — measured from rotor detents |
 | Blade RPM | 2800 | Target blade mechanical RPM |
 
@@ -477,7 +479,7 @@ Offset of the RTK antenna from the steering centre. Positive forward = antenna i
 |-------|---------|-------|
 | Lookahead base | 0.40 m | Minimum lookahead distance at zero speed |
 | Lookahead K | 0.80 s | Lookahead scales with speed: total = base + K × speed |
-| Mow speed | 0.15 m/s | Forward speed during strip mowing |
+| Mow speed | 0.15 m/s | Forward speed while mowing |
 | Headland speed | 0.20 m/s | Speed during perimeter passes |
 | Transit speed | 0.30 m/s | Speed when not mowing (repositioning) |
 
@@ -533,6 +535,14 @@ The PILZ has fired or the VESCs lost power before the CAN bus was established. C
 - Are the VESCs powered from the 48V battery?
 - Are the CAN bus wires connected and terminated at both ends?
 
+### AUTO won't start (nothing happens when CH4 = AUTO)
+
+AUTO is gated and the TX banner shows the reason for ~2 seconds. Common ones:
+- **Heading not set** — drive a short straight run with an RTK-Fixed solution so the heading establishes (the TX compass swings to North), then try again.
+- **GPS fix not RTK** — wait for at least a Float (preferably Fixed) solution.
+- **Outside perimeter** — the mower's position is outside the recorded boundary.
+- **No perimeter** — teach one first (§5).
+
 ### Mower enters PAUSED immediately after starting AUTO
 
 The safety perimeter breach check triggered on entry. Possible causes:
@@ -550,18 +560,15 @@ The transmitter is on or the CRSF receiver is still linked. Power off the TX16S 
 
 - CH6 must be in the ARMED position (or **Start Blade** tapped in WebUI).
 - Check `STATUS` output: `armed: true` must appear.
-- Check battery voltage — blade is locked out below 42.9V.
+- The blade ramps up over ~2 seconds (the VESC's current limit does the soft start) — give it a moment.
 
-### Mower goes into BOG_RECOVERY constantly
+### Recovery modes (BOG / RETRACE / obstacle-avoid)
 
-The slip detection is triggering: the wheels are spinning but GPS/EKF says the robot is not moving. Possible causes:
-- Wet or very soft ground — the wheels are digging in rather than propelling the mower.
-- Raise the cut height and approach affected areas more slowly.
-- Check `SLIP_RATIO_THRESHOLD` in Config — increasing it makes the slip detection less sensitive.
+These are built but **currently disabled** — the detectors produced too many false triggers, so for now the blade is operator-controlled (CH6) in AUTO and the only automatic responses left are tilt and the perimeter-breach/VESC-silence safeties. So you should not see BOG_RECOVERY, RETRACE or OBSTACLE_AVOID in normal use; they'll be re-enabled once the detectors are trustworthy.
 
 ### GPS position jumps during mowing
 
-The NTRIP RTK correction has changed base station or lost packets. The EKF innovation gate prevents large single-cycle jumps from being applied instantly — the position will converge smoothly over 2–3 GPS updates. If jumps are frequent, check your NTRIP connection quality.
+The mower only snaps its position to the GPS when it has a clean **RTK-Fixed** solution; on Float (e.g. under trees) it ignores the noisy fix and dead-reckons on odometry, so the on-map position should stay smooth and only correct when Fixed returns. Watch the two map arrows: if the **black** (raw GPS) arrow jumps about while the **red** (fused) one holds steady, that's working as intended. If the *red* arrow drifts a long way before a Fixed pulls it back, you spent a long stretch in Float — improving sky view / antenna gain (more Fixed) is the fix.
 
 ### Perimeter save fails after driving
 
@@ -571,11 +578,13 @@ Common reasons (check serial output):
 - **Area less than 5 m²**: the perimeter is too small.
 - **No viable robot fit**: after insetting the navigation boundary, nothing remains — garden is too narrow for the robot.
 
-### Blade fault / mower pauses unexpectedly with event latch
+### Blade warning (load high / not reaching RPM)
 
-The blade current dropped to near zero while the blade was commanded on, or the blade failed to reach target RPM. Possible causes:
+In AUTO the blade is operator-controlled and a blade fault **warns but does not pause** the mower (it keeps driving). If the blade load reads high or it isn't reaching target RPM:
 - Object lodged in the cutting deck — inspect and clear.
 - Blade belt/spindle failure.
 - Blade VESC fault — check VESC Tool for motor faults.
+
+(The event-latched PAUSE still applies to the *active* safeties: perimeter breach and tilt.)
 
 After clearing the cause, cycle the CH7 pause button to acknowledge and resume.

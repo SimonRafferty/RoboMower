@@ -18,11 +18,11 @@ in the settings (Web UI) I've tried to cover as many permutations of the layout 
 
 ## How it works
 
-You teach it the garden by driving it around the edge with the RC transmitter (or drawing the boundary on the map in the WebUI - both work).  From that one polygon it works out everything else: a navigation boundary the chassis must stay inside, and a working area where the stripes go.
+You teach it the garden by driving it around the edge with the RC transmitter (or drawing the boundary on the map in the WebUI - both work).  That recorded line is the limit the mower's steering centre is allowed to reach, and it plans a path that covers everything inside it.
 
-The path planning works just like a 3D Printer slicer - which is where I stole the idea from.  It mows the perimeter first (like the walls of a print), then an outline around each striped region, then fills in with parallel stripes (the infill).  
+The path planning borrows the idea from a 3D printer slicer.  It follows the perimeter, then spirals inward ring by ring - each ring one cut-width inside the last - until it reaches the middle, so the whole lawn is covered in one continuous path.  If the garden pinches into separate areas (a neck through to a side lawn, say), each area gets its own spiral.
 
-Position comes from a DFRobot RTK GPS (which was the most reasonably priced I could find), dead-reckoned on wheel odometry between fixes.  Heading comes from a magnetometer-based 9-axis IMU (a Bosch BNO055): its on-chip fusion gives a tilt-compensated absolute compass heading, with a small offset continuously trimmed from the GPS travel direction on straight runs.
+Position comes from a DFRobot RTK GPS (which was the most reasonably priced I could find).  The mower only trusts the GPS when it has a centimetre-accurate **RTK-Fixed** solution; the rest of the time it dead-reckons on wheel odometry.  That matters because gardens have trees, and RTK drops to a less accurate "Float" solution (sometimes a metre or two out) under the canopy - so rather than chase a bad fix, it coasts on odometry until a clean Fixed comes back.  Heading comes from a magnetometer-based 9-axis IMU (a Bosch BNO055): its on-chip fusion gives a tilt-compensated absolute compass heading, with a small offset trimmed from the GPS travel direction on straight RTK-Fixed runs.  The wheel-odometry scale (ticks per metre) and track width are self-calibrated against the GPS, again only on Fixed.
 
 In case you're interested, you can find small tracks on eBay & AliExpress, intended for ATV's.  I used a pair of Bafung geared e-bike front wheel motors with the freewheel clutch welded up so they will drive in reverse to drive the tracks.  They produce bags of torque at low current and are super robust!
 
@@ -39,7 +39,9 @@ If it gets stuck in long wet grass, it raises the cutting deck, has another go, 
 
 ## Controls & monitoring
 
-Day to day you don't need a laptop for anything.  The TX16S runs a Lua widget (in the repository) showing state, battery, blade load, GPS quality and a compass - and it beeps at you when the mower wants attention.  CH4 selects Manual/Auto/Return, CH5 records the perimeter, CH6 arms the blade, CH7 pauses.
+Day to day you don't need a laptop for anything.  The TX16S runs a Lua widget (in the repository) showing state, battery, blade load, GPS quality and a compass (with a line pointing at the next waypoint) - and it beeps at you when the mower wants attention.  CH4 selects Manual / Auto / Nudge, CH5 records the perimeter, CH6 arms the blade, CH7 pauses.
+
+A few things make it pleasant to live with.  **Nudge** (CH4 up) hands the sticks back to you mid-mow without ending the run - shove it off an obstacle or correct a drift, flick back to Auto and it carries on exactly where it was.  Pausing and flicking back to Auto does the same as long as the mower hasn't been moved; if you carried it somewhere, it starts the cycle again.  And rather than swing a wide arc to reach a point behind it (which could wander over the boundary), it simply reverses to it.
 
 ![The TX16S running the Lua telemetry widget](TX16S.jpg)
 
