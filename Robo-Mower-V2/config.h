@@ -363,6 +363,9 @@
 // so it stays in reverse until the next node is ahead.
 #define REV_ENTER_DEG            100.0f  // [deg] — switch to reverse when |heading error| exceeds this
 #define REV_EXIT_DEG             80.0f   // [deg] — switch back to forward once |heading error| drops below this
+// After ONE backward node, force this many forward nodes before reverse is allowed
+// again — geometry-independent guard so the mower can never get locked in reverse.
+#define REVERSE_FWD_LOCK_WAYPOINTS  4    // [nodes]
 
 // Node follower (drive branch): P-controller turns yaw rate from heading error.
 #define NODE_HEADING_KP           1.5f   // [1/s] — yaw rate = KP × heading error (rad)
@@ -566,6 +569,11 @@
 // trustworthy). NUDGE always continues (the EKF tracked the manual drive).
 #define PAUSE_RESUME_MAX_MOVE_M       0.5f    // [m]
 #define PAUSE_RESUME_MAX_TURN_RAD     0.35f   // [rad] ~20 deg
+
+// Accidental AUTO→MANUAL grace: if AUTO is re-selected within this long of leaving
+// it for MANUAL, resume the cycle where it left off (don't restart) — covers a
+// fumbled mode switch mid-mow. After this, MANUAL→AUTO is a fresh start as usual.
+#define AUTO_RESUME_GRACE_MS          4000    // [ms]
 
 
 // ══════════════════════════════════════════════════════════════════════════════

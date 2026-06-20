@@ -213,6 +213,11 @@ static float s_pause_x   = 0.0f;
 static float s_pause_y   = 0.0f;
 static float s_pause_hdg = 0.0f;
 
+// Set to millis() when MANUAL is entered FROM AUTO_MOWING (0 otherwise). If AUTO is
+// re-selected within AUTO_RESUME_GRACE_MS, the mow resumes where it left off — covers
+// an accidental mid-mow flick of the mode switch.
+static uint32_t s_manual_from_auto_ms = 0;
+
 // ── RETRACE state locals ──────────────────────────────────────────────────────
 static float s_retrace_strip_end_x = 0.0f;
 static float s_retrace_strip_end_y = 0.0f;
@@ -2120,6 +2125,9 @@ void state_machine_update() {
     // ── STATE_MANUAL ──────────────────────────────────────────────────────────
     case STATE_MANUAL: {
         if (g_state_entry) {
+            // Came straight from AUTO? Arm the resume-grace so a fumbled mode-switch
+            // can flick back to AUTO within AUTO_RESUME_GRACE_MS and continue the mow.
+            s_manual_from_auto_ms = (g_prev_state == STATE_AUTO_MOWING) ? millis() : 0;
             s_heading_active = false;
             s_drive_duty_l = 0.0f;
             s_drive_duty_r = 0.0f;
@@ -2304,6 +2312,10 @@ void state_machine_update() {
             //  • Otherwise: fresh start.
             bool from_nudge = (g_prev_state == STATE_AUTO_NUDGE);
             bool from_pause = (g_prev_state == STATE_PAUSED);
+            // Accidental AUTO→MANUAL→AUTO within the grace window: continue, don't restart.
+            bool from_manual_grace = (g_prev_state == STATE_MANUAL && s_manual_from_auto_ms != 0 &&
+                                      (uint32_t)(millis() - s_manual_from_auto_ms) < AUTO_RESUME_GRACE_MS);
+            if (from_manual_grace) sys_log_push("AUTO: resumed after brief MANUAL (grace) - continuing");
             bool moved_in_pause = false;
             if (from_pause) {
                 float dpx = pose.x - s_pause_x, dpy = pose.y - s_pause_y;
@@ -2318,7 +2330,7 @@ void state_machine_update() {
                          moved_in_pause ? "RESTART cycle" : "continue");
                 sys_log_push(l);
             }
-            bool resuming = from_nudge || (from_pause && !moved_in_pause);
+            bool resuming = from_nudge || from_manual_grace || (from_pause && !moved_in_pause);
 
             bool plan_ok = coverage_planner_plan(
                 perimeter_get_perimeter(),

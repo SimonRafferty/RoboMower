@@ -32,6 +32,8 @@ static uint32_t g_stall_start_ms     = 0;
 static uint32_t g_slip_start_ms      = 0;
 static bool     g_pivoting           = false;   ///< spinning in place to align
 static bool     g_reversing          = false;   ///< driving backward to a behind-node (hysteresis)
+static int      g_reverse_lockout    = 0;       ///< waypoints to force FORWARD after a reverse (anti-lock-in)
+static int      g_nf_last_wp_index   = -1;      ///< previous wp_index, for detecting advancement
 static float    g_session_distance_m = 0.0f;    ///< distance driven this AUTO session
 
 
@@ -138,6 +140,8 @@ void node_follower_init() {
     g_slip_start_ms      = 0;
     g_pivoting           = false;
     g_reversing          = false;
+    g_reverse_lockout    = 0;
+    g_nf_last_wp_index   = -1;
     g_session_distance_m = 0.0f;
     wheel_duty_ramp_reset();
 }
@@ -201,20 +205,42 @@ WheelCmd node_follower_compute(const Pose2D &pose, float current_speed,
     float bearing = atan2f(dx, dy);                     // 0=North, CW+
     float hdg_err = wrapAngle(bearing - pose.heading);  // +ve = node is CW (right)
 
+    // ── Reverse availability: counter lock (geometry-independent) ─────────────
+    // Reverse can help reach a behind-node, but must NEVER lock the mower into
+    // driving backward indefinitely (a geometry lookahead was unreliable). Allow at
+    // most ONE backward node, then force the next REVERSE_FWD_LOCK_WAYPOINTS forward.
+    // Track waypoint advancement (the state machine owns wp_index) to count the lock
+    // down. A reverse that just completed (g_reversing true at an advance) arms the
+    // lock; a wp_index reset (plan reload) clears it.
+    if (wp_index < g_nf_last_wp_index) {
+        g_reverse_lockout = 0;
+    } else if (g_nf_last_wp_index >= 0 && wp_index > g_nf_last_wp_index) {
+        if (g_reversing) {
+            g_reverse_lockout = REVERSE_FWD_LOCK_WAYPOINTS;   // finished a reverse → lock forward
+        } else if (g_reverse_lockout > 0) {
+            g_reverse_lockout -= (wp_index - g_nf_last_wp_index);
+            if (g_reverse_lockout < 0) g_reverse_lockout = 0;
+        }
+    }
+    g_nf_last_wp_index = wp_index;
+
     // ── Forward vs REVERSE selection ──────────────────────────────────────────
-    // When the node is BEHIND (|heading error| > ~90°) it's shorter to align the
-    // BACK and drive backward than to pivot >90° and arc forward (the wide arc
-    // swings out, sometimes across the perimeter). Hysteresis around 90° prevents
-    // chatter; a behind-node holds hdg_err near 180° so it stays in reverse until
-    // the next node is ahead. steer_err is the alignment error for whichever END
-    // leads (front when forward, back when reversing) — always ≤90° once chosen.
+    // Node BEHIND (|heading error| > ~90°): align the BACK and drive backward (one
+    // short node), unless the forward-lock is active. Otherwise face the node and
+    // drive forward. Hysteresis around 90° prevents chatter. steer_err is the
+    // alignment error of whichever END leads (front fwd / back rev) — ≤90° once set.
     {
         const float rev_enter = REV_ENTER_DEG * (float)M_PI / 180.0f;
         const float rev_exit  = REV_EXIT_DEG  * (float)M_PI / 180.0f;
         bool was_reversing = g_reversing;
-        if (!g_reversing && fabsf(hdg_err) > rev_enter)      g_reversing = true;
-        else if (g_reversing && fabsf(hdg_err) < rev_exit)   g_reversing = false;
-        if (g_reversing && !was_reversing) sys_log_push("NF reverse to behind node");
+        if (g_reverse_lockout > 0) {
+            g_reversing = false;                 // forward-locked after a recent reverse
+        } else if (!g_reversing) {
+            if (fabsf(hdg_err) > rev_enter) g_reversing = true;
+        } else {
+            if (fabsf(hdg_err) < rev_exit)  g_reversing = false;
+        }
+        if (g_reversing && !was_reversing) sys_log_push("NF reverse 1 node (behind)");
         else if (!g_reversing && was_reversing) sys_log_push("NF forward");
     }
     // Alignment error and travel direction: reverse aligns the BACK (heading+π).
@@ -280,11 +306,10 @@ WheelCmd node_follower_compute(const Pose2D &pose, float current_speed,
 #endif
     v_cmd = max(v_cmd, mc.min_creep_speed_ms);
 
-    // Reversing to a behind-node: cap the magnitude (no fast blind reverse) and
-    // apply the direction. v_cmd is now signed (negative = backward); the body-twist
-    // differential mix below is direction-agnostic, so the same formula steers the
-    // leading end (front when forward, back when reversing) toward the node.
-    if (g_reversing && v_cmd > mc.max_mowing_speed_ms) v_cmd = mc.max_mowing_speed_ms;
+    // Reversing to a behind-node uses the SAME speed profile/constraints as forward
+    // (per operator): apply the direction sign here. v_cmd is now signed (negative =
+    // backward); the body-twist differential mix below is direction-agnostic, so the
+    // same formula steers the leading end (front fwd / back rev) toward the node.
     v_cmd *= dir_sign;
 
     // Yaw rate proportional to the alignment error, capped. omega>0 = turn right (CW).
@@ -336,6 +361,8 @@ void node_follower_reset_stall() {
     g_slip_start_ms  = 0; g_slip_detected  = false;
     g_pivoting       = false;
     g_reversing      = false;
+    g_reverse_lockout  = 0;
+    g_nf_last_wp_index = -1;
 }
 
 bool node_follower_is_pivoting() { return g_pivoting; }
