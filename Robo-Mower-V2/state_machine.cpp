@@ -31,6 +31,7 @@
 #include "perimeter.h"
 #include "geometry.h"
 #include "coverage_planner.h"
+#include "obstacle_discs.h"
 #include "node_follower.h"
 #include "clipper_offset.h"
 #include "odo_calib.h"
@@ -1511,6 +1512,31 @@ static void handle_ble_command(const char *json) {
         return;
     }
 
+    // ── ADD_TEST_DISC — inject a test obstacle disc 1.5 m ahead ────────────
+    if (strcmp(cmd, "ADD_TEST_DISC") == 0) {
+        // Inject a disc 1.5 m ahead of the steering centre along current heading.
+        // DISC_SENSOR = the reserved future-sensor source (exercises the LIDAR path).
+        Pose2D p = ekf_get_pose();
+        const float ahead = 1.5f;
+        float ox = p.x + sinf(p.heading) * ahead;   // ENU: x=E, heading 0=N, CW+
+        float oy = p.y + cosf(p.heading) * ahead;
+        bool ok = obstacle_discs_add(ox, oy, mower_config_nav_inset_m(), DISC_SENSOR);
+        char l[SYS_LOG_MAX_LEN];
+        snprintf(l, sizeof(l), "TEST disc %s @ %.1f,%.1f (n=%d)",
+                 ok ? "added" : "FULL", (double)ox, (double)oy, obstacle_discs_count());
+        sys_log_push(l);
+        ble_server_send_ack(cmd, ok, l);
+        return;
+    }
+
+    // ── CLEAR_DISCS — remove all active obstacle discs ───────────────────────
+    if (strcmp(cmd, "CLEAR_DISCS") == 0) {
+        obstacle_discs_clear();
+        sys_log_push("TEST discs cleared");
+        ble_server_send_ack(cmd, true, "discs cleared");
+        return;
+    }
+
     ble_server_send_ack(cmd, false, "unknown command");
 }
 
@@ -2294,6 +2320,10 @@ void state_machine_update() {
         static uint32_t s_auto_entry_ms = 0;  // time AUTO was entered; used to gate obstacle detection
         static float    s_auto_entry_x  = 0;  // mower position at AUTO entry — segment start
         static float    s_auto_entry_y  = 0;  // for the index-0 pass-through projection
+        static Point s_detour_vias[DETOUR_MAX_VIAS];  // active detour via-points (Plan-1 planner)
+        static int   s_detour_n  = 0;                 // vias in the active detour (0 = none)
+        static int   s_detour_i  = 0;                 // current via index
+        static int   s_detour_wp = -1;                // s_wp_index the detour was planned for
         if (g_state_entry) {
             heading_controller_reset();
             DBG_PRINTLN("[AUTO] Entering AUTO_MOWING — planning path...");
@@ -2349,6 +2379,7 @@ void state_machine_update() {
             } else {
                 node_follower_reset_session_distance();   // fresh session only
                 coverage_planner_reset_progress();        // clear visited high-water mark
+                obstacle_discs_clear();                   // fresh run: start with no discs (discs persist across pause/nudge)
             }
 
             // Load all waypoints into local buffer for node follower
@@ -2409,6 +2440,7 @@ void state_machine_update() {
             node_follower_reset_stall();
             wheel_duty_ramp_reset(); // zero stale duty from manual driving; prevents carry-over reverse
             collisionClear();        // flush stale jolt data from manual driving
+            s_detour_n = 0; s_detour_i = 0; s_detour_wp = -1;
         }
 
         // ── Blade follows arm switch: armed = blade on (ramp up), disarmed = blade off (ramp down)
@@ -2681,9 +2713,75 @@ void state_machine_update() {
             // Heading comes from the BNO055 (NDOF auto-calibrates continuously) +
             // GPS-trimmed offset. AUTO does NOT gate on calibration status — the
             // fused heading is usable from the start and GPS corrects any bias.
-            WheelCmd cmd = node_follower_compute(pose, speed,
-                                                 s_wp_buf, s_wp_count, s_wp_index,
-                                                 s_desired_cut_height_mm, speed_scale);
+
+            // ── Reactive obstacle detour ──────────────────────────────────────────
+            // If the straight leg to the current node enters an active obstacle disc,
+            // steer to via-point(s) that skirt it (Plan-1 obstacle_discs planner). The
+            // coverage plan + in-order resume are untouched — only the per-tick target
+            // is redirected. Detour exhausted (cannot clear within bounds) → PAUSE.
+            const Waypoint &realwp = s_wp_buf[s_wp_index];
+            Waypoint tgt = realwp;
+            bool detour_paused = false;
+            if (obstacle_discs_count() > 0) {
+                float wad        = mower_config_get().waypoint_arrive_dist_m;
+                float via_arrive2 = wad * wad;
+                bool  blocked_now = obstacle_discs_segment_blocked(
+                                        pose.x, pose.y, realwp.x, realwp.y,
+                                        DETOUR_CLEARANCE_M) >= 0;
+                // (Re)plan when the target node changed, or a disc now blocks a leg
+                // that had no active detour (e.g. a disc added mid-leg).
+                if (s_detour_wp != s_wp_index || (s_detour_n == 0 && blocked_now)) {
+                    s_detour_wp = s_wp_index;
+                    s_detour_i  = 0;
+                    int n = obstacle_discs_plan_detour(
+                                pose.x, pose.y, realwp.x, realwp.y,
+                                perimeter_get_perimeter(),
+                                DETOUR_CLEARANCE_M, DETOUR_OFFSET_MARGIN_M, DETOUR_MAX_VIAS,
+                                s_detour_vias);
+                    if (n < 0) {
+                        sys_log_push("AUTO: obstacle detour exhausted - pausing");
+                        s_detour_n   = 0;
+                        detour_paused = true;
+                    } else {
+                        s_detour_n = n;
+                    }
+                }
+                // Advance past reached vias.
+                while (!detour_paused && s_detour_i < s_detour_n) {
+                    float ddx = s_detour_vias[s_detour_i].x - pose.x;
+                    float ddy = s_detour_vias[s_detour_i].y - pose.y;
+                    if (ddx * ddx + ddy * ddy <= via_arrive2) s_detour_i++;
+                    else break;
+                }
+                if (!detour_paused && s_detour_i < s_detour_n) {
+                    tgt.x       = s_detour_vias[s_detour_i].x;   // steer to the via
+                    tgt.y       = s_detour_vias[s_detour_i].y;
+                    tgt.reverse = false;                         // vias are forward transit
+                } else if (!detour_paused) {
+                    s_detour_n = 0;                              // detour complete → real node
+                }
+            }
+            if (detour_paused) {
+                vesc_set_current(VESC_ID_LEFT,  0);
+                vesc_set_current(VESC_ID_RIGHT, 0);
+                s_blade_commanded = false;
+                s_blade_ramp_erpm = 0.0f;
+                transition_to(STATE_PAUSED);
+                break;
+            }
+
+            // Drive toward the via as a 1-element transient plan while detouring;
+            // otherwise the normal full-plan call (keeps node_follower's multi-waypoint
+            // + reverse-counter behaviour for ordinary mowing).
+            WheelCmd cmd;
+            if (s_detour_n > 0) {
+                cmd = node_follower_compute(pose, speed, &tgt, 1, 0,
+                                            s_desired_cut_height_mm, speed_scale);
+            } else {
+                cmd = node_follower_compute(pose, speed,
+                                            s_wp_buf, s_wp_count, s_wp_index,
+                                            s_desired_cut_height_mm, speed_scale);
+            }
 
             // Per-track velocity cap: ALLOW REVERSE on a track so the tracked
             // vehicle can counter-rotate (tank steer / pivot on the spot) to reach
@@ -3469,7 +3567,7 @@ void state_machine_update() {
                           // Bit 0x20: battery WARNING or LOW — drives the
                           // flashing battery banner on the TX16S Lua widget
                           | (battery_get_state() != BATTERY_OK ? 0x20 : 0);
-        td.obs_count      = (uint16_t)obstacle_get_count();
+        td.obs_count      = (uint16_t)obstacle_discs_count();   // active detour discs
         { float unc_cm = ekf_get_position_uncertainty() * 100.0f;
           td.ekf_unc_cm = (unc_cm > 65535.0f) ? 65535u : (uint16_t)unc_cm; }
         td.session_mowed_dm2 = 0;  // TODO: integrate from coverage_planner
