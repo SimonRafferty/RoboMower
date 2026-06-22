@@ -415,6 +415,13 @@
 // active. Set back to 1 once the detectors are fixed and recalibrated.
 #define AUTO_FAULT_RESPONSES_ENABLED  0
 
+// ── Per-detector enables (replacing the blanket gate above, incrementally) ──
+// Plan 3: collision → obstacle disc → back-up → detour. Default ON, but the
+// collision baseline is not yet field-confirmed: a false jolt costs a needless
+// 0.4 m reverse + detour (bounded-safe). Watch the COLL log on first runs; set
+// to 0 if it fires without a real hit, and report the jolt/base values.
+#define COLLISION_RESPONSE_ENABLED  1
+
 // Obstacle avoidance
 #define OBSTACLE_BACKUP_DIST_M        0.40f   // [m] — reverse distance after collision (default; direction-adjusted)
 #define OBSTACLE_BACKUP_SPEED_MS      0.10f   // [m/s] — speed during reverse after collision
