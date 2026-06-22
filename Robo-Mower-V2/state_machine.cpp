@@ -2330,6 +2330,13 @@ void state_machine_update() {
         static float s_tilt_rev_x      = 0.0f;   // pose where the tilt-reverse began
         static uint32_t s_tilt_rev_start_ms = 0; // millis() when tilt-reverse began (timeout cap)
         static float s_tilt_rev_y      = 0.0f;
+        static bool  s_slip_win_valid = false;  // detection window has a valid start fix
+        static float s_slip_win_e = 0.0f, s_slip_win_n = 0.0f;  // raw-GPS at window start (ENU m)
+        static float s_slip_cmd_dist = 0.0f;    // commanded forward distance this window (m)
+        static bool  s_slip_reversing = false;  // in slip reverse-to-confirm
+        static float s_slip_rev_e = 0.0f, s_slip_rev_n = 0.0f;  // raw-GPS at reverse start
+        static float s_slip_rev_cmd = 0.0f;     // commanded reverse distance so far (m)
+        static float s_slip_disc_x = 0.0f, s_slip_disc_y = 0.0f;  // disc centre (ahead of detection)
         if (g_state_entry) {
             heading_controller_reset();
             DBG_PRINTLN("[AUTO] Entering AUTO_MOWING — planning path...");
@@ -2449,6 +2456,8 @@ void state_machine_update() {
             s_detour_n = 0; s_detour_i = 0; s_detour_wp = -1;
             s_coll_backup_until_ms = 0;
             s_tilt_confirm = 0; s_tilt_reversing = false;
+            s_slip_win_valid = false; s_slip_reversing = false;
+            s_slip_cmd_dist = 0.0f;  s_slip_rev_cmd  = 0.0f;
         }
 
         // ── Blade follows arm switch: armed = blade on (ramp up), disarmed = blade off (ramp down)
@@ -2745,6 +2754,47 @@ void state_machine_update() {
             }
         }
 
+        // ── Slip recovery: reverse to tell an obstacle from a true stuck ───────
+        // Reverse at creep watching the RAW GPS fix: if it moves (≥ SLIP_MOTION_M)
+        // after backing clear → obstacle blocked forward → disc + detour; if it
+        // reverses the cap with the fix still flat → genuinely stuck → PAUSE; no
+        // fix → PAUSE.
+        if (s_slip_reversing) {
+            GpsMeasurement sm = rtk_gps_get_measurement();
+            if (!sm.valid) {
+                sys_log_push("SLIP: no fix during recovery -> PAUSE");
+                vesc_set_current(VESC_ID_LEFT,  0);
+                vesc_set_current(VESC_ID_RIGHT, 0);
+                vesc_set_current(VESC_ID_BLADE, 0);
+                s_blade_commanded = false; s_blade_ramp_erpm = 0.0f;
+                s_slip_reversing = false;
+                collisionSaveBaselineForced();
+                transition_to(STATE_PAUSED);
+                break;
+            }
+            float d_rev = hypotf(sm.enu_east_m - s_slip_rev_e,
+                                 sm.enu_north_m - s_slip_rev_n);
+            s_slip_rev_cmd += OBSTACLE_BACKUP_SPEED_MS * 0.1f;   // 10 Hz tick
+            if (d_rev >= SLIP_MOTION_M && s_slip_rev_cmd >= OBSTACLE_BACKUP_DIST_M) {
+                obstacle_discs_add(s_slip_disc_x, s_slip_disc_y,
+                                   mower_config_nav_inset_m(), DISC_SLIP);
+                s_slip_reversing = false;
+                node_follower_reset_stall();
+                sys_log_push("SLIP: obstacle -> disc + detour");
+            } else if (s_slip_rev_cmd >= SLIP_REVERSE_MAX_DIST_M) {
+                sys_log_push("SLIP: stuck (no GPS motion) -> PAUSE");
+                vesc_set_current(VESC_ID_LEFT,  0);
+                vesc_set_current(VESC_ID_RIGHT, 0);
+                vesc_set_current(VESC_ID_BLADE, 0);
+                s_blade_commanded = false; s_blade_ramp_erpm = 0.0f;
+                s_slip_reversing = false;
+                collisionSaveBaselineForced();
+                transition_to(STATE_PAUSED);
+                break;
+            }
+            // else: keep reversing (drive-override block).
+        }
+
         // Strip truncation: if margin <= 0 and on a mowing STRIP waypoint, skip
         // the rest of that strip. Headland passes are EXEMPT: they are flagged
         // mowing=true but are deliberately driven along the perimeter edge, where
@@ -2815,7 +2865,7 @@ void state_machine_update() {
             // placed disc, so plan_detour would (correctly) fail and PAUSE before the
             // reverse can run. The reverse override drives instead; once it completes
             // and the mower has backed clear of the disc, this block routes around it.
-            if (s_coll_backup_until_ms == 0 && !s_tilt_reversing &&
+            if (s_coll_backup_until_ms == 0 && !s_tilt_reversing && !s_slip_reversing &&
                 obstacle_discs_count() > 0) {
                 float wad        = mower_config_get().waypoint_arrive_dist_m;
                 float via_arrive2 = wad * wad;
@@ -2911,6 +2961,10 @@ void state_machine_update() {
             else if (s_tilt_reversing) {
                 // Tilt reverse-to-clear: creep backward; termination is decided in
                 // the tilt block above (level + cleared, or cap → PAUSE).
+                float v = -OBSTACLE_BACKUP_SPEED_MS;
+                cmd.left_ms = v; cmd.right_ms = v; cmd.v_cmd = v; cmd.kappa = 0.0f;
+            }
+            else if (s_slip_reversing) {
                 float v = -OBSTACLE_BACKUP_SPEED_MS;
                 cmd.left_ms = v; cmd.right_ms = v; cmd.v_cmd = v; cmd.kappa = 0.0f;
             }
@@ -3023,7 +3077,7 @@ void state_machine_update() {
             // plan segment — letting it skip the real cursor would abandon the very
             // node we are detouring toward.
             float xte = fabsf(node_follower_get_cross_track_error());
-            if (s_detour_n > 0 || s_coll_backup_until_ms != 0 || s_tilt_reversing) {
+            if (s_detour_n > 0 || s_coll_backup_until_ms != 0 || s_tilt_reversing || s_slip_reversing) {
                 s_cross_track_exceed_ms = 0;        // don't accumulate during a detour/back-up/tilt-reverse
             } else if (xte > 0.5f) {
                 if (s_cross_track_exceed_ms == 0) s_cross_track_exceed_ms = millis();
@@ -3063,7 +3117,7 @@ void state_machine_update() {
             // wheels legitimately aren't advancing forward.
             if (STALL_RESPONSE_ENABLED && obs_armed &&
                 !node_follower_is_pivoting() && !node_follower_is_reversing() &&
-                s_detour_n == 0 && s_coll_backup_until_ms == 0 && !s_tilt_reversing &&
+                s_detour_n == 0 && s_coll_backup_until_ms == 0 && !s_tilt_reversing && !s_slip_reversing &&
                 node_follower_is_stalled()) {
                 sys_log_push("AUTO: wheel stall (fault) -> PAUSE");
                 vesc_set_current(VESC_ID_LEFT,  0);
@@ -3074,6 +3128,47 @@ void state_machine_update() {
                 collisionSaveBaselineForced();
                 transition_to(STATE_PAUSED);
                 break;
+            }
+
+            // ── Slip detection (raw-GPS, NOT the EKF — see spec §4.4) ──────────
+            // Accumulate commanded forward distance; compare to raw-GPS net travel
+            // over the window. Window resets on invalid fix or any non-forward state.
+            if (SLIP_RESPONSE_ENABLED && obs_armed && !s_slip_reversing &&
+                !node_follower_is_pivoting() && !node_follower_is_reversing() &&
+                s_detour_n == 0 && s_coll_backup_until_ms == 0 && !s_tilt_reversing &&
+                cmd.v_cmd > mower_config_get().min_creep_speed_ms) {
+                GpsMeasurement sm = rtk_gps_get_measurement();
+                if (!sm.valid) {
+                    s_slip_win_valid = false;
+                } else {
+                    if (!s_slip_win_valid) {
+                        s_slip_win_valid = true;
+                        s_slip_win_e = sm.enu_east_m; s_slip_win_n = sm.enu_north_m;
+                        s_slip_cmd_dist = 0.0f;
+                    }
+                    s_slip_cmd_dist += cmd.v_cmd * 0.1f;
+                    if (s_slip_cmd_dist >= SLIP_WINDOW_M) {
+                        float d = hypotf(sm.enu_east_m - s_slip_win_e,
+                                         sm.enu_north_m - s_slip_win_n);
+                        if (d < s_slip_cmd_dist / SLIP_RATIO) {
+                            float ahead = 0.5f * mower_config_get().footprint_length_m;
+                            s_slip_disc_x = pose.x + sinf(pose.heading) * ahead;
+                            s_slip_disc_y = pose.y + cosf(pose.heading) * ahead;
+                            s_slip_rev_e = sm.enu_east_m; s_slip_rev_n = sm.enu_north_m;
+                            s_slip_rev_cmd = 0.0f;
+                            s_slip_reversing = true;
+                            s_slip_win_valid = false;
+                            char l[SYS_LOG_MAX_LEN];
+                            snprintf(l, sizeof(l), "SLIP suspected D=%.1f d=%.1f -> reverse",
+                                     (double)s_slip_cmd_dist, (double)d);
+                            sys_log_push(l);
+                        } else {
+                            s_slip_win_valid = false;
+                        }
+                    }
+                }
+            } else {
+                s_slip_win_valid = false;
             }
 
             // Wheel slip: wheels spinning but GPS/EKF says robot barely moving →
