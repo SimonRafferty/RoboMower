@@ -2324,6 +2324,7 @@ void state_machine_update() {
         static int   s_detour_n  = 0;                 // vias in the active detour (0 = none)
         static int   s_detour_i  = 0;                 // current via index
         static int   s_detour_wp = -1;                // s_wp_index the detour was planned for
+        static uint32_t s_coll_backup_until_ms = 0;   // !=0 → reversing to clear a collision
         if (g_state_entry) {
             heading_controller_reset();
             DBG_PRINTLN("[AUTO] Entering AUTO_MOWING — planning path...");
@@ -2441,6 +2442,7 @@ void state_machine_update() {
             wheel_duty_ramp_reset(); // zero stale duty from manual driving; prevents carry-over reverse
             collisionClear();        // flush stale jolt data from manual driving
             s_detour_n = 0; s_detour_i = 0; s_detour_wp = -1;
+            s_coll_backup_until_ms = 0;
         }
 
         // ── Blade follows arm switch: armed = blade on (ramp up), disarmed = blade off (ramp down)
@@ -2635,6 +2637,39 @@ void state_machine_update() {
         collisionDetectSetMultiplier(careful ? mc_ua.collision_mult_careful
                                              : COLLISION_THRESHOLD_MULTIPLIER);
 
+        // ── Collision → obstacle disc + brief back-up (Plan 3) ─────────────────
+        // A confirmed forward/side IMU jolt = struck something. Drop a disc at the
+        // strike point and reverse briefly to clear the contact; the detour then
+        // routes around it on the next ticks. Stays in AUTO (disc persists). Rear/
+        // terrain hits are ignored. Bounded-safe. Don't re-trigger mid-back-up.
+        if (s_coll_backup_until_ms == 0 &&
+            COLLISION_RESPONSE_ENABLED && obs_armed && collisionDetected()) {
+            CollisionDirection cd = collisionGetDirection();
+            bool front_or_side = (cd == COLLISION_DIR_FORWARD ||
+                                  cd == COLLISION_DIR_OBLIQUE_FL ||
+                                  cd == COLLISION_DIR_OBLIQUE_FR ||
+                                  cd == COLLISION_DIR_LEFT ||
+                                  cd == COLLISION_DIR_RIGHT);
+            if (front_or_side) {
+                float ahead = 0.5f * mower_config_get().footprint_length_m;
+                float ox = pose.x + sinf(pose.heading) * ahead;   // ENU: x=E, hdg 0=N, CW+
+                float oy = pose.y + cosf(pose.heading) * ahead;
+                obstacle_discs_add(ox, oy, mower_config_nav_inset_m(), DISC_COLLISION);
+                float back_m = (cd == COLLISION_DIR_LEFT || cd == COLLISION_DIR_RIGHT)
+                                 ? 0.15f : OBSTACLE_BACKUP_DIST_M;
+                s_coll_backup_until_ms = millis() +
+                    (uint32_t)(back_m / OBSTACLE_BACKUP_SPEED_MS * 1000.0f);
+                char l[SYS_LOG_MAX_LEN];
+                snprintf(l, sizeof(l),
+                         "COLL dir=%d -> disc + back %.2fm jolt=%.2f base=%.2f (n=%d)",
+                         (int)cd, (double)back_m,
+                         (double)collisionGetJoltRms(), (double)collisionGetBaseline(),
+                         obstacle_discs_count());
+                sys_log_push(l);
+            }
+            collisionClear();   // consume the event either way (incl. rear/terrain)
+        }
+
         // Tilt check: use stricter limit when careful
         float tilt_deg = imu_get_tilt_rad() * (180.0f / M_PI);
         float tilt_limit = careful ? mc_ua.tilt_limit_careful_deg
@@ -2802,6 +2837,16 @@ void state_machine_update() {
                 cmd.left_ms  = clampf(cmd.left_ms,  -max_v, max_v);
                 cmd.right_ms = clampf(cmd.right_ms, -max_v, max_v);
             }
+            // Collision back-up overrides normal drive: creep reverse until the
+            // timer expires, then resume (disc now behind us; detour routes around).
+            if (s_coll_backup_until_ms != 0) {
+                if ((int32_t)(s_coll_backup_until_ms - millis()) > 0) {
+                    float v = -OBSTACLE_BACKUP_SPEED_MS;
+                    cmd.left_ms = v; cmd.right_ms = v; cmd.v_cmd = v; cmd.kappa = 0.0f;
+                } else {
+                    s_coll_backup_until_ms = 0;   // back-up complete
+                }
+            }
             // Duty-cycle ramp toward desired wheel velocities (ramp is reset on AUTO entry)
             node_follower_to_vesc_duty(cmd);
 
@@ -2911,8 +2956,8 @@ void state_machine_update() {
             // plan segment — letting it skip the real cursor would abandon the very
             // node we are detouring toward.
             float xte = fabsf(node_follower_get_cross_track_error());
-            if (s_detour_n > 0) {
-                s_cross_track_exceed_ms = 0;        // don't accumulate during a detour
+            if (s_detour_n > 0 || s_coll_backup_until_ms != 0) {
+                s_cross_track_exceed_ms = 0;        // don't accumulate during a detour/back-up
             } else if (xte > 0.5f) {
                 if (s_cross_track_exceed_ms == 0) s_cross_track_exceed_ms = millis();
                 if (millis() - s_cross_track_exceed_ms > 2000) {
