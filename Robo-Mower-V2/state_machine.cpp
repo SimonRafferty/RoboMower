@@ -2806,7 +2806,13 @@ void state_machine_update() {
             const Waypoint &realwp = s_wp_buf[s_wp_index];
             Waypoint tgt = realwp;
             bool detour_paused = false;
-            if (obstacle_discs_count() > 0) {
+            // Skip detour planning while a recovery reverse (collision back-up or
+            // tilt reverse-to-clear) is in progress: the mower is inside the freshly
+            // placed disc, so plan_detour would (correctly) fail and PAUSE before the
+            // reverse can run. The reverse override drives instead; once it completes
+            // and the mower has backed clear of the disc, this block routes around it.
+            if (s_coll_backup_until_ms == 0 && !s_tilt_reversing &&
+                obstacle_discs_count() > 0) {
                 float wad        = mower_config_get().waypoint_arrive_dist_m;
                 float via_arrive2 = wad * wad;
                 bool  blocked_now = obstacle_discs_segment_blocked(
@@ -3052,7 +3058,7 @@ void state_machine_update() {
             // wheels legitimately aren't advancing forward.
             if (STALL_RESPONSE_ENABLED && obs_armed &&
                 !node_follower_is_pivoting() && !node_follower_is_reversing() &&
-                s_detour_n == 0 && s_coll_backup_until_ms == 0 &&
+                s_detour_n == 0 && s_coll_backup_until_ms == 0 && !s_tilt_reversing &&
                 node_follower_is_stalled()) {
                 sys_log_push("AUTO: wheel stall (fault) -> PAUSE");
                 vesc_set_current(VESC_ID_LEFT,  0);
