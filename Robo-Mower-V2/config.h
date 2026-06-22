@@ -431,6 +431,14 @@
 #define TILT_REVERSE_TIMEOUT_MS 15000   // tilt-reverse no-progress cap (~1.5x nominal) -> PAUSE
 #define TILT_REVERSE_MAX_DIST_M 1.0f    // reverse cap; not cleared by here → PAUSE
 
+// Plan 5: slip = wheels commanded forward but raw-GPS shows little net travel.
+// DEFAULT 0 — noisy under RTK-Float; enable after field-tuning the window/ratio.
+#define SLIP_RESPONSE_ENABLED   0
+#define SLIP_WINDOW_M           2.5f    // commanded-forward distance per detection window
+#define SLIP_RATIO              2.0f    // slip if raw-GPS net move < commanded / ratio
+#define SLIP_MOTION_M           0.15f   // raw-GPS net move during reverse = "can move"
+#define SLIP_REVERSE_MAX_DIST_M 1.0f    // reverse cap; still flat → genuinely stuck → PAUSE
+
 // Obstacle avoidance
 #define OBSTACLE_BACKUP_DIST_M        0.40f   // [m] — reverse distance after collision (default; direction-adjusted)
 #define OBSTACLE_BACKUP_SPEED_MS      0.10f   // [m/s] — speed during reverse after collision
