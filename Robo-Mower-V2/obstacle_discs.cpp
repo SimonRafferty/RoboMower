@@ -44,7 +44,8 @@ int obstacle_discs_segment_blocked(float px, float py, float wx, float wy,
     return -1;
 }
 
-// Two via-points skirting disc D on the perimeter-interior side of leg [P->W].
+// Two via-points skirting disc D on the perimeter-interior side, offset from the
+// disc CENTRE (not the leg line) so clearance holds even when D is off the leg.
 // Returns false if neither side keeps both points inside perim.
 static bool disc_bracket(const ObstacleDisc &D,
                          float px, float py, float wx, float wy,
@@ -53,21 +54,21 @@ static bool disc_bracket(const ObstacleDisc &D,
     float dx = wx - px, dy = wy - py;
     float L  = sqrtf(dx * dx + dy * dy);
     if (L < 1e-4f) return false;
-    float ux = dx / L, uy = dy / L;                 // unit along leg
-    float tt = (D.x - px) * ux + (D.y - py) * uy;   // disc-centre projection onto line
-    float fx = px + tt * ux, fy = py + tt * uy;     // foot on the infinite line
-    float off  = D.r + offset_margin;               // perpendicular offset
-    float half = D.r + offset_margin;               // along-line bracket half-length (~45 deg)
+    float ux = dx / L, uy = dy / L;                 // unit along the original leg
     float nx = -uy, ny = ux;                         // left normal
+    float off  = D.r + offset_margin;                // perpendicular offset FROM THE CENTRE
+    float half = D.r + offset_margin;                // along-leg bracket half-length (~45 deg)
 
-    // Pick the side (sign of normal) with greater interior clearance at the foot.
-    float cl_l = distanceToNearestEdge(perim, fx + nx * off, fy + ny * off);
-    float cl_r = distanceToNearestEdge(perim, fx - nx * off, fy - ny * off);
+    // Pick the side (sign of normal) with greater interior clearance, measured at
+    // the offset point relative to the disc centre.
+    float cl_l = distanceToNearestEdge(perim, D.x + nx * off, D.y + ny * off);
+    float cl_r = distanceToNearestEdge(perim, D.x - nx * off, D.y - ny * off);
     float sgn  = (cl_l >= cl_r) ? 1.0f : -1.0f;
     float bnx = nx * sgn, bny = ny * sgn;
 
-    Point a{ fx - ux * half + bnx * off, fy - uy * half + bny * off };
-    Point b{ fx + ux * half + bnx * off, fy + uy * half + bny * off };
+    // Bracket straddles the disc CENTRE along the leg, offset perpendicular from it.
+    Point a{ D.x - ux * half + bnx * off, D.y - uy * half + bny * off };
+    Point b{ D.x + ux * half + bnx * off, D.y + uy * half + bny * off };
     if (distanceToNearestEdge(perim, a.x, a.y) <= 0.0f) return false;
     if (distanceToNearestEdge(perim, b.x, b.y) <= 0.0f) return false;
     *v1 = a; *v2 = b;
@@ -80,16 +81,20 @@ int obstacle_discs_plan_detour(float px, float py, float wx, float wy,
                                Point *vias_out) {
     float cx = px, cy = py;
     int n = 0;
-    for (int guard = 0; guard < 64; guard++) {
+    for (int guard = 0; guard < 64; guard++) {       // guard: belt-and-braces; real bound is max_vias
         int idx = obstacle_discs_segment_blocked(cx, cy, wx, wy, clearance);
         if (idx < 0) return n;                       // leg to W is clear
         if (n + 2 > max_vias) return -1;             // can't fit another bracket
         Point v1, v2;
         if (!disc_bracket(s_disc[idx], px, py, wx, wy, offset_margin, perim, &v1, &v2))
             return -1;                               // no safe interior side
+        // Re-validate the two NEW legs we are about to commit; bail to PAUSE if
+        // either is still blocked (e.g. another disc in the way).
+        if (obstacle_discs_segment_blocked(cx, cy, v1.x, v1.y, clearance) != -1) return -1;
+        if (obstacle_discs_segment_blocked(v1.x, v1.y, v2.x, v2.y, clearance) != -1) return -1;
         vias_out[n++] = v1;
         vias_out[n++] = v2;
-        cx = v2.x; cy = v2.y;                        // continue from the bracket exit
+        cx = v2.x; cy = v2.y;                        // re-check v2 -> W on the next iteration
     }
     return -1;                                        // iteration guard tripped -> PAUSE
 }
