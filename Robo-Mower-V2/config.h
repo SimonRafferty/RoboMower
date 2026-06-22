@@ -421,6 +421,14 @@
 // 0.4 m reverse + detour (bounded-safe). Watch the COLL log on first runs; set
 // to 0 if it fires without a real hit, and report the jolt/base values.
 #define COLLISION_RESPONSE_ENABLED  1
+// Plan 4: stall → PAUSE (safe stop) is on by default.
+#define STALL_RESPONSE_ENABLED  1
+// Plan 4: tilt → reverse-to-clear → disc → detour. DEFAULT 0 = keep the current
+// SAFE immediate PAUSE. Set to 1 only after field-testing the reverse on a known
+// slope — tilt is the genuinely dangerous case.
+#define TILT_RESPONSE_ENABLED   0
+#define TILT_CONFIRM_TICKS      2       // 10 Hz ticks over the limit before acting
+#define TILT_REVERSE_MAX_DIST_M 1.0f    // reverse cap; not cleared by here → PAUSE
 
 // Obstacle avoidance
 #define OBSTACLE_BACKUP_DIST_M        0.40f   // [m] — reverse distance after collision (default; direction-adjusted)
