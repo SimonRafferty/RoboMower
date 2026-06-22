@@ -2655,8 +2655,11 @@ void state_machine_update() {
                 float ox = pose.x + sinf(pose.heading) * ahead;   // ENU: x=E, hdg 0=N, CW+
                 float oy = pose.y + cosf(pose.heading) * ahead;
                 obstacle_discs_add(ox, oy, mower_config_nav_inset_m(), DISC_COLLISION);
-                float back_m = (cd == COLLISION_DIR_LEFT || cd == COLLISION_DIR_RIGHT)
-                                 ? 0.15f : OBSTACLE_BACKUP_DIST_M;
+                // Uniform back-up: the disc is projected AHEAD regardless of hit
+                // direction, so a side hit must clear the same ahead-disc as a
+                // forward hit. (The old 0.15 m side value left the steering centre
+                // on the disc radius → the detour couldn't plan → PAUSE.)
+                float back_m = OBSTACLE_BACKUP_DIST_M;
                 s_coll_backup_until_ms = millis() +
                     (uint32_t)(back_m / OBSTACLE_BACKUP_SPEED_MS * 1000.0f);
                 char l[SYS_LOG_MAX_LEN];
@@ -2845,6 +2848,7 @@ void state_machine_update() {
                     cmd.left_ms = v; cmd.right_ms = v; cmd.v_cmd = v; cmd.kappa = 0.0f;
                 } else {
                     s_coll_backup_until_ms = 0;   // back-up complete
+                    collisionClear();             // drop any jolt latched while reversing
                 }
             }
             // Duty-cycle ramp toward desired wheel velocities (ramp is reset on AUTO entry)
