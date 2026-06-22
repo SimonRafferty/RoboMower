@@ -2764,6 +2764,7 @@ void state_machine_update() {
             if (detour_paused) {
                 vesc_set_current(VESC_ID_LEFT,  0);
                 vesc_set_current(VESC_ID_RIGHT, 0);
+                vesc_set_current(VESC_ID_BLADE, 0);   // safe-by-construction (match tilt-PAUSE)
                 s_blade_commanded = false;
                 s_blade_ramp_erpm = 0.0f;
                 transition_to(STATE_PAUSED);
@@ -2905,8 +2906,14 @@ void state_machine_update() {
             // stuck/off-line on the current segment. Strict in-order recovery: skip
             // to the NEXT waypoint in sequence only (re-aims the follower) — never
             // jump to the globally-nearest, which on a spiral abandons whole rings.
+            // Suppressed while detouring: the follower is driving a transient via-
+            // target, so its cross-track error is relative to the via leg, not the
+            // plan segment — letting it skip the real cursor would abandon the very
+            // node we are detouring toward.
             float xte = fabsf(node_follower_get_cross_track_error());
-            if (xte > 0.5f) {
+            if (s_detour_n > 0) {
+                s_cross_track_exceed_ms = 0;        // don't accumulate during a detour
+            } else if (xte > 0.5f) {
                 if (s_cross_track_exceed_ms == 0) s_cross_track_exceed_ms = millis();
                 if (millis() - s_cross_track_exceed_ms > 2000) {
                     if (s_wp_index < s_wp_count) s_wp_index++;   // advance one, in order
