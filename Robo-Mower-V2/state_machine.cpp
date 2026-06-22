@@ -2466,6 +2466,7 @@ void state_machine_update() {
             s_slip_cmd_dist = 0.0f;  s_slip_rev_cmd  = 0.0f;
             s_blade_reversing = false; s_blade_high_since_ms = 0;
             s_blade_retry_count = 0;   s_blade_clear_dist = 0.0f;
+            s_blade_last_x = pose.x;   s_blade_last_y = pose.y;   // avoid stale first-tick delta
         }
 
         // ── Blade follows arm switch: armed = blade on (ramp up), disarmed = blade off (ramp down)
@@ -2827,7 +2828,8 @@ void state_machine_update() {
                 s_blade_clear_dist = 0.0f;
             }
             // else keep reversing (drive-override block).
-        } else if (BLADE_LOAD_REVERSE_ENABLED && obs_armed && s_blade_commanded) {
+        } else if (BLADE_LOAD_REVERSE_ENABLED && obs_armed && s_blade_commanded &&
+                   s_coll_backup_until_ms == 0 && !s_tilt_reversing && !s_slip_reversing) {
             float bl = cutting_monitor_get_rpm_load_fraction();
             if (bl >= BLADE_LOAD_REVERSE_THRESH) {
                 s_blade_clear_dist = 0.0f;
