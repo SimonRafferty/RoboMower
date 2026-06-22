@@ -2328,6 +2328,7 @@ void state_machine_update() {
         static int   s_tilt_confirm    = 0;      // consecutive ticks over the tilt limit
         static bool  s_tilt_reversing  = false;  // reversing to clear a confirmed tilt
         static float s_tilt_rev_x      = 0.0f;   // pose where the tilt-reverse began
+        static uint32_t s_tilt_rev_start_ms = 0; // millis() when tilt-reverse began (timeout cap)
         static float s_tilt_rev_y      = 0.0f;
         if (g_state_entry) {
             heading_controller_reset();
@@ -2691,9 +2692,11 @@ void state_machine_update() {
                 float rev_dist = sqrtf(ddx * ddx + ddy * ddy);
                 if (tilt_deg <= tilt_limit && rev_dist >= OBSTACLE_BACKUP_DIST_M) {
                     s_tilt_reversing = false; s_tilt_confirm = 0;
+                    node_follower_reset_stall();   // clear stall latched while reversing (I-1)
                     sys_log_push("AUTO: tilt cleared -> detour around slope");
-                } else if (rev_dist > TILT_REVERSE_MAX_DIST_M) {
-                    sys_log_push("AUTO: tilt not cleared in 1m -> PAUSE");
+                } else if (rev_dist > TILT_REVERSE_MAX_DIST_M ||
+                           (uint32_t)(millis() - s_tilt_rev_start_ms) > TILT_REVERSE_TIMEOUT_MS) {
+                    sys_log_push("AUTO: tilt not cleared (dist/time cap) -> PAUSE");
                     vesc_set_current(VESC_ID_LEFT,  0);
                     vesc_set_current(VESC_ID_RIGHT, 0);
                     vesc_set_current(VESC_ID_BLADE, 0);
@@ -2712,6 +2715,7 @@ void state_machine_update() {
                     obstacle_discs_add(ox, oy, mower_config_nav_inset_m(), DISC_TILT);
                     s_tilt_reversing = true;
                     s_tilt_rev_x = pose.x; s_tilt_rev_y = pose.y;
+                    s_tilt_rev_start_ms = millis();
                     char line[SYS_LOG_MAX_LEN];
                     snprintf(line, sizeof(line), "AUTO: tilt %.1f > %.1f -> disc + reverse",
                              tilt_deg, tilt_limit);
@@ -2901,6 +2905,7 @@ void state_machine_update() {
                 } else {
                     s_coll_backup_until_ms = 0;   // back-up complete
                     collisionClear();             // drop any jolt latched while reversing
+                    node_follower_reset_stall();  // clear stall latched while reversing (I-1)
                 }
             }
             else if (s_tilt_reversing) {

@@ -428,6 +428,7 @@
 // slope — tilt is the genuinely dangerous case.
 #define TILT_RESPONSE_ENABLED   0
 #define TILT_CONFIRM_TICKS      2       // 10 Hz ticks over the limit before acting
+#define TILT_REVERSE_TIMEOUT_MS 15000   // tilt-reverse no-progress cap (~1.5x nominal) -> PAUSE
 #define TILT_REVERSE_MAX_DIST_M 1.0f    // reverse cap; not cleared by here → PAUSE
 
 // Obstacle avoidance
