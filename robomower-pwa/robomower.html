@@ -544,6 +544,12 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
       <button class="ctrl-btn" id="btn-copy-log"
               onclick="window._copySysLog && window._copySysLog(this)"
               title="Copy all log lines to the clipboard for pasting into a bug report.">Copy log</button>
+      <button class="ctrl-btn" id="btn-plan-test" disabled
+              title="Dry-run the coverage planner and log the result (waypoint count, ring count). Does not start mowing.">Plan Test</button>
+      <button class="ctrl-btn" id="btn-add-test-disc" disabled
+              title="Obstacle-detour test: inject a virtual obstacle disc 1.5 m ahead of the mower's current position. The detour logic should steer around it.">Add test disc ahead</button>
+      <button class="ctrl-btn" id="btn-clear-discs" disabled
+              title="Obstacle-detour test: remove all injected obstacle discs.">Clear discs</button>
     </div>
     <input type="file" id="cal-file-input" accept="application/json,.json" style="display:none">
     <div id="diag-log" style="margin:6px 0"></div>
@@ -859,6 +865,9 @@ const Commands = {
   recalibrateImu:()     => ({ cmd: 'RECAL_IMU' }),
   imuSaveCal:()         => ({ cmd: 'IMUSAVECAL' }),
   reloadImuCal:()       => ({ cmd: 'RELOAD_IMU_CAL' }),
+  planTest:      ()     => ({ cmd: 'PLAN_TEST' }),
+  addTestDisc:   ()     => ({ cmd: 'ADD_TEST_DISC' }),
+  clearDiscs:    ()     => ({ cmd: 'CLEAR_DISCS' }),
   // Protocol v2: absolute WGS-84 lat/lon + per-point accuracy. polygon = [[lat,lon,acc],...]
   sendPerimeter: (polygon) => ({ cmd: 'SEND_PERIMETER', v: 2, polygon })
 };
@@ -1958,6 +1967,27 @@ async function main() {
     try {
       await ble.sendCommand(Commands.imuSaveCal());
       showToast('Save requested — check the log to confirm it verified', true);
+    } catch (e) { showToast(e.message, false); }
+  });
+  document.getElementById('btn-plan-test')?.addEventListener('click', async () => {
+    if (!ble.connected) { showToast('Not connected', false); return; }
+    try {
+      await ble.sendCommand(Commands.planTest());
+      showToast('Plan test requested — check the log for results', true);
+    } catch (e) { showToast(e.message, false); }
+  });
+  document.getElementById('btn-add-test-disc')?.addEventListener('click', async () => {
+    if (!ble.connected) { showToast('Not connected', false); return; }
+    try {
+      await ble.sendCommand(Commands.addTestDisc());
+      showToast('Test disc injected 1.5 m ahead', true);
+    } catch (e) { showToast(e.message, false); }
+  });
+  document.getElementById('btn-clear-discs')?.addEventListener('click', async () => {
+    if (!ble.connected) { showToast('Not connected', false); return; }
+    try {
+      await ble.sendCommand(Commands.clearDiscs());
+      showToast('All obstacle discs cleared', true);
     } catch (e) { showToast(e.message, false); }
   });
 
