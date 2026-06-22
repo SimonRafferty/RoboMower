@@ -421,6 +421,13 @@
 #define OBSTACLE_CONFIRM_MS            500    // [ms] — time cutting obstacle must persist to be confirmed (A03 corrected)
 #define OBSTACLE_DETECT_STARTUP_MS   10000   // [ms] — startup gate: suppress cutting-monitor triggers for this long after AUTO entry
 
+// ── Reactive obstacle-disc detour (see docs spec 2026-06-21). Tuning is passed
+//    into obstacle_discs_plan_detour(); the module itself is config-free/host-tested.
+#define DETOUR_CLEARANCE_M      0.10f   // block-test slack added to disc radius
+#define DETOUR_OFFSET_MARGIN_M  0.15f   // via-point offset beyond disc radius
+#define DETOUR_MAX_VIAS         4       // 2 per disc (~2 discs) before PAUSE
+// OBSTACLE_DISCS_MAX is defined in obstacle_discs.h (32).
+
 // ── IMU Collision Detection ───────────────────────────────────────────────────
 // Replaces the physical bumper sensor (no dedicated bumper GPIO — GPIO 6 is now
 // the PAUSE switch, PAUSE_PIN; see ASSUMPTIONS.md A34).
