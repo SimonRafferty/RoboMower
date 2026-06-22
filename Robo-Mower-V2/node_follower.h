@@ -86,6 +86,11 @@ bool node_follower_is_slipping();
 /** True while a pivot-on-the-spot (tank turn) is in progress. */
 bool node_follower_is_pivoting();
 
+/** True while driving deliberately backward to reach a behind-node (hysteresis).
+ *  Intent gate: callers suppress "not moving forward" detectors (stall/slip) while
+ *  this is true, since the wheels are advancing in reverse by design. */
+bool node_follower_is_reversing();
+
 /** Reset the session distance accumulator (collision-baseline settle gate).
  *  Call when AUTO_MOWING is entered fresh (not on resume from PAUSED). */
 void node_follower_reset_session_distance();

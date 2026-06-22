@@ -366,6 +366,7 @@ void node_follower_reset_stall() {
 }
 
 bool node_follower_is_pivoting() { return g_pivoting; }
+bool node_follower_is_reversing() { return g_reversing; }
 
 void node_follower_to_vesc_duty(const WheelCmd &cmd) {
     wheel_duty_ramp_compute(VESC_ID_LEFT,  cmd.left_ms);
