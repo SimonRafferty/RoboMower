@@ -2337,6 +2337,12 @@ void state_machine_update() {
         static float s_slip_rev_e = 0.0f, s_slip_rev_n = 0.0f;  // raw-GPS at reverse start
         static float s_slip_rev_cmd = 0.0f;     // commanded reverse distance so far (m)
         static float s_slip_disc_x = 0.0f, s_slip_disc_y = 0.0f;  // disc centre (ahead of detection)
+        static bool     s_blade_reversing = false;     // backing off a too-heavy patch
+        static float    s_blade_rev_x = 0.0f, s_blade_rev_y = 0.0f;  // pose at reverse start
+        static uint32_t s_blade_high_since_ms = 0;     // dwell timer for sustained high load
+        static int      s_blade_retry_count = 0;       // consecutive reverse-retries
+        static float    s_blade_clear_dist = 0.0f;     // travel below threshold (counter reset)
+        static float    s_blade_last_x = 0.0f, s_blade_last_y = 0.0f;  // pose last tick (displacement)
         if (g_state_entry) {
             heading_controller_reset();
             DBG_PRINTLN("[AUTO] Entering AUTO_MOWING — planning path...");
@@ -2458,6 +2464,8 @@ void state_machine_update() {
             s_tilt_confirm = 0; s_tilt_reversing = false;
             s_slip_win_valid = false; s_slip_reversing = false;
             s_slip_cmd_dist = 0.0f;  s_slip_rev_cmd  = 0.0f;
+            s_blade_reversing = false; s_blade_high_since_ms = 0;
+            s_blade_retry_count = 0;   s_blade_clear_dist = 0.0f;
         }
 
         // ── Blade follows arm switch: armed = blade on (ramp up), disarmed = blade off (ramp down)
@@ -2647,6 +2655,18 @@ void state_machine_update() {
         // applied downstream in node_follower (after this scale).
         float speed_scale = clampf(margin / mc_ua.uncertainty_margin_m, 0.0f, 1.0f);
 
+        // Blade-load speed modulation (Plan 6): ramp drive speed down toward creep
+        // as RPM-droop load rises past the onset. Self-damping; floored at min_creep
+        // by the follower. Dormant when the blade is off (rpm load reads 0).
+        if (BLADE_LOAD_SPEED_ENABLED) {
+            float bl = cutting_monitor_get_rpm_load_fraction();
+            if (bl > BLADE_LOAD_SPEED_ONSET) {
+                float f = 1.0f - (bl - BLADE_LOAD_SPEED_ONSET) /
+                                 (BLADE_LOAD_REVERSE_THRESH - BLADE_LOAD_SPEED_ONSET);
+                speed_scale *= clampf(f, 0.0f, 1.0f);
+            }
+        }
+
         // Collision sensitivity: lower multiplier when margin is low
         bool careful = (margin < mc_ua.uncertainty_margin_m);
         collisionDetectSetMultiplier(careful ? mc_ua.collision_mult_careful
@@ -2795,6 +2815,54 @@ void state_machine_update() {
             // else: keep reversing (drive-override block).
         }
 
+        // ── Blade-load reverse-retry (Plan 6) ──────────────────────────────────────────
+        // Sustained high RPM-droop load → back off and retry the patch at creep
+        // (re-mow; heavy grass is not an obstacle, so no disc). Counter resets once
+        // the mower has cleared the patch (travelled below threshold). MAX_RETRIES →
+        // PAUSE. Blade-RC-gated: dormant when the blade is disarmed.
+        if (s_blade_reversing) {
+            float ddx = pose.x - s_blade_rev_x, ddy = pose.y - s_blade_rev_y;
+            if (sqrtf(ddx * ddx + ddy * ddy) >= BLADE_LOAD_REVERSE_DIST_M) {
+                s_blade_reversing = false;   // backed off → resume forward (retry)
+                s_blade_clear_dist = 0.0f;
+            }
+            // else keep reversing (drive-override block).
+        } else if (BLADE_LOAD_REVERSE_ENABLED && obs_armed && s_blade_commanded) {
+            float bl = cutting_monitor_get_rpm_load_fraction();
+            if (bl >= BLADE_LOAD_REVERSE_THRESH) {
+                s_blade_clear_dist = 0.0f;
+                if (s_blade_high_since_ms == 0) s_blade_high_since_ms = millis();
+                if ((uint32_t)(millis() - s_blade_high_since_ms) > BLADE_LOAD_REVERSE_DWELL_MS) {
+                    s_blade_high_since_ms = 0;
+                    if (++s_blade_retry_count > BLADE_LOAD_MAX_RETRIES) {
+                        sys_log_push("BLADE load: retries exhausted -> PAUSE");
+                        vesc_set_current(VESC_ID_LEFT,  0);
+                        vesc_set_current(VESC_ID_RIGHT, 0);
+                        vesc_set_current(VESC_ID_BLADE, 0);
+                        s_blade_commanded = false; s_blade_ramp_erpm = 0.0f;
+                        s_blade_reversing = false; s_blade_retry_count = 0;
+                        collisionSaveBaselineForced();
+                        transition_to(STATE_PAUSED);
+                        break;
+                    }
+                    s_blade_reversing = true;
+                    s_blade_rev_x = pose.x; s_blade_rev_y = pose.y;
+                    char l[SYS_LOG_MAX_LEN];
+                    snprintf(l, sizeof(l), "BLADE load %.2f -> reverse-retry %d",
+                             (double)bl, s_blade_retry_count);
+                    sys_log_push(l);
+                }
+            } else {
+                s_blade_high_since_ms = 0;
+                float mdx = pose.x - s_blade_last_x, mdy = pose.y - s_blade_last_y;
+                s_blade_clear_dist += sqrtf(mdx * mdx + mdy * mdy);
+                if (s_blade_clear_dist >= BLADE_LOAD_RETRY_RESET_DIST_M) {
+                    s_blade_retry_count = 0; s_blade_clear_dist = 0.0f;
+                }
+            }
+        }
+        s_blade_last_x = pose.x; s_blade_last_y = pose.y;   // for clear-distance tracking
+
         // Strip truncation: if margin <= 0 and on a mowing STRIP waypoint, skip
         // the rest of that strip. Headland passes are EXEMPT: they are flagged
         // mowing=true but are deliberately driven along the perimeter edge, where
@@ -2865,7 +2933,7 @@ void state_machine_update() {
             // placed disc, so plan_detour would (correctly) fail and PAUSE before the
             // reverse can run. The reverse override drives instead; once it completes
             // and the mower has backed clear of the disc, this block routes around it.
-            if (s_coll_backup_until_ms == 0 && !s_tilt_reversing && !s_slip_reversing &&
+            if (s_coll_backup_until_ms == 0 && !s_tilt_reversing && !s_slip_reversing && !s_blade_reversing &&
                 obstacle_discs_count() > 0) {
                 float wad        = mower_config_get().waypoint_arrive_dist_m;
                 float via_arrive2 = wad * wad;
@@ -2965,6 +3033,10 @@ void state_machine_update() {
                 cmd.left_ms = v; cmd.right_ms = v; cmd.v_cmd = v; cmd.kappa = 0.0f;
             }
             else if (s_slip_reversing) {
+                float v = -OBSTACLE_BACKUP_SPEED_MS;
+                cmd.left_ms = v; cmd.right_ms = v; cmd.v_cmd = v; cmd.kappa = 0.0f;
+            }
+            else if (s_blade_reversing) {
                 float v = -OBSTACLE_BACKUP_SPEED_MS;
                 cmd.left_ms = v; cmd.right_ms = v; cmd.v_cmd = v; cmd.kappa = 0.0f;
             }
@@ -3077,7 +3149,7 @@ void state_machine_update() {
             // plan segment — letting it skip the real cursor would abandon the very
             // node we are detouring toward.
             float xte = fabsf(node_follower_get_cross_track_error());
-            if (s_detour_n > 0 || s_coll_backup_until_ms != 0 || s_tilt_reversing || s_slip_reversing) {
+            if (s_detour_n > 0 || s_coll_backup_until_ms != 0 || s_tilt_reversing || s_slip_reversing || s_blade_reversing) {
                 s_cross_track_exceed_ms = 0;        // don't accumulate during a detour/back-up/tilt-reverse
             } else if (xte > 0.5f) {
                 if (s_cross_track_exceed_ms == 0) s_cross_track_exceed_ms = millis();
@@ -3117,7 +3189,7 @@ void state_machine_update() {
             // wheels legitimately aren't advancing forward.
             if (STALL_RESPONSE_ENABLED && obs_armed &&
                 !node_follower_is_pivoting() && !node_follower_is_reversing() &&
-                s_detour_n == 0 && s_coll_backup_until_ms == 0 && !s_tilt_reversing && !s_slip_reversing &&
+                s_detour_n == 0 && s_coll_backup_until_ms == 0 && !s_tilt_reversing && !s_slip_reversing && !s_blade_reversing &&
                 node_follower_is_stalled()) {
                 sys_log_push("AUTO: wheel stall (fault) -> PAUSE");
                 vesc_set_current(VESC_ID_LEFT,  0);
