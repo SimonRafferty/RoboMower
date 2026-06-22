@@ -2759,7 +2759,7 @@ void state_machine_update() {
         // after backing clear → obstacle blocked forward → disc + detour; if it
         // reverses the cap with the fix still flat → genuinely stuck → PAUSE; no
         // fix → PAUSE.
-        if (s_slip_reversing) {
+        if (s_slip_reversing && s_coll_backup_until_ms == 0) {   // collision back-up takes precedence
             GpsMeasurement sm = rtk_gps_get_measurement();
             if (!sm.valid) {
                 sys_log_push("SLIP: no fix during recovery -> PAUSE");
