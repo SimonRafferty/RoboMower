@@ -2325,6 +2325,10 @@ void state_machine_update() {
         static int   s_detour_i  = 0;                 // current via index
         static int   s_detour_wp = -1;                // s_wp_index the detour was planned for
         static uint32_t s_coll_backup_until_ms = 0;   // !=0 → reversing to clear a collision
+        static int   s_tilt_confirm    = 0;      // consecutive ticks over the tilt limit
+        static bool  s_tilt_reversing  = false;  // reversing to clear a confirmed tilt
+        static float s_tilt_rev_x      = 0.0f;   // pose where the tilt-reverse began
+        static float s_tilt_rev_y      = 0.0f;
         if (g_state_entry) {
             heading_controller_reset();
             DBG_PRINTLN("[AUTO] Entering AUTO_MOWING — planning path...");
@@ -2443,6 +2447,7 @@ void state_machine_update() {
             collisionClear();        // flush stale jolt data from manual driving
             s_detour_n = 0; s_detour_i = 0; s_detour_wp = -1;
             s_coll_backup_until_ms = 0;
+            s_tilt_confirm = 0; s_tilt_reversing = false;
         }
 
         // ── Blade follows arm switch: armed = blade on (ramp up), disarmed = blade off (ramp down)
@@ -2673,26 +2678,67 @@ void state_machine_update() {
             collisionClear();   // consume the event either way (incl. rear/terrain)
         }
 
-        // Tilt check: use stricter limit when careful
+        // ── Tilt ───────────────────────────────────────────────────────────────
+        // Default (TILT_RESPONSE_ENABLED 0): immediate PAUSE — the safe response.
+        // Opt-in: confirm, drop a disc ahead, reverse at creep until level AND clear
+        // of the disc, then resume (detour routes around the slope toe); cap → PAUSE.
         float tilt_deg = imu_get_tilt_rad() * (180.0f / M_PI);
         float tilt_limit = careful ? mc_ua.tilt_limit_careful_deg
                                    : mc_ua.tilt_limit_normal_deg;
-        if (tilt_deg > tilt_limit) {
-            DBG_PRINTF("[AUTO] Tilt %.1f > limit %.1f — pausing\n",
-                          tilt_deg, tilt_limit);
-            {
-                char line[SYS_LOG_MAX_LEN];
-                snprintf(line, sizeof(line), "AUTO: tilt %.1f > %.1f deg", tilt_deg, tilt_limit);
-                sys_log_push(line);
+        if (TILT_RESPONSE_ENABLED) {
+            if (s_tilt_reversing) {
+                float ddx = pose.x - s_tilt_rev_x, ddy = pose.y - s_tilt_rev_y;
+                float rev_dist = sqrtf(ddx * ddx + ddy * ddy);
+                if (tilt_deg <= tilt_limit && rev_dist >= OBSTACLE_BACKUP_DIST_M) {
+                    s_tilt_reversing = false; s_tilt_confirm = 0;
+                    sys_log_push("AUTO: tilt cleared -> detour around slope");
+                } else if (rev_dist > TILT_REVERSE_MAX_DIST_M) {
+                    sys_log_push("AUTO: tilt not cleared in 1m -> PAUSE");
+                    vesc_set_current(VESC_ID_LEFT,  0);
+                    vesc_set_current(VESC_ID_RIGHT, 0);
+                    vesc_set_current(VESC_ID_BLADE, 0);
+                    s_blade_commanded = false; s_blade_ramp_erpm = 0.0f;
+                    s_tilt_reversing = false; s_tilt_confirm = 0;
+                    collisionSaveBaselineForced();
+                    transition_to(STATE_PAUSED);
+                    break;
+                }
+                // else: keep reversing (applied at the drive-override block below).
+            } else if (tilt_deg > tilt_limit) {
+                if (++s_tilt_confirm >= TILT_CONFIRM_TICKS) {
+                    float ahead = 0.5f * mower_config_get().footprint_length_m;
+                    float ox = pose.x + sinf(pose.heading) * ahead;   // ENU: x=E, hdg 0=N, CW+
+                    float oy = pose.y + cosf(pose.heading) * ahead;
+                    obstacle_discs_add(ox, oy, mower_config_nav_inset_m(), DISC_TILT);
+                    s_tilt_reversing = true;
+                    s_tilt_rev_x = pose.x; s_tilt_rev_y = pose.y;
+                    char line[SYS_LOG_MAX_LEN];
+                    snprintf(line, sizeof(line), "AUTO: tilt %.1f > %.1f -> disc + reverse",
+                             tilt_deg, tilt_limit);
+                    sys_log_push(line);
+                }
+            } else {
+                s_tilt_confirm = 0;
             }
-            vesc_set_current(VESC_ID_LEFT,  0);
-            vesc_set_current(VESC_ID_RIGHT, 0);
-            vesc_set_current(VESC_ID_BLADE, 0);
-            s_blade_commanded = false;
-            s_blade_ramp_erpm = 0.0f;
-            collisionSaveBaselineForced();
-            transition_to(STATE_PAUSED);
-            break;
+        } else {
+            // Safe default: tilt over the limit → immediate PAUSE (original behaviour).
+            if (tilt_deg > tilt_limit) {
+                DBG_PRINTF("[AUTO] Tilt %.1f > limit %.1f — pausing\n",
+                              tilt_deg, tilt_limit);
+                {
+                    char line[SYS_LOG_MAX_LEN];
+                    snprintf(line, sizeof(line), "AUTO: tilt %.1f > %.1f deg", tilt_deg, tilt_limit);
+                    sys_log_push(line);
+                }
+                vesc_set_current(VESC_ID_LEFT,  0);
+                vesc_set_current(VESC_ID_RIGHT, 0);
+                vesc_set_current(VESC_ID_BLADE, 0);
+                s_blade_commanded = false;
+                s_blade_ramp_erpm = 0.0f;
+                collisionSaveBaselineForced();
+                transition_to(STATE_PAUSED);
+                break;
+            }
         }
 
         // Strip truncation: if margin <= 0 and on a mowing STRIP waypoint, skip
@@ -2851,6 +2897,12 @@ void state_machine_update() {
                     collisionClear();             // drop any jolt latched while reversing
                 }
             }
+            else if (s_tilt_reversing) {
+                // Tilt reverse-to-clear: creep backward; termination is decided in
+                // the tilt block above (level + cleared, or cap → PAUSE).
+                float v = -OBSTACLE_BACKUP_SPEED_MS;
+                cmd.left_ms = v; cmd.right_ms = v; cmd.v_cmd = v; cmd.kappa = 0.0f;
+            }
             // Duty-cycle ramp toward desired wheel velocities (ramp is reset on AUTO entry)
             node_follower_to_vesc_duty(cmd);
 
@@ -2960,8 +3012,8 @@ void state_machine_update() {
             // plan segment — letting it skip the real cursor would abandon the very
             // node we are detouring toward.
             float xte = fabsf(node_follower_get_cross_track_error());
-            if (s_detour_n > 0 || s_coll_backup_until_ms != 0) {
-                s_cross_track_exceed_ms = 0;        // don't accumulate during a detour/back-up
+            if (s_detour_n > 0 || s_coll_backup_until_ms != 0 || s_tilt_reversing) {
+                s_cross_track_exceed_ms = 0;        // don't accumulate during a detour/back-up/tilt-reverse
             } else if (xte > 0.5f) {
                 if (s_cross_track_exceed_ms == 0) s_cross_track_exceed_ms = millis();
                 if (millis() - s_cross_track_exceed_ms > 2000) {
@@ -2990,6 +3042,26 @@ void state_machine_update() {
                 s_lastCollisionDir = COLLISION_DIR_UNKNOWN;
                 collisionSaveBaselineForced();
                 transition_to(STATE_OBSTACLE_AVOID);
+                break;
+            }
+
+            // Wheel stall → PAUSE (Plan 4). A true stall (commanded > creep, wheels
+            // not turning, EKF confirms no motion, sustained STALL_DETECT_TIME_MS) is
+            // a mechanical/electrical fault, not terrain. Intent-gated: skip while
+            // pivoting / reversing / detouring / in a collision back-up, where the
+            // wheels legitimately aren't advancing forward.
+            if (STALL_RESPONSE_ENABLED && obs_armed &&
+                !node_follower_is_pivoting() && !node_follower_is_reversing() &&
+                s_detour_n == 0 && s_coll_backup_until_ms == 0 &&
+                node_follower_is_stalled()) {
+                sys_log_push("AUTO: wheel stall (fault) -> PAUSE");
+                vesc_set_current(VESC_ID_LEFT,  0);
+                vesc_set_current(VESC_ID_RIGHT, 0);
+                vesc_set_current(VESC_ID_BLADE, 0);
+                s_blade_commanded = false;
+                s_blade_ramp_erpm = 0.0f;
+                collisionSaveBaselineForced();
+                transition_to(STATE_PAUSED);
                 break;
             }
 
