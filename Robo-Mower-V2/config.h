@@ -439,6 +439,16 @@
 #define SLIP_MOTION_M           0.15f   // raw-GPS net move during reverse = "can move"
 #define SLIP_REVERSE_MAX_DIST_M 1.0f    // reverse cap; still flat → genuinely stuck → PAUSE
 
+// Plan 6: blade-load response (RPM-droop load = (target-actual)/target, 0..1).
+#define BLADE_LOAD_SPEED_ENABLED     1      // slow drive toward creep as load rises (safe, on)
+#define BLADE_LOAD_SPEED_ONSET       0.30f  // load above which slowdown begins
+#define BLADE_LOAD_REVERSE_ENABLED   0      // reverse-retry a patch the blade can't cut (opt-in)
+#define BLADE_LOAD_REVERSE_THRESH    0.60f  // load to force creep + arm reverse-retry
+#define BLADE_LOAD_REVERSE_DWELL_MS  400    // sustained-high time before reversing (rejects clumps)
+#define BLADE_LOAD_REVERSE_DIST_M    0.5f   // reverse distance per retry
+#define BLADE_LOAD_MAX_RETRIES       4      // consecutive retries -> PAUSE
+#define BLADE_LOAD_RETRY_RESET_DIST_M 1.0f  // travel below threshold to reset the retry counter
+
 // Obstacle avoidance
 #define OBSTACLE_BACKUP_DIST_M        0.40f   // [m] — reverse distance after collision (default; direction-adjusted)
 #define OBSTACLE_BACKUP_SPEED_MS      0.10f   // [m/s] — speed during reverse after collision
