@@ -20,3 +20,15 @@
 Thumbs.db
 .DS_Store
 *.swp
+
+# Local-only working files — never publish to the public repo:
+#  PWA exports (the perimeter JSON is the garden's GPS = home location),
+#  debug screenshots, scratch notes, and the design brief.
+/perimeter*.json
+/robomower-config*.json
+/SJRToDo.txt
+/exception-handling.md
+/Perimeter.jpg
+/Perimeter2.jpg
+/PerimiterBreach.jpg
+/PositionError.jpg
