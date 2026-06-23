@@ -132,7 +132,7 @@ local function init_colors()
         [0] = { lcd.RGB( 96,  0,  0), lcd.RGB(255, 80, 80), "NO FIX"    },
         [1] = { lcd.RGB( 96, 56,  0), lcd.RGB(255,168, 48), "GPS ONLY"  },
         [2] = { lcd.RGB( 80, 48, 16), lcd.RGB(224,192,112), "DGPS"      },
-        [4] = { lcd.RGB(  8, 64, 32), lcd.RGB( 80,240,160), "RTK FIXED" },
+        [4] = { lcd.RGB(255,255,255), lcd.RGB(  0,  0,  0), "RTK FIXED" },  -- black-on-white: readable in direct sun
         [5] = { lcd.RGB( 96, 56,  0), lcd.RGB(255,176, 32), "RTK FLOAT" },
     }
     FIX_DEF = { lcd.RGB(96, 0, 0), lcd.RGB(255, 80, 80), "UNKNOWN" }
@@ -392,19 +392,22 @@ end
 --  LEFT PANEL
 -- ═══════════════════════════════════════════════════════════════════════
 
-local function draw_left_panel(fix_type, ekf_mm, batt_pct, blade_pct, cut_mm)
+local function draw_left_panel(fix_type, batt_pct, blade_pct, cut_mm)
     local px = 4
     local bw = L_W - 8
     local rx = L_W - 4
 
     -- GPS / RTK ──────────────────────────────────────────────────────────
+    -- Fix badge only. RTK FIXED renders black-on-white (high contrast, readable
+    -- in direct sun); every other fix state keeps its colour scheme. The old
+    -- "ACC: +-Nmm" line was removed: the firmware reports the last GPS sigma,
+    -- which it holds while dead-reckoning off Fixed, so the figure stuck at the
+    -- last good value and never cleared. fix_type tracks the live solution, so
+    -- the badge is the honest cue.
     draw_sh(px, BODY_Y + 4, bw, "GPS / RTK")
     local fc = FIX_COL[fix_type] or FIX_DEF
     lcd.drawFilledRectangle(px, BODY_Y + 20, bw, 14, fc[1])
     lcd.drawText(px + 3, BODY_Y + 18, fc[3], bor(FXXS, fc[2]))
-    lcd.drawText(px,  BODY_Y + 38, "ACC:", bor(FXXS, C_DIM))
-    local ekf_str = "+-" .. tostring(ekf_mm) .. "mm"
-    lcd.drawText(rx, BODY_Y + 38, ekf_str, bor(FXXS, FRGHT, uncert_col(ekf_mm)))
 
     -- POWER ───────────────────────────────────────────────────────────────
     draw_sh(px, BODY_Y + 62, bw, "POWER")
@@ -690,7 +693,7 @@ local function refresh(widget, event, touchState)
 
     lcd.drawFilledRectangle(0, 0, SCR_W, SCR_H, C_BG)
     draw_header(widget.state_str, armed, blade_on, widget.tx_voltage)
-    draw_left_panel(ft, ekf_mm, batt_pct, widget.blade_load, widget.cut_mm)
+    draw_left_panel(ft, batt_pct, widget.blade_load, widget.cut_mm)
     draw_compass(widget.heading, widget.speed_kmh, ekf_mm, ft, is_bog, is_coll, widget.wp_bearing)
     draw_right_panel(widget.state_str)
     draw_vesc_bar(widget.state_str, blade_on, is_bog)
