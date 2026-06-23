@@ -233,6 +233,7 @@
 // CUT_HEIGHT_MAX_MM also used as safe height for bog recovery passes.
 #define CUT_HEIGHT_MIN_MM          35      // [mm] — minimum deck height (measured mechanical limit)
 #define CUT_HEIGHT_MAX_MM         100      // [mm] — maximum deck height (measured mechanical limit)
+#define CUT_HEIGHT_TIMEOUT_S  3.0f   // [s] stop the cut-height PPM after this with no movement (0 = continuous)
 
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -416,14 +417,14 @@
 #define AUTO_FAULT_RESPONSES_ENABLED  0
 
 // ── Per-detector enables (replacing the blanket gate above, incrementally) ──
-// Plan 3: collision → obstacle disc → back-up → detour. Default ON, but the
+// Plan 3: collision → obstacle island → back-up → detour. Default ON, but the
 // collision baseline is not yet field-confirmed: a false jolt costs a needless
 // 0.4 m reverse + detour (bounded-safe). Watch the COLL log on first runs; set
 // to 0 if it fires without a real hit, and report the jolt/base values.
 #define COLLISION_RESPONSE_ENABLED  1
 // Plan 4: stall → PAUSE (safe stop) is on by default.
 #define STALL_RESPONSE_ENABLED  1
-// Plan 4: tilt → reverse-to-clear → disc → detour. DEFAULT 0 = keep the current
+// Plan 4: tilt → reverse-to-clear → island → detour. DEFAULT 0 = keep the current
 // SAFE immediate PAUSE. Set to 1 only after field-testing the reverse on a known
 // slope — tilt is the genuinely dangerous case.
 #define TILT_RESPONSE_ENABLED   0
@@ -455,12 +456,12 @@
 #define OBSTACLE_CONFIRM_MS            500    // [ms] — time cutting obstacle must persist to be confirmed (A03 corrected)
 #define OBSTACLE_DETECT_STARTUP_MS   10000   // [ms] — startup gate: suppress cutting-monitor triggers for this long after AUTO entry
 
-// ── Reactive obstacle-disc detour (see docs spec 2026-06-21). Tuning is passed
-//    into obstacle_discs_plan_detour(); the module itself is config-free/host-tested.
-#define DETOUR_CLEARANCE_M      0.10f   // block-test slack added to disc radius
-#define DETOUR_OFFSET_MARGIN_M  0.15f   // via-point offset beyond disc radius
-#define DETOUR_MAX_VIAS         4       // 2 per disc (~2 discs) before PAUSE
-// OBSTACLE_DISCS_MAX is defined in obstacle_discs.h (32).
+// ── Reactive obstacle-island detour (see docs spec 2026-06-21). Tuning is passed
+//    into obstacle_islands_plan_detour(); the module itself is config-free/host-tested.
+#define DETOUR_CLEARANCE_M      0.10f   // block-test slack added to island radius
+#define DETOUR_OFFSET_MARGIN_M  0.15f   // via-point offset beyond island radius
+#define DETOUR_MAX_VIAS         4       // 2 per island (~2 islands) before PAUSE
+// OBSTACLE_ISLANDS_MAX is defined in obstacle_islands.h (32).
 
 // ── IMU Collision Detection ───────────────────────────────────────────────────
 // Replaces the physical bumper sensor (no dedicated bumper GPIO — GPIO 6 is now

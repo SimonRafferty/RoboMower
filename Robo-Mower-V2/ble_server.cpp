@@ -614,7 +614,7 @@ static String build_status_json() {
         }
     }
 
-    static char cbuf[1536];  // static: BSS segment, not stack — build_status_json() is called from one BLE task only (incl. bnocal hex)
+    static char cbuf[1700];  // static: BSS segment, not stack — build_status_json() is called from one BLE task only (incl. bnocal hex + resp_* bools)
     snprintf(cbuf, sizeof(cbuf),
         "\"cfg\":{"
         "\"footprint_width_m\":%.3f,\"footprint_length_m\":%.3f,"
@@ -635,7 +635,11 @@ static String build_status_json() {
         "\"heading_kp\":%.2f,\"heading_kd\":%.2f,\"manual_max_yaw_rate\":%.2f,"
         "\"wheel_pi_kp\":%.2f,\"wheel_pi_ki\":%.2f,"
         "\"manual_max_duty\":%.2f,\"manual_max_speed_ms\":%.3f,"
-        "\"min_turn_radius_m\":%.3f,\"min_move_duty\":%.3f,\"turn_margin_m\":%.3f%s},",
+        "\"min_turn_radius_m\":%.3f,\"min_move_duty\":%.3f,\"turn_margin_m\":%.3f,"
+        "\"resp_collision_en\":%s,\"resp_stall_en\":%s,"
+        "\"resp_tilt_en\":%s,\"resp_slip_en\":%s,"
+        "\"resp_blade_slow_en\":%s,\"resp_blade_reverse_en\":%s,"
+        "\"cut_height_timeout_s\":%.1f%s},",
         mc.footprint_width_m, mc.footprint_length_m,
         mc.track_width_m,
         mc.wheel_radius_m, (int)mc.motor_pole_pairs, mc.gear_ratio,
@@ -654,7 +658,15 @@ static String build_status_json() {
         mc.heading_kp, mc.heading_kd, mc.manual_max_yaw_rate,
         mc.wheel_pi_kp, mc.wheel_pi_ki,
         mc.manual_max_duty, mc.manual_max_speed_ms,
-        mc.min_turn_radius_m, mc.min_move_duty, mc.turn_margin_m, calfld);
+        mc.min_turn_radius_m, mc.min_move_duty, mc.turn_margin_m,
+        mc.resp_collision_en   ? "true" : "false",
+        mc.resp_stall_en       ? "true" : "false",
+        mc.resp_tilt_en        ? "true" : "false",
+        mc.resp_slip_en        ? "true" : "false",
+        mc.resp_blade_slow_en  ? "true" : "false",
+        mc.resp_blade_reverse_en ? "true" : "false",
+        mc.cut_height_timeout_s,
+        calfld);
     out += cbuf;
 
     // Append system log array (last N messages, newest last)

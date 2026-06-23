@@ -31,7 +31,7 @@
 #include "perimeter.h"
 #include "geometry.h"
 #include "coverage_planner.h"
-#include "obstacle_discs.h"
+#include "obstacle_islands.h"
 #include "node_follower.h"
 #include "clipper_offset.h"
 #include "odo_calib.h"
@@ -1401,6 +1401,20 @@ static void handle_ble_command(const char *json) {
                 if (p) { long v = strtol(p + 1, nullptr, 10); dst = v; }
             }
         };
+        // Parse a bool field encoded as JSON true/false or 0/1
+        auto gb = [&](const char *key, bool &dst) {
+            const char *p = strstr(json, key);
+            if (p) {
+                p = strchr(p, ':');
+                if (p) {
+                    p++;
+                    while (*p == ' ') p++;
+                    if (*p == 't') dst = true;
+                    else if (*p == 'f') dst = false;
+                    else dst = (strtol(p, nullptr, 10) != 0);
+                }
+            }
+        };
         gf("\"footprint_width_m\"",      cfg.footprint_width_m);
         gf("\"footprint_length_m\"",     cfg.footprint_length_m);
         gf("\"track_width_m\"",          cfg.track_width_m);
@@ -1441,6 +1455,13 @@ static void handle_ble_command(const char *json) {
         gf("\"min_turn_radius_m\"",    cfg.min_turn_radius_m);
         gf("\"min_move_duty\"",        cfg.min_move_duty);
         gf("\"turn_margin_m\"",        cfg.turn_margin_m);
+        gb("\"resp_collision_en\"",    cfg.resp_collision_en);
+        gb("\"resp_stall_en\"",        cfg.resp_stall_en);
+        gb("\"resp_tilt_en\"",         cfg.resp_tilt_en);
+        gb("\"resp_slip_en\"",         cfg.resp_slip_en);
+        gb("\"resp_blade_slow_en\"",   cfg.resp_blade_slow_en);
+        gb("\"resp_blade_reverse_en\"", cfg.resp_blade_reverse_en);
+        gf("\"cut_height_timeout_s\"",  cfg.cut_height_timeout_s);
 
         // ── BNO055 calibration restore (carried in the settings file) ───────────
         // The PWA round-trips the saved calibration as "bnocal" (44 hex chars = 22
@@ -1512,28 +1533,28 @@ static void handle_ble_command(const char *json) {
         return;
     }
 
-    // ── ADD_TEST_DISC — inject a test obstacle disc 1.5 m ahead ────────────
-    if (strcmp(cmd, "ADD_TEST_DISC") == 0) {
-        // Inject a disc 1.5 m ahead of the steering centre along current heading.
-        // DISC_SENSOR = the reserved future-sensor source (exercises the LIDAR path).
+    // ── ADD_TEST_ISLAND — inject a test obstacle island 1.5 m ahead ────────────
+    if (strcmp(cmd, "ADD_TEST_ISLAND") == 0) {
+        // Inject an island 1.5 m ahead of the steering centre along current heading.
+        // ISLAND_SENSOR = the reserved future-sensor source (exercises the LIDAR path).
         Pose2D p = ekf_get_pose();
         const float ahead = 1.5f;
         float ox = p.x + sinf(p.heading) * ahead;   // ENU: x=E, heading 0=N, CW+
         float oy = p.y + cosf(p.heading) * ahead;
-        bool ok = obstacle_discs_add(ox, oy, mower_config_nav_inset_m(), DISC_SENSOR);
+        bool ok = obstacle_islands_add(ox, oy, mower_config_nav_inset_m(), ISLAND_SENSOR);
         char l[SYS_LOG_MAX_LEN];
-        snprintf(l, sizeof(l), "TEST disc %s @ %.1f,%.1f (n=%d)",
-                 ok ? "added" : "FULL", (double)ox, (double)oy, obstacle_discs_count());
+        snprintf(l, sizeof(l), "TEST island %s @ %.1f,%.1f (n=%d)",
+                 ok ? "added" : "FULL", (double)ox, (double)oy, obstacle_islands_count());
         sys_log_push(l);
         ble_server_send_ack(cmd, ok, l);
         return;
     }
 
-    // ── CLEAR_DISCS — remove all active obstacle discs ───────────────────────
-    if (strcmp(cmd, "CLEAR_DISCS") == 0) {
-        obstacle_discs_clear();
-        sys_log_push("TEST discs cleared");
-        ble_server_send_ack(cmd, true, "discs cleared");
+    // ── CLEAR_ISLANDS — remove all active obstacle islands ───────────────────────
+    if (strcmp(cmd, "CLEAR_ISLANDS") == 0) {
+        obstacle_islands_clear();
+        sys_log_push("TEST islands cleared");
+        ble_server_send_ack(cmd, true, "islands cleared");
         return;
     }
 
@@ -1778,6 +1799,11 @@ void state_machine_update() {
         ble_server_send_diag();
         g_ble_diag_pending = false;
     }
+
+    // ── Cut-height actuator PPM timeout ──────────────────────────────────────
+    // Stops the servo PPM after cut_height_timeout_s of no commanded movement so
+    // the self-holding actuator de-powers and stops drawing current.
+    servo_output_update();
 
     // ── Compute state machine dt ────────────────────────────────────────────
     static uint32_t s_sm_last_ms = 0;
@@ -2336,7 +2362,7 @@ void state_machine_update() {
         static bool  s_slip_reversing = false;  // in slip reverse-to-confirm
         static float s_slip_rev_e = 0.0f, s_slip_rev_n = 0.0f;  // raw-GPS at reverse start
         static float s_slip_rev_cmd = 0.0f;     // commanded reverse distance so far (m)
-        static float s_slip_disc_x = 0.0f, s_slip_disc_y = 0.0f;  // disc centre (ahead of detection)
+        static float s_slip_island_x = 0.0f, s_slip_island_y = 0.0f;  // island centre (ahead of detection)
         static bool     s_blade_reversing = false;     // backing off a too-heavy patch
         static float    s_blade_rev_x = 0.0f, s_blade_rev_y = 0.0f;  // pose at reverse start
         static uint32_t s_blade_high_since_ms = 0;     // dwell timer for sustained high load
@@ -2398,7 +2424,7 @@ void state_machine_update() {
             } else {
                 node_follower_reset_session_distance();   // fresh session only
                 coverage_planner_reset_progress();        // clear visited high-water mark
-                obstacle_discs_clear();                   // fresh run: start with no discs (discs persist across pause/nudge)
+                obstacle_islands_clear();                   // fresh run: start with no islands (islands persist across pause/nudge)
             }
 
             // Load all waypoints into local buffer for node follower
@@ -2659,7 +2685,7 @@ void state_machine_update() {
         // Blade-load speed modulation (Plan 6): ramp drive speed down toward creep
         // as RPM-droop load rises past the onset. Self-damping; floored at min_creep
         // by the follower. Dormant when the blade is off (rpm load reads 0).
-        if (BLADE_LOAD_SPEED_ENABLED) {
+        if (mc_ua.resp_blade_slow_en) {
             float bl = cutting_monitor_get_rpm_load_fraction();
             if (bl > BLADE_LOAD_SPEED_ONSET) {
                 float f = 1.0f - (bl - BLADE_LOAD_SPEED_ONSET) /
@@ -2673,13 +2699,13 @@ void state_machine_update() {
         collisionDetectSetMultiplier(careful ? mc_ua.collision_mult_careful
                                              : COLLISION_THRESHOLD_MULTIPLIER);
 
-        // ── Collision → obstacle disc + brief back-up (Plan 3) ─────────────────
-        // A confirmed forward/side IMU jolt = struck something. Drop a disc at the
+        // ── Collision → obstacle island + brief back-up (Plan 3) ─────────────────
+        // A confirmed forward/side IMU jolt = struck something. Drop an island at the
         // strike point and reverse briefly to clear the contact; the detour then
-        // routes around it on the next ticks. Stays in AUTO (disc persists). Rear/
+        // routes around it on the next ticks. Stays in AUTO (island persists). Rear/
         // terrain hits are ignored. Bounded-safe. Don't re-trigger mid-back-up.
         if (s_coll_backup_until_ms == 0 &&
-            COLLISION_RESPONSE_ENABLED && obs_armed && collisionDetected()) {
+            mc_ua.resp_collision_en && obs_armed && collisionDetected()) {
             CollisionDirection cd = collisionGetDirection();
             bool front_or_side = (cd == COLLISION_DIR_FORWARD ||
                                   cd == COLLISION_DIR_OBLIQUE_FL ||
@@ -2690,33 +2716,33 @@ void state_machine_update() {
                 float ahead = 0.5f * mower_config_get().footprint_length_m;
                 float ox = pose.x + sinf(pose.heading) * ahead;   // ENU: x=E, hdg 0=N, CW+
                 float oy = pose.y + cosf(pose.heading) * ahead;
-                obstacle_discs_add(ox, oy, mower_config_nav_inset_m(), DISC_COLLISION);
-                // Uniform back-up: the disc is projected AHEAD regardless of hit
-                // direction, so a side hit must clear the same ahead-disc as a
+                obstacle_islands_add(ox, oy, mower_config_nav_inset_m(), ISLAND_COLLISION);
+                // Uniform back-up: the island is projected AHEAD regardless of hit
+                // direction, so a side hit must clear the same ahead-island as a
                 // forward hit. (The old 0.15 m side value left the steering centre
-                // on the disc radius → the detour couldn't plan → PAUSE.)
+                // on the island radius → the detour couldn't plan → PAUSE.)
                 float back_m = OBSTACLE_BACKUP_DIST_M;
                 s_coll_backup_until_ms = millis() +
                     (uint32_t)(back_m / OBSTACLE_BACKUP_SPEED_MS * 1000.0f);
                 char l[SYS_LOG_MAX_LEN];
                 snprintf(l, sizeof(l),
-                         "COLL dir=%d -> disc + back %.2fm jolt=%.2f base=%.2f (n=%d)",
+                         "COLL dir=%d -> island + back %.2fm jolt=%.2f base=%.2f (n=%d)",
                          (int)cd, (double)back_m,
                          (double)collisionGetJoltRms(), (double)collisionGetBaseline(),
-                         obstacle_discs_count());
+                         obstacle_islands_count());
                 sys_log_push(l);
             }
             collisionClear();   // consume the event either way (incl. rear/terrain)
         }
 
         // ── Tilt ───────────────────────────────────────────────────────────────
-        // Default (TILT_RESPONSE_ENABLED 0): immediate PAUSE — the safe response.
-        // Opt-in: confirm, drop a disc ahead, reverse at creep until level AND clear
-        // of the disc, then resume (detour routes around the slope toe); cap → PAUSE.
+        // Default (resp_tilt_en false): immediate PAUSE — the safe response.
+        // Opt-in: confirm, drop an island ahead, reverse at creep until level AND clear
+        // of the island, then resume (detour routes around the slope toe); cap → PAUSE.
         float tilt_deg = imu_get_tilt_rad() * (180.0f / M_PI);
         float tilt_limit = careful ? mc_ua.tilt_limit_careful_deg
                                    : mc_ua.tilt_limit_normal_deg;
-        if (TILT_RESPONSE_ENABLED) {
+        if (mc_ua.resp_tilt_en) {
             if (s_tilt_reversing) {
                 float ddx = pose.x - s_tilt_rev_x, ddy = pose.y - s_tilt_rev_y;
                 float rev_dist = sqrtf(ddx * ddx + ddy * ddy);
@@ -2742,12 +2768,12 @@ void state_machine_update() {
                     float ahead = 0.5f * mower_config_get().footprint_length_m;
                     float ox = pose.x + sinf(pose.heading) * ahead;   // ENU: x=E, hdg 0=N, CW+
                     float oy = pose.y + cosf(pose.heading) * ahead;
-                    obstacle_discs_add(ox, oy, mower_config_nav_inset_m(), DISC_TILT);
+                    obstacle_islands_add(ox, oy, mower_config_nav_inset_m(), ISLAND_TILT);
                     s_tilt_reversing = true;
                     s_tilt_rev_x = pose.x; s_tilt_rev_y = pose.y;
                     s_tilt_rev_start_ms = millis();
                     char line[SYS_LOG_MAX_LEN];
-                    snprintf(line, sizeof(line), "AUTO: tilt %.1f > %.1f -> disc + reverse",
+                    snprintf(line, sizeof(line), "AUTO: tilt %.1f > %.1f -> island + reverse",
                              tilt_deg, tilt_limit);
                     sys_log_push(line);
                 }
@@ -2777,7 +2803,7 @@ void state_machine_update() {
 
         // ── Slip recovery: reverse to tell an obstacle from a true stuck ───────
         // Reverse at creep watching the RAW GPS fix: if it moves (≥ SLIP_MOTION_M)
-        // after backing clear → obstacle blocked forward → disc + detour; if it
+        // after backing clear → obstacle blocked forward → island + detour; if it
         // reverses the cap with the fix still flat → genuinely stuck → PAUSE; no
         // fix → PAUSE.
         if (s_slip_reversing && s_coll_backup_until_ms == 0) {   // collision back-up takes precedence
@@ -2797,11 +2823,11 @@ void state_machine_update() {
                                  sm.enu_north_m - s_slip_rev_n);
             s_slip_rev_cmd += OBSTACLE_BACKUP_SPEED_MS * 0.1f;   // 10 Hz tick
             if (d_rev >= SLIP_MOTION_M && s_slip_rev_cmd >= OBSTACLE_BACKUP_DIST_M) {
-                obstacle_discs_add(s_slip_disc_x, s_slip_disc_y,
-                                   mower_config_nav_inset_m(), DISC_SLIP);
+                obstacle_islands_add(s_slip_island_x, s_slip_island_y,
+                                   mower_config_nav_inset_m(), ISLAND_SLIP);
                 s_slip_reversing = false;
                 node_follower_reset_stall();
-                sys_log_push("SLIP: obstacle -> disc + detour");
+                sys_log_push("SLIP: obstacle -> island + detour");
             } else if (s_slip_rev_cmd >= SLIP_REVERSE_MAX_DIST_M) {
                 sys_log_push("SLIP: stuck (no GPS motion) -> PAUSE");
                 vesc_set_current(VESC_ID_LEFT,  0);
@@ -2818,7 +2844,7 @@ void state_machine_update() {
 
         // ── Blade-load reverse-retry (Plan 6) ──────────────────────────────────────────
         // Sustained high RPM-droop load → back off and retry the patch at creep
-        // (re-mow; heavy grass is not an obstacle, so no disc). Counter resets once
+        // (re-mow; heavy grass is not an obstacle, so no island). Counter resets once
         // the mower has cleared the patch (travelled below threshold). MAX_RETRIES →
         // PAUSE. Blade-RC-gated: dormant when the blade is disarmed.
         if (s_blade_reversing) {
@@ -2828,7 +2854,7 @@ void state_machine_update() {
                 s_blade_clear_dist = 0.0f;
             }
             // else keep reversing (drive-override block).
-        } else if (BLADE_LOAD_REVERSE_ENABLED && obs_armed && s_blade_commanded &&
+        } else if (mc_ua.resp_blade_reverse_en && obs_armed && s_blade_commanded &&
                    s_coll_backup_until_ms == 0 && !s_tilt_reversing && !s_slip_reversing) {
             float bl = cutting_monitor_get_rpm_load_fraction();
             if (bl >= BLADE_LOAD_REVERSE_THRESH) {
@@ -2923,8 +2949,8 @@ void state_machine_update() {
             // fused heading is usable from the start and GPS corrects any bias.
 
             // ── Reactive obstacle detour ──────────────────────────────────────────
-            // If the straight leg to the current node enters an active obstacle disc,
-            // steer to via-point(s) that skirt it (Plan-1 obstacle_discs planner). The
+            // If the straight leg to the current node enters an active obstacle island,
+            // steer to via-point(s) that skirt it (Plan-1 obstacle_islands planner). The
             // coverage plan + in-order resume are untouched — only the per-tick target
             // is redirected. Detour exhausted (cannot clear within bounds) → PAUSE.
             const Waypoint &realwp = s_wp_buf[s_wp_index];
@@ -2932,22 +2958,22 @@ void state_machine_update() {
             bool detour_paused = false;
             // Skip detour planning while a recovery reverse (collision back-up or
             // tilt reverse-to-clear) is in progress: the mower is inside the freshly
-            // placed disc, so plan_detour would (correctly) fail and PAUSE before the
+            // placed island, so plan_detour would (correctly) fail and PAUSE before the
             // reverse can run. The reverse override drives instead; once it completes
-            // and the mower has backed clear of the disc, this block routes around it.
+            // and the mower has backed clear of the island, this block routes around it.
             if (s_coll_backup_until_ms == 0 && !s_tilt_reversing && !s_slip_reversing && !s_blade_reversing &&
-                obstacle_discs_count() > 0) {
+                obstacle_islands_count() > 0) {
                 float wad        = mower_config_get().waypoint_arrive_dist_m;
                 float via_arrive2 = wad * wad;
-                bool  blocked_now = obstacle_discs_segment_blocked(
+                bool  blocked_now = obstacle_islands_segment_blocked(
                                         pose.x, pose.y, realwp.x, realwp.y,
                                         DETOUR_CLEARANCE_M) >= 0;
-                // (Re)plan when the target node changed, or a disc now blocks a leg
-                // that had no active detour (e.g. a disc added mid-leg).
+                // (Re)plan when the target node changed, or an island now blocks a leg
+                // that had no active detour (e.g. an island added mid-leg).
                 if (s_detour_wp != s_wp_index || (s_detour_n == 0 && blocked_now)) {
                     s_detour_wp = s_wp_index;
                     s_detour_i  = 0;
-                    int n = obstacle_discs_plan_detour(
+                    int n = obstacle_islands_plan_detour(
                                 pose.x, pose.y, realwp.x, realwp.y,
                                 perimeter_get_perimeter(),
                                 DETOUR_CLEARANCE_M, DETOUR_OFFSET_MARGIN_M, DETOUR_MAX_VIAS,
@@ -3017,7 +3043,7 @@ void state_machine_update() {
                 cmd.right_ms = clampf(cmd.right_ms, -max_v, max_v);
             }
             // Collision back-up overrides normal drive: creep reverse until the
-            // timer expires, then resume (disc now behind us; detour routes around).
+            // timer expires, then resume (island now behind us; detour routes around).
             if (s_coll_backup_until_ms != 0) {
                 if ((int32_t)(s_coll_backup_until_ms - millis()) > 0) {
                     float v = -OBSTACLE_BACKUP_SPEED_MS;
@@ -3189,7 +3215,7 @@ void state_machine_update() {
             // a mechanical/electrical fault, not terrain. Intent-gated: skip while
             // pivoting / reversing / detouring / in a collision back-up, where the
             // wheels legitimately aren't advancing forward.
-            if (STALL_RESPONSE_ENABLED && obs_armed &&
+            if (mc_ua.resp_stall_en && obs_armed &&
                 !node_follower_is_pivoting() && !node_follower_is_reversing() &&
                 s_detour_n == 0 && s_coll_backup_until_ms == 0 && !s_tilt_reversing && !s_slip_reversing && !s_blade_reversing &&
                 node_follower_is_stalled()) {
@@ -3207,7 +3233,7 @@ void state_machine_update() {
             // ── Slip detection (raw-GPS, NOT the EKF — see spec §4.4) ──────────
             // Accumulate commanded forward distance; compare to raw-GPS net travel
             // over the window. Window resets on invalid fix or any non-forward state.
-            if (SLIP_RESPONSE_ENABLED && obs_armed && !s_slip_reversing &&
+            if (mc_ua.resp_slip_en && obs_armed && !s_slip_reversing &&
                 !node_follower_is_pivoting() && !node_follower_is_reversing() &&
                 s_detour_n == 0 && s_coll_backup_until_ms == 0 && !s_tilt_reversing &&
                 cmd.v_cmd > mower_config_get().min_creep_speed_ms) {
@@ -3226,8 +3252,8 @@ void state_machine_update() {
                                          sm.enu_north_m - s_slip_win_n);
                         if (d < s_slip_cmd_dist / SLIP_RATIO) {
                             float ahead = 0.5f * mower_config_get().footprint_length_m;
-                            s_slip_disc_x = pose.x + sinf(pose.heading) * ahead;
-                            s_slip_disc_y = pose.y + cosf(pose.heading) * ahead;
+                            s_slip_island_x = pose.x + sinf(pose.heading) * ahead;
+                            s_slip_island_y = pose.y + cosf(pose.heading) * ahead;
                             s_slip_rev_e = sm.enu_east_m; s_slip_rev_n = sm.enu_north_m;
                             s_slip_rev_cmd = 0.0f;
                             s_slip_reversing = true;
@@ -3875,7 +3901,7 @@ void state_machine_update() {
                           // Bit 0x20: battery WARNING or LOW — drives the
                           // flashing battery banner on the TX16S Lua widget
                           | (battery_get_state() != BATTERY_OK ? 0x20 : 0);
-        td.obs_count      = (uint16_t)obstacle_discs_count();   // active detour discs
+        td.obs_count      = (uint16_t)obstacle_islands_count();   // active detour islands
         { float unc_cm = ekf_get_position_uncertainty() * 100.0f;
           td.ekf_unc_cm = (unc_cm > 65535.0f) ? 65535u : (uint16_t)unc_cm; }
         td.session_mowed_dm2 = 0;  // TODO: integrate from coverage_planner

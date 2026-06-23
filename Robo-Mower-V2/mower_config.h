@@ -95,6 +95,21 @@ struct MowerConfig {
     // Appended (NVS key bumped to mow_cfg_v14). Inset of the spiral's outer ring
     // (mow path) from the perimeter so the body clears corners while pivoting.
     float    turn_margin_m;               // ring-0 inset from perimeter [m]; 0 = ring 0 = perimeter
+
+    // ── AUTO exception-handling layer enables (PWA-switchable) ───────────────
+    // Appended (NVS key bumped to mow_cfg_v15). Replaces compile-time #defines.
+    bool     resp_collision_en;           // collision → back-up + detour (Plan 3)
+    bool     resp_stall_en;               // stall → PAUSE (Plan 4 — node-follower stall)
+    bool     resp_tilt_en;                // tilt → reverse-to-clear (Plan 4 opt-in; default off — immediate PAUSE is safer)
+    bool     resp_slip_en;                // slip → reverse-retry (Plan 5; default off — noisy under Float)
+    bool     resp_blade_slow_en;          // blade-load → drive slowdown (Plan 6a; on by default)
+    bool     resp_blade_reverse_en;       // blade-load → reverse-retry (Plan 6b; opt-in)
+
+    // ── Cut-height actuator PPM timeout ──────────────────────────────────────
+    // Appended (NVS key bumped to mow_cfg_v16). After this many seconds with no
+    // commanded height change, the PPM is stopped so the self-holding actuator
+    // de-powers and stops drawing current fighting stiffness. 0 = continuous.
+    float    cut_height_timeout_s;         // stop cut-height PPM after this many s idle (0 = continuous)
 };
 
 

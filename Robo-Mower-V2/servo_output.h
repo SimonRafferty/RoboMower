@@ -53,3 +53,10 @@ uint16_t heightToServoPulse(float height_mm);
  * @param sub_cmd  String after "CALHEIGHT " (null-terminated).
  */
 void servo_handle_cal_command(const char *sub_cmd);
+
+/**
+ * @brief Per-tick housekeeping. After cut_height_timeout_s (MowerConfig) of no
+ *  commanded movement, stop the PPM so the self-holding actuator de-powers and
+ *  stops drawing current. 0 = never time out (continuous PPM). Call every loop tick.
+ */
+void servo_output_update();

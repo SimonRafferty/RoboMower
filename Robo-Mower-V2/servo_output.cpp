@@ -26,6 +26,8 @@
 
 // ── Module state ─────────────────────────────────────────────────────────────
 static uint16_t servo_current_pulse_us = 0;
+static uint32_t s_servo_last_drive_ms  = 0;     // millis() of last commanded movement
+static bool     s_servo_idle           = false; // true = PPM stopped (actuator de-powered)
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -49,6 +51,13 @@ static void ledcWritePulse(uint16_t pulse_us)
     ledc_set_duty(SERVO_LEDC_SPEED, SERVO_LEDC_CH, pulseUsToDuty(pulse_us));
     ledc_update_duty(SERVO_LEDC_SPEED, SERVO_LEDC_CH);
     servo_current_pulse_us = pulse_us;
+}
+
+static void servo_stop_ppm()
+{
+    // Duty 0 = constant LOW = no servo pulses → the self-holding actuator de-powers.
+    ledc_set_duty(SERVO_LEDC_SPEED, SERVO_LEDC_CH, 0);
+    ledc_update_duty(SERVO_LEDC_SPEED, SERVO_LEDC_CH);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,6 +100,8 @@ void servo_output_init()
         return;
     }
     servo_current_pulse_us = init_pulse_us;
+    s_servo_last_drive_ms = millis();
+    s_servo_idle          = false;
 
     DBG_PRINTF("[SERVO] Ready — GPIO%d, %dHz, 14-bit, range %d–%d µs\n",
                   SERVO_PIN, SERVO_LEDC_FREQ_HZ, SERVO_MIN_US, SERVO_MAX_US);
@@ -147,7 +158,15 @@ void servo_set_height_mm(float height_mm)
         output_us = (uint16_t)backed;
     }
 
-    ledcWritePulse(output_us);
+    // Only (re)drive on an actual movement; ledcWritePulse re-applies the duty, so
+    // this also resumes the PPM if it had timed out. When the output is steady, the
+    // timeout in servo_output_update() de-powers the actuator to stop it drawing
+    // current fighting mechanical stiffness.
+    if (output_us != servo_current_pulse_us) {
+        ledcWritePulse(output_us);
+        s_servo_last_drive_ms = millis();
+        s_servo_idle          = false;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -164,5 +183,20 @@ void servo_handle_cal_command(const char *sub_cmd)
         DBG_PRINTF("[SERVO] Test: %.0f mm → %d µs\n", mm, heightToServoPulse(mm));
     } else {
         DBG_PRINTLN("[SERVO] Usage: CALHEIGHT TEST <mm>");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+void servo_output_update()
+{
+    if (s_servo_idle) return;                          // already de-powered
+    float timeout_s = (float)mower_config_get().cut_height_timeout_s;
+    if (timeout_s <= 0.0f) return;                     // 0 = continuous PPM
+    if (s_servo_last_drive_ms == 0) return;            // nothing driven yet
+    if ((uint32_t)(millis() - s_servo_last_drive_ms) >= (uint32_t)(timeout_s * 1000.0f)) {
+        servo_stop_ppm();
+        s_servo_idle = true;
+        DBG_PRINTF("[SERVO] PPM off after %.1fs hold (actuator self-holds)\n", (double)timeout_s);
     }
 }

@@ -12,7 +12,7 @@
 // NVS storage: same "mower" namespace as nvs_storage.cpp to avoid wasting slots.
 // Key must be ≤ 15 characters.
 static const char *k_nvs_ns  = "mower";
-static const char *k_nvs_key = "mow_cfg_v14"; // bumped 2026-06-19: added turn_margin_m (ring-0 inset). v13 refreshed defaults; v12 added min_move_duty; v11 added footprint W×L box + track_width_m
+static const char *k_nvs_key = "mow_cfg_v16"; // bumped 2026-06-23: v16 added cut_height_timeout_s. v15 added 6 resp_* bool fields (AUTO exception-handling enables). v14 added turn_margin_m; v13 refreshed defaults; v12 added min_move_duty; v11 added footprint W×L box + track_width_m
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -60,6 +60,13 @@ static const MowerConfig k_defaults = {
     /* min_turn_radius_m      */ MIN_TURNING_RADIUS_M,
     /* min_move_duty          */ MIN_MOVE_DUTY,
     /* turn_margin_m          */ TURN_MARGIN_M,
+    /* resp_collision_en      */ (bool)COLLISION_RESPONSE_ENABLED,
+    /* resp_stall_en          */ (bool)STALL_RESPONSE_ENABLED,
+    /* resp_tilt_en           */ (bool)TILT_RESPONSE_ENABLED,
+    /* resp_slip_en           */ (bool)SLIP_RESPONSE_ENABLED,
+    /* resp_blade_slow_en     */ (bool)BLADE_LOAD_SPEED_ENABLED,
+    /* resp_blade_reverse_en  */ (bool)BLADE_LOAD_REVERSE_ENABLED,
+    /* cut_height_timeout_s   */ CUT_HEIGHT_TIMEOUT_S,
 };
 
 static MowerConfig s_cfg;

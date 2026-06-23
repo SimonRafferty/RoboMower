@@ -93,6 +93,11 @@ input[type=range] { width: 100%; }
 /* Only active tab is shown */
 .tab        { display: none; height: 100%; overflow-y: auto; }
 .tab.active { display: flex; flex-direction: column; }
+/* Log tab: fill the full height; the .log-box itself is the single scroller
+   (override its default max-height:60vh so it grows to the available space) */
+#tab-log                    { overflow-y: hidden; }
+#tab-log #diag-log          { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+#tab-log #diag-log .log-box { flex: 1 1 auto; min-height: 0; max-height: none; margin-top: 0; overflow-y: auto; }
 
 /* ══════════════════════════════════════════════════════
    Cards
@@ -165,6 +170,7 @@ input[type=range] { width: 100%; }
 }
 .log-box .log-entry { padding: 1px 0; border-bottom: 1px solid #1e1e1e; }
 .log-box .log-entry:last-child { border-bottom: none; }
+.log-box .log-newest { position: sticky; top: 0; background: #111; color: var(--muted); font-size: .68rem; text-transform: uppercase; letter-spacing: .05em; padding-bottom: 3px; margin-bottom: 3px; border-bottom: 1px solid #333; }
 .log-box.empty { color: var(--muted); font-style: italic; }
 
 /* ══════════════════════════════════════════════════════
@@ -361,6 +367,8 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
     <button class="tab-btn" data-tab="map">Map</button>
     <button class="tab-btn" data-tab="controls">Controls</button>
     <button class="tab-btn" data-tab="diag">Diagnostics</button>
+    <button class="tab-btn" data-tab="settings">Settings</button>
+    <button class="tab-btn" data-tab="log">Log</button>
   </nav>
   <span id="ble-dot" class="disconnected"></span>
   <span id="ble-label" style="font-size:.85rem;color:var(--muted)">Disconnected</span>
@@ -373,7 +381,11 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
   <!-- Dashboard -->
   <section id="tab-dashboard" class="tab active">
     <div id="dash-grid"></div>
-    <details class="ctrl-section" id="cfg-section">
+  </section>
+
+  <!-- Settings -->
+  <section id="tab-settings" class="tab">
+    <details class="ctrl-section" id="cfg-section" open>
       <summary>Settings</summary>
       <div id="cfg-form">
         <p class="cfg-note">Values are saved to the mower's NVS and take effect immediately. The mower must be connected.</p>
@@ -420,6 +432,7 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
         <div class="cfg-grid">
           <label>Min mm<input type="number" class="cfg-input" id="cfg-cut_height_min_mm" step="1" min="0" title="Minimum allowed cutting deck height (mm). The cut-height slider won't go below this"></label>
           <label>Max mm<input type="number" class="cfg-input" id="cfg-cut_height_max_mm" step="1" min="0" title="Maximum allowed cutting deck height (mm). The cut-height slider won't go above this"></label>
+          <label>Actuator timeout s<input type="number" class="cfg-input" id="cfg-cut_height_timeout_s" step="0.5" min="0" title="After this many seconds with no cut-height movement, the mower stops sending the servo PPM so the (self-holding) actuator de-powers and stops drawing current fighting stiffness. 0 = send continuously. Default 3."></label>
         </div>
         <div class="cfg-group-label">Path Following</div>
         <div class="cfg-grid">
@@ -446,6 +459,15 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
         <div class="cfg-grid">
           <label>Speed Kp A/(m/s)<input type="number" class="cfg-input" id="cfg-wheel_pi_kp" step="1.0" title="Proportional gain for ESP32 wheel speed PI loop (A per m/s of error). Higher = more aggressive response. Reduce if wheels oscillate."></label>
           <label>Speed Ki A/(m/s²)<input type="number" class="cfg-input" id="cfg-wheel_pi_ki" step="0.5" title="Integral gain for ESP32 wheel speed PI loop (A per accumulated m/s error). Eliminates steady-state speed error under load."></label>
+        </div>
+        <div class="cfg-group-label">AUTO Exception Handling</div>
+        <div class="cfg-grid">
+          <label title="Collision (IMU jolt) → 0.4 m back-up + obstacle island + detour. Watch COLL log on first runs; disable if it fires without a real hit."><input type="checkbox" class="cfg-bool" id="cfg-resp_collision_en"> Collision response</label>
+          <label title="Wheel stall (eRPM low + no GPS motion, sustained) → PAUSE. On by default; safe to leave enabled."><input type="checkbox" class="cfg-bool" id="cfg-resp_stall_en"> Stall → pause</label>
+          <label title="Tilt over limit → reverse-to-clear + obstacle island + detour. OFF by default — immediate PAUSE is safer. Enable only after field-testing the reverse on a known slope."><input type="checkbox" class="cfg-bool" id="cfg-resp_tilt_en"> Tilt reverse-to-clear</label>
+          <label title="Slip (wheels commanded forward but GPS shows little net travel) → reverse-retry. OFF by default — noisy under RTK-Float; enable after field-tuning."><input type="checkbox" class="cfg-bool" id="cfg-resp_slip_en"> Slip watchdog</label>
+          <label title="Blade RPM-droop load rises → ramp drive speed down toward creep. On by default; safe."><input type="checkbox" class="cfg-bool" id="cfg-resp_blade_slow_en"> Blade-load slowdown</label>
+          <label title="Blade RPM-droop load sustained high → reverse-retry the patch. Off by default; opt-in after confirming the detector is trustworthy."><input type="checkbox" class="cfg-bool" id="cfg-resp_blade_reverse_en"> Blade-load reverse-retry</label>
         </div>
         <div class="cfg-group-label">Derived (read-only)</div>
         <div class="cfg-derived" id="cfg-derived"></div>
@@ -517,7 +539,7 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
       <div id="cut-height-section">
         <div class="ctrl-label">Cut Height</div>
         <div id="cut-height-row">
-          <input type="range" id="cut-height-slider" min="35" max="90" value="90" step="5" disabled title="Adjust blade cut height (35–90 mm)">
+          <input type="range" id="cut-height-slider" min="35" max="90" value="90" step="1" disabled title="Adjust blade cut height (35–90 mm)">
           <span id="cut-height-val">90mm</span>
         </div>
       </div>
@@ -529,8 +551,6 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
   <section id="tab-diag" class="tab">
     <div id="diag-age">No data — switch to this tab while connected to start polling</div>
     <div class="ctrl-btn-bar" style="margin:6px 0">
-      <button class="ctrl-btn" id="btn-refresh-log" disabled
-              title="Fetch the latest status and system log from the mower (shown below)">Refresh Log</button>
       <button class="ctrl-btn" id="btn-recal-imu" disabled
               title="Optional: force a fresh BNO055 compass calibration (clears the stored profile and relearns). The IMU also auto-calibrates as it drives. After pressing, drive slow figure-8/loops.">Calibrate compass</button>
       <button class="ctrl-btn" id="btn-imu-savecal" disabled
@@ -541,19 +561,27 @@ details.ctrl-section summary::-webkit-details-marker { color:var(--muted); }
               title="Save the compass calibration currently stored in the mower to a file on disc, as a backup.">Save cal to file</button>
       <button class="ctrl-btn" id="btn-load-cal-file" disabled
               title="Load a compass calibration from a file on disc (a cal file or a settings file) and apply it to the mower.">Load cal from file</button>
+      <button class="ctrl-btn" id="btn-plan-test" disabled
+              title="Dry-run the coverage planner and log the result (waypoint count, ring count). Does not start mowing.">Plan Test</button>
+      <button class="ctrl-btn" id="btn-add-test-island" disabled
+              title="Obstacle-detour test: inject a virtual obstacle island 1.5 m ahead of the mower's current position. The detour logic should steer around it.">Add test island ahead</button>
+      <button class="ctrl-btn" id="btn-clear-islands" disabled
+              title="Obstacle-detour test: remove all injected obstacle islands.">Clear islands</button>
+    </div>
+    <input type="file" id="cal-file-input" accept="application/json,.json" style="display:none">
+    <div id="diag-grid"></div>
+  </section>
+
+  <!-- Log -->
+  <section id="tab-log" class="tab">
+    <div class="ctrl-btn-bar" style="margin:6px 0">
+      <button class="ctrl-btn" id="btn-refresh-log" disabled
+              title="Fetch the latest status and system log from the mower (shown below)">Refresh Log</button>
       <button class="ctrl-btn" id="btn-copy-log"
               onclick="window._copySysLog && window._copySysLog(this)"
               title="Copy all log lines to the clipboard for pasting into a bug report.">Copy log</button>
-      <button class="ctrl-btn" id="btn-plan-test" disabled
-              title="Dry-run the coverage planner and log the result (waypoint count, ring count). Does not start mowing.">Plan Test</button>
-      <button class="ctrl-btn" id="btn-add-test-disc" disabled
-              title="Obstacle-detour test: inject a virtual obstacle disc 1.5 m ahead of the mower's current position. The detour logic should steer around it.">Add test disc ahead</button>
-      <button class="ctrl-btn" id="btn-clear-discs" disabled
-              title="Obstacle-detour test: remove all injected obstacle discs.">Clear discs</button>
     </div>
-    <input type="file" id="cal-file-input" accept="application/json,.json" style="display:none">
-    <div id="diag-log" style="margin:6px 0"></div>
-    <div id="diag-grid"></div>
+    <div id="diag-log"></div>
   </section>
 
 </main>
@@ -866,8 +894,8 @@ const Commands = {
   imuSaveCal:()         => ({ cmd: 'IMUSAVECAL' }),
   reloadImuCal:()       => ({ cmd: 'RELOAD_IMU_CAL' }),
   planTest:      ()     => ({ cmd: 'PLAN_TEST' }),
-  addTestDisc:   ()     => ({ cmd: 'ADD_TEST_DISC' }),
-  clearDiscs:    ()     => ({ cmd: 'CLEAR_DISCS' }),
+  addTestIsland: ()     => ({ cmd: 'ADD_TEST_ISLAND' }),
+  clearIslands:  ()     => ({ cmd: 'CLEAR_ISLANDS' }),
   // Protocol v2: absolute WGS-84 lat/lon + per-point accuracy. polygon = [[lat,lon,acc],...]
   sendPerimeter: (polygon) => ({ cmd: 'SEND_PERIMETER', v: 2, polygon })
 };
@@ -1541,25 +1569,25 @@ function buildDashboard(telem) {
     ${vescChip('VESC-R', m.vR !== 0, 'Right drive wheel VESC motor controller. Amber = CAN bus OK but no response from this VESC')}
     ${vescChip('VESC-B', m.vB !== 0, 'Blade motor VESC controller. Amber = CAN bus OK but no response from this VESC')}`;
 
-  // System log from last status response (d.log)
+  // System log from last status response (d.log). Firmware sends oldest→newest,
+  // so reverse for display: NEWEST FIRST (top), so the latest is visible at a glance.
   const logEntries = Array.isArray(d.log) ? d.log : [];
-  window._lastLogEntries = logEntries;   // kept for the Copy button
+  window._lastLogEntries = logEntries;   // kept for the Copy button (chronological)
   const logHtml = logEntries.length === 0
     ? '<div class="log-box empty">No messages</div>'
-    : `<div class="log-box">${
-        logEntries.map(e => `<div class="log-entry">${escHtml(e)}</div>`).join('')
+    : `<div class="log-box"><div class="log-newest">Newest first</div>${
+        logEntries.slice().reverse().map(e => `<div class="log-entry">${escHtml(e)}</div>`).join('')
       }</div>`;
-  // Mirror the log into the Diagnostics tab panel, so the Refresh Log button there
-  // (which fetches a fresh STATUS) visibly updates the log right next to itself.
-  { const dl = document.getElementById('diag-log'); if (dl) dl.innerHTML = logHtml; }
+  // Only rewrite the DOM when the log actually changed — every telemetry refresh
+  // calls this, and replacing innerHTML would reset the user's scroll position.
+  { const dl = document.getElementById('diag-log');
+    if (dl && dl._lastLogHtml !== logHtml) { dl.innerHTML = logHtml; dl._lastLogHtml = logHtml; } }
 
   return `
     <div class="card" style="grid-column:1/-1" title="Current operating state of the mower and overall mowing progress as a percentage of the planned area">
       <div class="card-title">State</div>
       <span class="state-badge" style="background:${col}20;color:${col};border:1px solid ${col}">${d.state}</span>
       <div class="sw-row">
-        <span class="sw-chip ${d.armed ? 'on' : ''}" title="CH6 arm switch / s_last_armed">ARM: ${d.armed ? 'ON' : 'OFF'}</span>
-        <span class="sw-chip ${d.ch6Us > 1530 ? 'on' : d.ch6Us > 1168 ? 'warn' : ''}" title="CH6 raw µs — >1530=armed, 1168-1530=borderline, <1168=disarmed">CH6: ${d.ch6Us}µs</span>
         <span class="sw-chip ${['','on','warn'][d.modeSw] || ''}" title="CH4 mode switch">${['MODE: Manual','MODE: Auto','MODE: Return'][d.modeSw] || 'MODE: ?'}</span>
         <span class="sw-chip ${d.pauseSw ? 'warn' : ''}" title="CH7 pause switch">PAUSE: ${d.pauseSw ? 'ON' : 'OFF'}</span>
         <span class="sw-chip ${d.learnSw ? 'on' : ''}" title="CH5 learn switch">LEARN: ${d.learnSw ? 'ON' : 'OFF'}</span>
@@ -1604,10 +1632,9 @@ function buildDashboard(telem) {
       <div class="card-sub">${d.battState}</div>
     </div>
 
-    <div class="card" title="Current cutting deck height in mm and arm/disarm status (controlled by the RC transmitter CH6 switch)">
+    <div class="card" title="Current cutting deck height in mm">
       <div class="card-title">Cut Height</div>
       <div class="card-value">${Math.round(d.cutH)}<span style="font-size:.8rem;font-weight:400">mm</span></div>
-      <div class="card-sub">${d.armed ? '🟢 Armed' : '⚫ Disarmed'}</div>
     </div>
 
     <div class="card" title="Current session stats: obstacle collision count, IMU collision detection baseline acceleration, and firmware uptime">
@@ -1976,18 +2003,18 @@ async function main() {
       showToast('Plan test requested — check the log for results', true);
     } catch (e) { showToast(e.message, false); }
   });
-  document.getElementById('btn-add-test-disc')?.addEventListener('click', async () => {
+  document.getElementById('btn-add-test-island')?.addEventListener('click', async () => {
     if (!ble.connected) { showToast('Not connected', false); return; }
     try {
-      await ble.sendCommand(Commands.addTestDisc());
-      showToast('Test disc injected 1.5 m ahead', true);
+      await ble.sendCommand(Commands.addTestIsland());
+      showToast('Test island injected 1.5 m ahead', true);
     } catch (e) { showToast(e.message, false); }
   });
-  document.getElementById('btn-clear-discs')?.addEventListener('click', async () => {
+  document.getElementById('btn-clear-islands')?.addEventListener('click', async () => {
     if (!ble.connected) { showToast('Not connected', false); return; }
     try {
-      await ble.sendCommand(Commands.clearDiscs());
-      showToast('All obstacle discs cleared', true);
+      await ble.sendCommand(Commands.clearIslands());
+      showToast('All obstacle islands cleared', true);
     } catch (e) { showToast(e.message, false); }
   });
 
@@ -2202,14 +2229,14 @@ async function main() {
   });
 
   // ── Mower config form ───────────────────────────────────
-  // Config fields: key = cfg-<field_name>
+  // Numeric config fields: key = cfg-<field_name> (type=number inputs)
   const CFG_FIELDS = [
     'footprint_width_m','footprint_length_m',
     'track_width_m',
     'wheel_radius_m','motor_pole_pairs','gear_ratio',
     'antenna_fwd_m','antenna_right_m',
     'steer_to_cut_m','cut_disc_radius_m','cut_width_m','strip_overlap_m','turn_margin_m',
-    'cut_height_min_mm','cut_height_max_mm',
+    'cut_height_min_mm','cut_height_max_mm','cut_height_timeout_s',
     'blade_motor_pole_pairs','blade_target_rpm',
     'pp_lookahead_base_m','pp_lookahead_k',
     'max_mowing_speed_ms','headland_speed_ms','transit_speed_ms','min_creep_speed_ms',
@@ -2223,6 +2250,22 @@ async function main() {
     'min_move_duty'
   ];
 
+  // Bool config fields: key = cfg-<field_name> (type=checkbox inputs)
+  const CFG_BOOL_FIELDS = [
+    'resp_collision_en', 'resp_stall_en', 'resp_tilt_en',
+    'resp_slip_en', 'resp_blade_slow_en', 'resp_blade_reverse_en'
+  ];
+
+  // Bool defaults — mirror config.h compile-time values
+  const CFG_BOOL_DEFAULTS = {
+    resp_collision_en:    true,
+    resp_stall_en:        true,
+    resp_tilt_en:         false,
+    resp_slip_en:         false,
+    resp_blade_slow_en:   true,
+    resp_blade_reverse_en: false
+  };
+
   // Firmware defaults (config.h) — used when a loaded config file omits a key,
   // so importing a partial/old file never leaves a field blank. Keep in sync
   // with Robo-Mower-V2/config.h #defines (see mower_config.cpp k_defaults).
@@ -2232,7 +2275,7 @@ async function main() {
     wheel_radius_m: 0.10, motor_pole_pairs: 7, gear_ratio: 20.0,
     antenna_fwd_m: -0.20, antenna_right_m: 0.00,
     steer_to_cut_m: 0.0, cut_disc_radius_m: 0.21, cut_width_m: 0.38, strip_overlap_m: 0.02, turn_margin_m: 0.10,
-    cut_height_min_mm: 35, cut_height_max_mm: 90,
+    cut_height_min_mm: 35, cut_height_max_mm: 90, cut_height_timeout_s: 3.0,
     blade_motor_pole_pairs: 10, blade_target_rpm: 2800,
     pp_lookahead_base_m: 0.40, pp_lookahead_k: 0.80,
     max_mowing_speed_ms: 0.15, headland_speed_ms: 0.20, transit_speed_ms: 0.30, min_creep_speed_ms: 0.05,
@@ -2284,6 +2327,10 @@ async function main() {
       const el = document.getElementById('cfg-' + f);
       if (el) obj[f] = Number(el.value);
     });
+    CFG_BOOL_FIELDS.forEach(f => {
+      const el = document.getElementById('cfg-' + f);
+      if (el) obj[f] = el.checked;
+    });
     return obj;
   }
 
@@ -2291,6 +2338,10 @@ async function main() {
     CFG_FIELDS.forEach(f => {
       const el = document.getElementById('cfg-' + f);
       if (el && cfg[f] !== undefined) el.value = cfg[f];
+    });
+    CFG_BOOL_FIELDS.forEach(f => {
+      const el = document.getElementById('cfg-' + f);
+      if (el && cfg[f] !== undefined) el.checked = !!cfg[f];
     });
     cfgUpdateDerived(cfg);
   }
@@ -2371,11 +2422,12 @@ async function main() {
   }
 
   // Populate the form from a settings object. Known keys present in the file are
-  // applied; known keys missing fall back to CFG_DEFAULTS; unknown keys ignored.
+  // applied; known keys missing fall back to CFG_DEFAULTS / CFG_BOOL_DEFAULTS; unknown keys ignored.
   function applyConfigSettings(settings) {
-    const known = new Set(CFG_FIELDS);
+    const knownNum  = new Set(CFG_FIELDS);
+    const knownBool = new Set(CFG_BOOL_FIELDS);
     let applied = 0, defaulted = 0;
-    const ignored = Object.keys(settings).filter(k => !known.has(k)).length;
+    const ignored = Object.keys(settings).filter(k => !knownNum.has(k) && !knownBool.has(k)).length;
     const merged = {};
     CFG_FIELDS.forEach(f => {
       const v = settings[f];
@@ -2383,6 +2435,14 @@ async function main() {
         merged[f] = Number(v); applied++;
       } else {
         merged[f] = CFG_DEFAULTS[f]; defaulted++;
+      }
+    });
+    CFG_BOOL_FIELDS.forEach(f => {
+      const v = settings[f];
+      if (v !== undefined && v !== null) {
+        merged[f] = !!v; applied++;
+      } else {
+        merged[f] = CFG_BOOL_DEFAULTS[f]; defaulted++;
       }
     });
     cfgPopulate(merged);
