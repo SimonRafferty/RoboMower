@@ -54,7 +54,6 @@ static BLECharacteristic *s_pCmd     = nullptr;
 static BLECharacteristic *s_pStatus  = nullptr;
 
 static volatile bool s_connected     = false;
-static volatile uint16_t s_conn_id   = 0;
 static uint16_t s_negotiated_mtu     = 23;  // BLE minimum; updated after connection
 static bool     s_mtu_dirty          = false;
 
@@ -109,9 +108,14 @@ static void handle_cmd_fragment(const uint8_t *data, size_t len) {
 // ── BLE callbacks ─────────────────────────────────────────────────────────────
 
 class ServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer *pServer, esp_ble_gatts_cb_param_t *param) override {
+    // Override the parameter-less onConnect/onDisconnect overloads — these are the
+    // "Common public declarations" present and invoked on EVERY core version and BOTH
+    // BLE backends (Bluedroid calls them, and so does NimBLE, which the ESP32-S3 build
+    // selects from core 3.1+). The old Bluedroid-only onConnect(…, esp_ble_gatts_cb_param_t*)
+    // overload doesn't exist under NimBLE, so using it broke the build on newer cores.
+    // We only used `param` to set the (never-read, now removed) s_conn_id, so nothing is lost.
+    void onConnect(BLEServer *pServer) override {
         s_connected  = true;
-        s_conn_id    = param->connect.conn_id;
         s_mtu_dirty  = true;   // read actual negotiated MTU next tick
         // NOTE: do NOT call BLEDevice::setMTU() here — that would overwrite the
         // value the BLE stack sets via ESP_GATTS_MTU_EVT with our local preference,

@@ -57,12 +57,12 @@ If you use a different VESC for the blade, check which bytes of the CAN STATUS_5
 
 ## Libraries & Dependencies
 
-Built and tested against the **exact versions below**.  The ESP32 *board core* version in particular matters — newer cores changed the Bluetooth API and won't compile as-is (see the note under the table).  Install the core in **Boards Manager** and the libraries in **Library Manager** (Arduino IDE):
+Built and tested against the versions below (the libraries are the **exact** versions used).  The firmware compiles on the **esp32 board core from 3.0.5 through the current 3.3.x** — newer cores moved the ESP32-S3 onto the NimBLE Bluetooth stack, and the code now handles both backends, so you don't need to pin an old core any more.  Install the core in **Boards Manager** and the libraries in **Library Manager** (Arduino IDE):
 
 | Dependency | Version | What it's for |
 |---|---|---|
 | Arduino IDE | 2.x | (or arduino-cli 1.5.x) |
-| **esp32** by Espressif (board core) | **3.0.5** | ESP32-S3 board support — and BLE, `Wire`, `Preferences`/NVS, LEDC (servo), TWAI (CAN) and FreeRTOS all ship with it.  **Pin this version.** |
+| **esp32** by Espressif (board core) | **3.0.5 – 3.3.x** | ESP32-S3 board support — and BLE, `Wire`, `Preferences`/NVS, LEDC (servo), TWAI (CAN) and FreeRTOS all ship with it.  Anything from 3.0.5 to the current 3.3.x builds; 3.0.5 is the most field-tested if you want to play it safe. |
 | Adafruit BNO055 | 1.6.4 | the IMU |
 | Adafruit Unified Sensor | 1.1.15 | dependency of the BNO055 library |
 | Adafruit BusIO | 1.17.4 | dependency of the Adafruit libraries (Library Manager installs it for you) |
@@ -71,7 +71,7 @@ Built and tested against the **exact versions below**.  The ESP32 *board core* v
 
 **Clipper2** (polygon offsetting for the spiral path planner) is **bundled in the repo** at `Robo-Mower-V2/src/clipper2/` — Arduino compiles the sketch's `src/` folder automatically, so there's nothing to install.
 
-> **Getting `'esp_ble_gatts_cb_param_t' has not been declared` (or other BLE errors)?**  You're on a different ESP32 core version — the BLE callback signatures changed after 3.0.x.  In Boards Manager, install **esp32 3.0.5** specifically and select it for this build (you can keep several core versions installed and pick per project).  The latest core (3.3.x) needs the BLE code adapted; 3.0.5 builds clean.
+> **Getting `'esp_ble_gatts_cb_param_t' has not been declared`?**  That was an older version of this firmware, which only built on core 3.0.x.  **Pull the latest commit** — it now builds on 3.0.5 through the current 3.3.x.  (If you're stuck on an old firmware copy for some reason, installing **esp32 3.0.5** in Boards Manager and selecting it for this build also works.)
 
 ## Setting it up
 
