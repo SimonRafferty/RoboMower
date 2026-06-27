@@ -55,9 +55,27 @@ When the battery gets low it warns you on the transmitter and the phone, then le
 If you use a different VESC for the blade, check which bytes of the CAN STATUS_5 message you're reading.  I had a bug where the firmware read the first two bytes (which are actually the tachometer) as the battery voltage.  It decoded as -0.1V, the firmware decided the battery was flat, and quietly refused to start the blade - while the transmitter cheerfully displayed "Armed & Running".  That one took a while to find.  The voltage is in bytes 4-5.
 #
 
+## Libraries & Dependencies
+
+Built and tested against the **exact versions below**.  The ESP32 *board core* version in particular matters — newer cores changed the Bluetooth API and won't compile as-is (see the note under the table).  Install the core in **Boards Manager** and the libraries in **Library Manager** (Arduino IDE):
+
+| Dependency | Version | What it's for |
+|---|---|---|
+| Arduino IDE | 2.x | (or arduino-cli 1.5.x) |
+| **esp32** by Espressif (board core) | **3.0.5** | ESP32-S3 board support — and BLE, `Wire`, `Preferences`/NVS, LEDC (servo), TWAI (CAN) and FreeRTOS all ship with it.  **Pin this version.** |
+| Adafruit BNO055 | 1.6.4 | the IMU |
+| Adafruit Unified Sensor | 1.1.15 | dependency of the BNO055 library |
+| Adafruit BusIO | 1.17.4 | dependency of the Adafruit libraries (Library Manager installs it for you) |
+| FastLED | 3.10.3 | the status LED strip |
+| DFRobot_RTK_LoRa | 1.0.0 | the RTK GPS board |
+
+**Clipper2** (polygon offsetting for the spiral path planner) is **bundled in the repo** at `Robo-Mower-V2/src/clipper2/` — Arduino compiles the sketch's `src/` folder automatically, so there's nothing to install.
+
+> **Getting `'esp_ble_gatts_cb_param_t' has not been declared` (or other BLE errors)?**  You're on a different ESP32 core version — the BLE callback signatures changed after 3.0.x.  In Boards Manager, install **esp32 3.0.5** specifically and select it for this build (you can keep several core versions installed and pick per project).  The latest core (3.3.x) needs the BLE code adapted; 3.0.5 builds clean.
+
 ## Setting it up
 
-1. Arduino IDE 2.x, board "ESP32S3 Dev Module", Partition Scheme "Huge APP (3MB No OTA)", PSRAM "OPI PSRAM".  Libraries: Adafruit BNO055 (+ Adafruit Unified Sensor) and FastLED.
+1. Install the core + libraries from **Libraries & Dependencies** above.  Board "ESP32S3 Dev Module", Partition Scheme "Huge APP (3MB No OTA)", PSRAM "OPI PSRAM".
 2. In VESC Tool: set CAN IDs 1 (left), 2 (right), 3 (blade), baud 250 kbit/s, enable CAN status messages on all three.  Drive motors in current control, blade in speed control with a 2800 RPM limit.
 3. Wiring, calibration and the full operating procedure are in manual.md.  The CRSF telemetry format (if you want to build your own display) is in telemetry.md.
 4. Drive the perimeter, press Auto, and watch it go.
